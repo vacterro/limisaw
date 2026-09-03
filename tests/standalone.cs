@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Reflection;
@@ -9,16 +10,52 @@ using System.Reflection;
 // still has every palette, every sound and its icon, and that an external file
 // of the same name still overrides the embedded one.
 //
+// The icon checks run against the real exe from a HOST process, which is where
+// a module-vs-process mixup would show: the harness has its own icon, so a
+// loader reading the process module would hand back the wrong one.
+//
 // Build + run: pwsh .\build.ps1 -Tests
 public static class Standalone
 {
     static int fails = 0, checks = 0;
+
+    // The sizes the shell asks for, and therefore the frames the artwork owes.
+    static readonly int[] Sizes = { 16, 24, 32, 48, 64, 128 };
 
     static void Check(string name, bool ok, string detail)
     {
         checks++;
         if (ok) Console.WriteLine("PASS  " + name + (detail.Length > 0 ? "  -> " + detail : ""));
         else { fails++; Console.WriteLine("FAIL  " + name + "  -> " + detail); }
+    }
+
+    // The widths in an .ico's own directory. Reading the file is the only way to
+    // tell a real per-size frame from one the loader reduced for us.
+    static List<int> FramesOf(string path)
+    {
+        var widths = new List<int>();
+        try
+        {
+            byte[] raw = File.ReadAllBytes(path);
+            if (raw.Length < 6) return widths;
+            int count = BitConverter.ToUInt16(raw, 4);
+            for (int i = 0; i < count && 6 + i * 16 + 16 <= raw.Length; i++)
+            {
+                byte w = raw[6 + i * 16];
+                widths.Add(w == 0 ? 256 : w);
+            }
+        }
+        catch { }
+        widths.Sort();
+        return widths;
+    }
+
+    static List<int> MissingFrames(string path)
+    {
+        List<int> have = FramesOf(path);
+        var missing = new List<int>();
+        foreach (int size in Sizes) if (!have.Contains(size)) missing.Add(size);
+        return missing;
     }
 
     public static int Main()
@@ -66,11 +103,52 @@ public static class Standalone
             Check("the shipped low-quota alert is playable", low != null && File.Exists(low), low ?? "null");
 
             MethodInfo icon = assets.GetMethod("AppIcon", BindingFlags.Public | BindingFlags.Static);
-            var sixteen = (Icon)icon.Invoke(null, new object[] { temp, 16 });
-            var thirtytwo = (Icon)icon.Invoke(null, new object[] { temp, 32 });
-            Check("the icon comes out of the exe at the size the shell asks for",
-                sixteen != null && sixteen.Width == 16 && thirtytwo != null && thirtytwo.Width == 32,
-                sixteen == null ? "null" : sixteen.Width + "px / " + (thirtytwo == null ? "null" : thirtytwo.Width + "px"));
+
+            // Every size the shell actually asks for must come back at exactly
+            // that size.
+            //
+            // This runs in a HOST process (the harness loaded LIMISAW.exe as an
+            // assembly, and the harness has its own icon), so it also proves
+            // AppIcon reads ITS OWN module's icon group rather than the process
+            // module's — the bug that would silently ship the wrong icon
+            // anywhere LIMISAW is not the entry assembly.
+            var badSizes = new List<string>();
+            foreach (int size in Sizes)
+            {
+                var got = (Icon)icon.Invoke(null, new object[] { temp, size });
+                if (got == null) { badSizes.Add(size + ":null"); continue; }
+                using (got)
+                    if (got.Width != size || got.Height != size)
+                        badSizes.Add(size + ":" + got.Width + "x" + got.Height);
+            }
+            Check("the icon comes out of the exe at every size the shell asks for",
+                badSizes.Count == 0, badSizes.Count == 0 ? "16/24/32/48/64/128"
+                    : string.Join(", ", badSizes.ToArray()));
+
+            // ...and it must be a REAL frame per size, not one oversized frame
+            // the loader reduces on the fly. That is a property of the artwork
+            // file, not of what LoadImage hands back: this artwork is four flat
+            // colours, so the shell's own reduction of a single 128x128 frame
+            // comes back nearly pixel-identical (measured: 0 differing pixels at
+            // 16 and 32, 10 at 24). Reading the icon directory is therefore the
+            // only check that can actually tell the two apart — which is the
+            // whole regression, since the single-frame file is what LIMISAW
+            // shipped with.
+            string artwork = Path.Combine(Directory.GetCurrentDirectory(), "heh.ico");
+            Check("heh.ico carries one real frame per size, not one oversized frame",
+                FramesOf(artwork).Count == Sizes.Length && MissingFrames(artwork).Count == 0,
+                "frames: " + string.Join("/", FramesOf(artwork).ConvertAll(n => n.ToString()).ToArray())
+                    + (MissingFrames(artwork).Count > 0
+                        ? "  missing: " + string.Join(", ", MissingFrames(artwork).ConvertAll(n => n.ToString()).ToArray())
+                        : ""));
+
+            // Swapping the artwork must not need a rebuild either.
+            File.Copy(artwork, Path.Combine(temp, "heh.ico"));
+            using (var external = (Icon)icon.Invoke(null, new object[] { temp, 32 }))
+                Check("an external heh.ico is loaded instead of the embedded group",
+                    external != null && external.Width == 32,
+                    external == null ? "null" : external.Width + "px");
+            File.Delete(Path.Combine(temp, "heh.ico"));
 
             // Customisation must not require a rebuild: a file next to the exe
             // wins over the embedded copy with the same slug.

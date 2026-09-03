@@ -3,9 +3,10 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 
-// Everything LIMISAW ships — every palette, every sound, its icon — is compiled
-// INTO the exe, so one file dropped in an empty folder is a complete install.
+// Everything LIMISAW ships — every palette, every sound, its icon — is inside
+// the exe, so one file dropped in an empty folder is a complete install.
 //
 // A file of the same name next to the exe still wins. Customisation must never
 // require rebuilding the program: `Themes\mine.json` adds a palette, and
@@ -16,7 +17,6 @@ namespace Limisaw
     {
         const string ThemePrefix = "Limisaw.Themes.";
         const string SoundPrefix = "Limisaw.Sounds.";
-        const string IconName = "Limisaw.heh.ico";
 
         static Assembly Self { get { return typeof(Assets).Assembly; } }
 
@@ -94,22 +94,54 @@ namespace Limisaw
             catch { return null; }
         }
 
-        // The size the shell asked for, from the exe's own icon resource. An
-        // external heh.ico still wins so the icon can be swapped without a
-        // rebuild; plain `new Icon(path)` is never used because it returns the
-        // largest frame (128x128 here) and the shell would blur it into 16x16.
+        // The app icon, at the exact size the shell asked for.
+        //
+        // Loaded through the shell's own `LoadImage`, not `new Icon(path, w, h)`:
+        // System.Drawing.Icon misparses a PNG-compressed frame when it picks a
+        // size out of a multi-frame .ico (it takes the BITMAPINFOHEADER path and
+        // reads past the end of the frame). Going through the OS is what lets the
+        // icon ship as ~4 KB of PNG frames instead of ~99 KB of raw DIBs, and it
+        // is the same loader the shell uses for the taskbar and Alt-Tab, so the
+        // window icon cannot disagree with them.
+        //
+        // The icon inside the exe is its win32 icon group (`-win32icon:`), which
+        // Windows already needs for Explorer — so there is no second embedded
+        // copy. An external heh.ico still wins, so the icon can be swapped
+        // without a rebuild.
         public static Icon AppIcon(string root, int size)
         {
             string external = Path.Combine(root ?? "", "heh.ico");
-            try { if (File.Exists(external)) return new Icon(external, size, size); }
-            catch { }
+            if (File.Exists(external))
+            {
+                Icon file = FromHandle(Native.LoadImage(IntPtr.Zero, external,
+                    Native.IMAGE_ICON, size, size, Native.LR_LOADFROMFILE));
+                if (file != null) return file;
+            }
+            // GetHINSTANCE of THIS module, not GetModuleHandle(null): under a
+            // test harness or any other host, the process module is the host and
+            // carries a different icon (or none).
+            IntPtr self;
+            try { self = Marshal.GetHINSTANCE(typeof(Assets).Module); }
+            catch { return null; }
+            if (self == IntPtr.Zero || self == new IntPtr(-1)) return null;
+            return FromHandle(Native.LoadImage(self, GroupIconId,
+                Native.IMAGE_ICON, size, size, 0));
+        }
+
+        // The first icon group csc emits for -win32icon:, by convention.
+        const string GroupIconId = "#32512";
+
+        // Icon.FromHandle does NOT own the handle, so the managed object dies
+        // with it; Clone() copies the bits out and lets the handle go.
+        static Icon FromHandle(IntPtr handle)
+        {
+            if (handle == IntPtr.Zero) return null;
             try
             {
-                using (Stream s = Self.GetManifestResourceStream(IconName))
-                    if (s != null) return new Icon(s, size, size);
+                using (Icon borrowed = Icon.FromHandle(handle)) return (Icon)borrowed.Clone();
             }
-            catch { }
-            return null;
+            catch { return null; }
+            finally { Native.DestroyIcon(handle); }
         }
     }
 }

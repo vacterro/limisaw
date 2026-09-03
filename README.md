@@ -8,8 +8,8 @@ asks each vendor's own CLI, so the numbers come from the vendor's server, not
 from a file whose meaning someone guessed. It never reads `auth.json`, never
 touches a token, never installs anything on its own.
 
-`LIMISAW.exe` is **442 KB and complete**: every palette, both alert sounds and
-the icon are compiled into it. Drop it in an empty folder and run it.
+`LIMISAW.exe` is **248 KB and complete**: every palette, both alert sounds and
+the icon are inside it. Drop it in an empty folder and run it.
 
 ```
 LIMISAW.exe          <- that's the whole install
@@ -62,9 +62,10 @@ vendor without quota. The last good numbers stay, dimmed and tagged
 - **Countdown**: `Tray shows: Off / % / Time`. `Time` puts the wait until that
   window's own reset in the icon — `12m`, `3h`, `2d`. An unknown or past stamp is
   `--`, never `0m`.
-- **Pixel art, always.** The icon is drawn on a 16x16 grid and scaled by whole
-  pixels only; the app icon carries a real frame for every size the shell asks
-  for. Nothing is ever handed to the shell to smooth.
+- **Pixel art, always.** The tray icon is drawn on a 16x16 grid and scaled by
+  whole pixels only; the app icon carries a real frame for every size the shell
+  asks for, loaded through the shell's own loader. Nothing is ever handed to
+  Windows to smooth.
 - **Single left click** opens the window, right click opens the menu — painted in
   the active theme, not system white.
 
@@ -131,8 +132,8 @@ pwsh .\build.ps1 -Tests     # build + run the whole suite
 one-file claim (`standalone.cs`), tray rendering pixel purity, window layout,
 alert timing, carry-forward, gating, tooltips and the tray item picker.
 
-`tools\make_ico.cs` regenerates `heh.ico` with whole-pixel frames when the
-artwork changes.
+`tools\make_ico.cs` regenerates `heh.ico` with one point-sampled frame per size
+the shell asks for, when the artwork changes.
 
 ---
 

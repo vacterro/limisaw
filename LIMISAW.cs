@@ -21,6 +21,13 @@ namespace Limisaw
         public const int NONANTIALIASED_QUALITY = 3;
         [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
+        // The shell's own icon loader. Unlike System.Drawing.Icon it reads a
+        // PNG-compressed frame out of a multi-frame .ico correctly, which is
+        // what lets heh.ico stay 4 KB instead of 99 KB of raw DIBs (Assets.cs).
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr LoadImage(IntPtr hInst, string name, uint type, int cx, int cy, uint flags);
+        public const uint IMAGE_ICON = 1;
+        public const uint LR_LOADFROMFILE = 0x0010;
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string className, string windowName);
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);

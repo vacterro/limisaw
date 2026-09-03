@@ -5,22 +5,25 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
 
-// Regenerate heh.ico with one whole-pixel frame per size the shell asks for,
-// scaled from the largest frame the source file carries.
+// Regenerate heh.ico with one frame per size the shell asks for, reduced from
+// the largest frame the source file carries.
 //
 // The single 128x128 frame LIMISAW inherited was the blur `UI.md` forbids: the
-// shell (and System.Drawing) got one oversized image and resampled it into a
-// 16x16 slot. Every frame here is a nearest-neighbour reduction of 128, so no
-// smoothing happens at any DPI.
+// shell got one oversized image and resampled it into a 16x16 slot. Every frame
+// here is a nearest-neighbour reduction with compositing and smoothing off, so
+// nothing is ever interpolated. 16/32/64/128 are exact integer ratios of the
+// master; 24 and 48 are not, but they are still point-sampled rather than
+// blended, and the shell asks for them.
 //
-// Two format details are load-bearing:
-//   * the source frame is PNG-compressed, so it is decoded as a PNG rather than
-//     through Icon.ToBitmap(), which flattens the alpha channel;
-//   * every frame is written as a classic 32bpp DIB. System.Drawing.Icon
-//     misparses a PNG frame when the file holds several frames (it takes the
-//     BITMAPINFOHEADER path and reads past the end), and that is exactly the
-//     lookup the app does for its window and tray icon. DIBs cost ~99 KB for
-//     the whole set, which is the right trade for an icon that always decodes.
+// Frames are PNG-compressed (the Vista+ icon format), which is what keeps the
+// file at ~4 KB instead of ~99 KB of raw DIBs. That choice is only safe because
+// the app loads its icon through `LoadImage` (see Assets.cs): `System.Drawing.Icon`
+// misparses a PNG frame when it picks a size out of a multi-frame file — it takes
+// the BITMAPINFOHEADER path and reads past the end. If the loader ever goes back
+// to `new Icon(path, w, h)`, this must go back to DIBs.
+//
+// The source frame is itself PNG-compressed, so it is decoded as a PNG rather
+// than through `Icon.ToBitmap()`, which flattens the alpha channel.
 //
 // Build + run (only needed when the artwork changes):
 //   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe -nologo ^
@@ -66,30 +69,13 @@ public static class MakeIco
         return bmp;
     }
 
-    static byte[] Dib(Bitmap bmp)    {
-        int w = bmp.Width, h = bmp.Height;
-        int maskStride = ((w + 31) / 32) * 4;
-        var ms = new MemoryStream();
-        var bw = new BinaryWriter(ms);
-        bw.Write(40); bw.Write(w); bw.Write(h * 2);          // XOR + AND stacked
-        bw.Write((short)1); bw.Write((short)32);
-        bw.Write(0); bw.Write(0);
-        bw.Write(0); bw.Write(0); bw.Write(0); bw.Write(0);
-        for (int y = h - 1; y >= 0; y--)                      // DIBs are bottom-up
-            for (int x = 0; x < w; x++)
-            {
-                Color c = bmp.GetPixel(x, y);
-                bw.Write(c.B); bw.Write(c.G); bw.Write(c.R); bw.Write(c.A);
-            }
-        for (int y = h - 1; y >= 0; y--)
+    static byte[] Png(Bitmap bmp)
+    {
+        using (var ms = new MemoryStream())
         {
-            var row = new byte[maskStride];
-            for (int x = 0; x < w; x++)
-                if (bmp.GetPixel(x, y).A == 0) row[x / 8] |= (byte)(0x80 >> (x % 8));
-            bw.Write(row);
+            bmp.Save(ms, ImageFormat.Png);
+            return ms.ToArray();
         }
-        bw.Flush();
-        return ms.ToArray();
     }
 
     public static int Main(string[] argv)
@@ -109,7 +95,7 @@ public static class MakeIco
         foreach (int size in sizes)
             using (Bitmap bmp = Scale(master, size))
             {
-                frames.Add(Dib(bmp));
+                frames.Add(Png(bmp));
                 dims.Add(size);
             }
 

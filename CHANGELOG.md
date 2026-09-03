@@ -1,3 +1,37 @@
+# LIMISAW 0.0.2 (2026-09-03)
+
+`LIMISAW.exe` drops from 442 KB to **248 KB**, and the icon is no longer stored
+twice.
+
+- **The app icon comes from the exe's own win32 icon group.** 0.0.1 embedded
+  `heh.ico` a second time as a managed resource, because
+  `System.Drawing.Icon` misparses a PNG-compressed frame when it picks a size
+  out of a multi-frame file — it takes the `BITMAPINFOHEADER` path and reads past
+  the end of the frame. The workaround was to store every frame as a raw DIB,
+  which cost 99 KB. The icon is now loaded with the shell's own `LoadImage`
+  against this module's icon group (`Marshal.GetHINSTANCE`, not
+  `GetModuleHandle(null)` — under any other host the process module is a
+  different binary with a different icon), so the frames can be PNG again:
+  102 134 -> 4 261 bytes for the artwork, and no second copy inside the assembly.
+  It is also the loader Windows uses for the taskbar and Alt-Tab, so the window
+  icon cannot disagree with them.
+- **`tests/standalone.cs` reads the icon directory, not just the loader's
+  answer.** Asking for every size and checking what comes back cannot catch a
+  regression here: this artwork is four flat colours, so the shell's reduction of
+  a single 128x128 frame is nearly pixel-identical to a real 16x16 one (measured:
+  0 differing pixels at 16 and 32, 10 at 24). The harness now also parses
+  `heh.ico`'s own directory and fails when a size the shell asks for has no frame
+  of its own — which is exactly the single-frame file 0.0.1 inherited. Both red
+  controls are recorded: an icon-less build fails at every size, and the pre-fix
+  artwork fails with `frames: 128  missing: 16, 24, 32, 48, 64`.
+
+## Fixed
+
+- Three dead `using System.Collections;` left over from the ArrayList-based JSON
+  parsing the C# probe replaced.
+- `build.ps1` assigned `$args` inside its test loop — PowerShell's automatic
+  variable for the caller's own arguments. Renamed to `$testArgs`.
+
 # LIMISAW 0.0.1 (2026-09-03)
 
 First release as its own program. LIMISAW was a tray monitor inside the SAITULS
@@ -16,19 +50,23 @@ toolkit; it is now standalone, and the point of this version is that
   - A wedged probe can no longer strand the refresh: there is no child process of
     our own to wait on, only the vendor CLIs, each under its own hard deadline.
   - `python not found` is gone as a failure mode.
-- **No folder.** Every palette (16), both alert WAVs and the app icon are
-  embedded as resources. `tests/standalone.cs` copies the exe alone into an empty
-  directory and proves all of it still loads.
+- **No folder.** Every palette (16) and both alert WAVs are embedded resources,
+  and the app icon is read back out of the exe's own win32 icon group — the one
+  Explorer already needs — so there is no second copy of it.
+  `tests/standalone.cs` copies the exe alone into an empty directory and proves
+  all of it still loads.
 - **Customisation still needs no rebuild.** A `Themes\*.json`, `Sounds\` folder
   or `heh.ico` next to the exe overrides the embedded copy — a palette file with
   the same slug *replaces* the built-in one rather than duplicating it.
 - **The app icon has real frames again.** It shipped as a single 128x128 frame,
   so the shell resampled it into every 16x16 slot — the exact blur `UI.md`
-  forbids. `heh.ico` now carries whole-pixel 16/24/32/48/64/128 frames, written
-  as 32bpp DIBs because `System.Drawing.Icon` misparses a PNG frame in a
-  multi-frame file (it takes the `BITMAPINFOHEADER` path and reads past the end)
-   — which is exactly the lookup the window and tray icon do.
-  `tools/make_ico.cs` regenerates it.
+  forbids. `heh.ico` now carries a point-sampled 16/24/32/48/64/128 frame each,
+  PNG-compressed, and the app loads it with the shell's own `LoadImage` instead
+  of `new Icon(path, w, h)`: `System.Drawing.Icon` misparses a PNG frame when it
+  picks a size out of a multi-frame file (it takes the `BITMAPINFOHEADER` path
+  and reads past the end). Going through the OS keeps the icon at 4 KB instead
+  of 99 KB of raw DIBs, and it is the same loader that draws the taskbar entry,
+  so the window icon cannot disagree with it. `tools/make_ico.cs` regenerates it.
 - **One build command.** `pwsh .\build.ps1` compiles with the .NET Framework
   compiler that ships inside Windows; `-Tests` builds and runs all 13 harnesses.
 

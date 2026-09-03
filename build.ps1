@@ -35,7 +35,10 @@ if ($missing) { throw "missing source file(s): $($missing -join ', ')" }
 $references = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll',
                 'System.Web.Extensions.dll')
 
-# Resource names must match what Assets.cs looks for.
+# Resource names must match what Assets.cs looks for. The icon is NOT embedded
+# as a managed resource: -win32icon: already puts it in the exe's win32 icon
+# group, which Explorer needs anyway, and Assets.AppIcon reads it back from
+# there — one copy instead of two.
 $resources = @()
 foreach ($theme in Get-ChildItem -LiteralPath (Join-Path $root 'Themes') -Filter '*.json') {
     $resources += "-resource:$($theme.FullName),Limisaw.Themes.$($theme.Name)"
@@ -44,16 +47,15 @@ foreach ($sound in Get-ChildItem -LiteralPath (Join-Path $root 'Sounds') -Filter
     $resources += "-resource:$($sound.FullName),Limisaw.Sounds.$($sound.Name)"
 }
 $icon = Join-Path $root 'heh.ico'
-if (Test-Path -LiteralPath $icon) { $resources += "-resource:$icon,Limisaw.heh.ico" }
+if (-not (Test-Path -LiteralPath $icon)) { throw "missing heh.ico: the app icon lives in the win32 icon group, so the build needs it" }
 
 $exe = Join-Path $root 'LIMISAW.exe'
-$arguments = @('-nologo', '-target:winexe', "-out:$exe", '-optimize+')
-if (Test-Path -LiteralPath $icon) { $arguments += "-win32icon:$icon" }
+$arguments = @('-nologo', '-target:winexe', "-out:$exe", '-optimize+', "-win32icon:$icon")
 $arguments += $references | ForEach-Object { "-r:$_" }
 $arguments += $resources
 $arguments += $sources
 
-if (-not $Quiet) { Write-Host "Building LIMISAW.exe ($($resources.Count) embedded resources)..." -ForegroundColor Cyan }
+if (-not $Quiet) { Write-Host "Building LIMISAW.exe ($($resources.Count) embedded resources + the win32 icon)..." -ForegroundColor Cyan }
 & $csc @arguments
 if ($LASTEXITCODE -ne 0) { throw "compiler returned $LASTEXITCODE" }
 $size = [math]::Round((Get-Item -LiteralPath $exe).Length / 1KB)
