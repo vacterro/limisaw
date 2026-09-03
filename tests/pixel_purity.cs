@@ -18,15 +18,10 @@ using System.Windows.Forms;
 // A theme is only a colour swap, so a theme that produced a blended pixel
 // would prove the swap leaked into the drawing - which is what this catches.
 //
-// Problip's icon is covered by Scripts/make_pixel_ico.py (NEAREST frames) +
-// tests/test_regs.py (exact-frame loading), not by this harness.
+// The app icon is covered by tests/standalone.cs (exact-frame loading at every
+// size the shell asks for); this harness only renders the tray bitmap.
 //
-// Build + run:
-//   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe -nologo ^
-//     -out:pixel_purity.exe -r:System.dll -r:System.Drawing.dll ^
-//     -r:System.Windows.Forms.dll -r:System.Web.Extensions.dll ^
-//     tests\pixel_purity.cs
-//   pixel_purity.exe        (exit 0 = all PASS)
+// Build + run: pwsh .\build.ps1 -Tests   (or see build.ps1 for the csc line)
 public static class PixelPurity
 {
     [DllImport("gdi32.dll")] static extern IntPtr CreateFont(int h,int w,int e,int o,int wt,uint it,uint un,uint so,uint cs,uint op,uint cp,uint q,uint pf,string face);

@@ -2,13 +2,12 @@
 LIMISAW.ini
 
 # Caches and build artifacts
-__pycache__/
-*.pyc
 *.bak
 *.tmp
 *.old
 
-# Test binaries built from tests\*.cs
+# Test binaries built by build.ps1 -Tests
+tests/bin/
 tests/*.exe
 tests/*.pdb
 tests/PROOF-*.txt

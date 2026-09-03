@@ -51,43 +51,61 @@ namespace Limisaw
             try { return C(Convert.ToInt32(s, 16)); } catch { return fallback; }
         }
 
+        // Every palette LIMISAW ships is embedded in the exe; a Themes\ folder
+        // next to it adds to them, and a file with the same slug REPLACES the
+        // embedded one, so a palette can be edited without a rebuild.
         public static List<Theme> Load(string root)
         {
             var list = new List<Theme> { new Theme() };
-            string dir = Path.Combine(root, "Themes");
-            if (!Directory.Exists(dir)) return list;
-            var ser = new JavaScriptSerializer();
-            foreach (string file in Directory.GetFiles(dir, "*.json"))
-            {
-                try
+            var bySlug = new Dictionary<string, Theme>(StringComparer.OrdinalIgnoreCase);
+            foreach (KeyValuePair<string, string> pair in Assets.ThemeFiles())
+                Add(list, bySlug, pair.Value, pair.Key);
+            string dir = Path.Combine(root ?? "", "Themes");
+            if (Directory.Exists(dir))
+                foreach (string file in Directory.GetFiles(dir, "*.json"))
                 {
-                    var doc = ser.Deserialize<Dictionary<string, object>>(File.ReadAllText(file));
-                    var tok = doc.ContainsKey("tokens") ? doc["tokens"] as Dictionary<string, object> : null;
-                    if (tok == null) continue;
-                    string slug = doc.ContainsKey("slug") ? doc["slug"] as string : Path.GetFileNameWithoutExtension(file);
-                    var t = new Theme { Slug = slug, Label = (doc.ContainsKey("label") ? doc["label"] as string : slug) ?? slug };
-                    if (doc.ContainsKey("order")) try { t.Order = Convert.ToInt32(doc["order"]); } catch { }
-                    t.BG = Hex(Get(tok, "background"), t.BG);
-                    t.SURFACE = Hex(Get(tok, "surface"), t.SURFACE);
-                    t.RAISED = Hex(Get(tok, "surfaceRaised"), t.RAISED);
-                    t.ALT = Hex(Get(tok, "surfaceAlt"), t.ALT);
-                    t.BDARK = Hex(Get(tok, "borderDark"), t.BDARK);
-                    t.BEVEL = Hex(Get(tok, "bevelLight"), t.BEVEL);
-                    t.TEXT = Hex(Get(tok, "textPrimary"), t.TEXT);
-                    t.TEXT2 = Hex(Get(tok, "textSecondary"), t.TEXT2);
-                    t.MUTED = Hex(Get(tok, "textMuted"), t.MUTED);
-                    t.SUCCESS = Hex(Get(tok, "success"), t.SUCCESS);
-                    t.WARNING = Hex(Get(tok, "warning"), t.WARNING);
-                    t.DANGER = Hex(Get(tok, "danger"), t.DANGER);
-                    t.DANGERTXT = Hex(Get(tok, "dangerText"), t.DANGERTXT);
-                    t.LINK = Hex(Get(tok, "link"), t.LINK);
-                    if (t.Slug == "goldendefault") list[0] = t; else list.Add(t);
+                    string text;
+                    try { text = File.ReadAllText(file); } catch { continue; }
+                    Add(list, bySlug, text, Path.GetFileNameWithoutExtension(file));
                 }
-                catch { }
-            }
             list.Sort((a, b) => a.Order != b.Order ? a.Order.CompareTo(b.Order)
                 : string.Compare(a.Label, b.Label, StringComparison.OrdinalIgnoreCase));
             return list;
+        }
+
+        static void Add(List<Theme> list, Dictionary<string, Theme> bySlug,
+                        string json, string fallbackSlug)
+        {
+            var ser = new JavaScriptSerializer();
+            try
+            {
+                var doc = ser.Deserialize<Dictionary<string, object>>(json);
+                var tok = doc.ContainsKey("tokens") ? doc["tokens"] as Dictionary<string, object> : null;
+                if (tok == null) return;
+                string slug = (doc.ContainsKey("slug") ? doc["slug"] as string : null) ?? fallbackSlug;
+                var t = new Theme { Slug = slug, Label = (doc.ContainsKey("label") ? doc["label"] as string : slug) ?? slug };
+                if (doc.ContainsKey("order")) try { t.Order = Convert.ToInt32(doc["order"]); } catch { }
+                t.BG = Hex(Get(tok, "background"), t.BG);
+                t.SURFACE = Hex(Get(tok, "surface"), t.SURFACE);
+                t.RAISED = Hex(Get(tok, "surfaceRaised"), t.RAISED);
+                t.ALT = Hex(Get(tok, "surfaceAlt"), t.ALT);
+                t.BDARK = Hex(Get(tok, "borderDark"), t.BDARK);
+                t.BEVEL = Hex(Get(tok, "bevelLight"), t.BEVEL);
+                t.TEXT = Hex(Get(tok, "textPrimary"), t.TEXT);
+                t.TEXT2 = Hex(Get(tok, "textSecondary"), t.TEXT2);
+                t.MUTED = Hex(Get(tok, "textMuted"), t.MUTED);
+                t.SUCCESS = Hex(Get(tok, "success"), t.SUCCESS);
+                t.WARNING = Hex(Get(tok, "warning"), t.WARNING);
+                t.DANGER = Hex(Get(tok, "danger"), t.DANGER);
+                t.DANGERTXT = Hex(Get(tok, "dangerText"), t.DANGERTXT);
+                t.LINK = Hex(Get(tok, "link"), t.LINK);
+                Theme prior;
+                if (bySlug.TryGetValue(t.Slug, out prior)) list[list.IndexOf(prior)] = t;
+                else if (t.Slug == "goldendefault") list[0] = t;
+                else list.Add(t);
+                bySlug[t.Slug] = t;
+            }
+            catch { }
         }
 
         static object Get(Dictionary<string, object> d, string key) { return d.ContainsKey(key) ? d[key] : null; }
@@ -414,13 +432,16 @@ namespace Limisaw
         static readonly Dictionary<string, string> Built = new Dictionary<string, string>();
         static bool Pruned;
 
-        // Where the picker looks. A Sounds folder next to the exe wins; the
-        // Windows media folder is the fallback so the list is never empty.
+        // Where the picker looks. A folder the user pointed at wins, then a
+        // Sounds folder next to the exe, then the WAVs embedded in the exe, and
+        // the Windows media folder last so the list is never empty.
         public static string Library(string root, string setting)
         {
             if (!string.IsNullOrEmpty(setting) && Directory.Exists(setting)) return setting;
-            string local = Path.Combine(root, "Sounds");
+            string local = Path.Combine(root ?? "", "Sounds");
             if (Directory.Exists(local)) return local;
+            string shipped = Assets.SoundLibrary();
+            if (shipped != null) return shipped;
             return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Media");
         }
 
@@ -433,6 +454,14 @@ namespace Limisaw
             if (Path.IsPathRooted(file)) return File.Exists(file) ? file : null;
             string p = Path.Combine(Library(root, library), file);
             if (File.Exists(p)) return p;
+            // The shipped defaults must keep working after the user points the
+            // picker at a folder that does not contain them.
+            string shipped = Assets.SoundLibrary();
+            if (shipped != null)
+            {
+                string s = Path.Combine(shipped, file);
+                if (File.Exists(s)) return s;
+            }
             return File.Exists(file) ? file : null;
         }
 
@@ -757,7 +786,7 @@ namespace Limisaw
             StartPosition = FormStartPosition.CenterScreen; ClientSize = new Size(420, 160);
             BackColor = Palette.BG; DoubleBuffered = true; TopMost = false;
             KeyPreview = true;
-            try { string ico = Path.Combine(root, "heh.ico"); if (File.Exists(ico)) Icon = new Icon(ico, SystemInformation.IconSize.Width, SystemInformation.IconSize.Height); } catch { }
+            try { Icon = Assets.AppIcon(root, SystemInformation.IconSize.Width) ?? Icon; } catch { }
             if (Settings.WindowX != int.MinValue && Settings.WindowY != int.MinValue)
             {
                 var saved = new Rectangle(Settings.WindowX, Settings.WindowY, Width, Height);
@@ -856,23 +885,12 @@ namespace Limisaw
             {
                 try
                 {
-                    string probe = Path.Combine(RootPath, "Scripts", "limisaw_probe.py");
-                    var psi = new ProcessStartInfo("python.exe", "\"" + probe + "\" --json")
-                    { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = RootPath };
-                    var proc = Process.Start(psi); if (proc == null) { SetError("python not found"); return; }
-                    // Async read + bounded wait. A blocking ReadToEnd made the
-                    // guard unreachable: a wedged probe left Refreshing true
-                    // forever and the tray never updated again. The window is
-                    // wider than the probe's own 66s budget so a slow vendor
-                    // CLI is reported by the probe, not killed here.
-                    var buffer = new System.Text.StringBuilder();
-                    proc.OutputDataReceived += (sender, data) => { if (data.Data != null) buffer.AppendLine(data.Data); };
-                    proc.BeginOutputReadLine();
-                    if (!proc.WaitForExit(90000)) { try { proc.Kill(); } catch { } SetError("timeout"); return; }
-                    proc.WaitForExit();
-                    string json = buffer.ToString();
-                    if (json.Trim().Length == 0) { SetError("probe exit " + proc.ExitCode + ", no output"); return; }
-                    ParseAndUpdate(json);
+                    // The probe runs IN this process (Probe.cs / ProbeClaude.cs /
+                    // ProbeAntigravity.cs): no interpreter, no script folder, no
+                    // child of our own to time out. Each vendor CLI still gets a
+                    // hard deadline of its own, and Probe.Run's total budget is
+                    // what bounds the sweep.
+                    Apply(Probe.Run());
                 }
                 catch (Exception ex) { SetError(ex.Message); }
             });
@@ -884,81 +902,12 @@ namespace Limisaw
             try { BeginInvoke((Action)(() => { Refresh(); UpdateTray(); })); } catch { }
         }
 
-        static string Str(Dictionary<string, object> d, string key)
-        {
-            return (d.ContainsKey(key) && d[key] != null) ? d[key] as string : null;
-        }
-        static bool Flag(Dictionary<string, object> d, string key)
-        {
-            return d.ContainsKey(key) && d[key] is bool && (bool)d[key];
-        }
-        static int Num(Dictionary<string, object> d, string key)
-        {
-            if (!d.ContainsKey(key) || d[key] == null) return 0;
-            try { return (int)Math.Round(Convert.ToDouble(d[key])); } catch { return 0; }
-        }
-
-        void ParseAndUpdate(string json)
+        void Apply(ProbeResult snapshot)
         {
             try
             {
-                var ser = new JavaScriptSerializer();
-                var root = ser.Deserialize<Dictionary<string, object>>(json);
-                var newAccounts = new List<AccountData>();
-                var accounts = root.ContainsKey("accounts") ? root["accounts"] as ArrayList : null;
-                if (accounts != null)
-                    foreach (var aObj in accounts)
-                    {
-                        var a = aObj as Dictionary<string, object>; if (a == null) continue;
-                        var ad = new AccountData
-                        {
-                            Provider = Str(a, "provider") ?? "",
-                            ProviderLabel = Str(a, "provider_label") ?? "",
-                            Name = Str(a, "name") ?? "",
-                            Status = Str(a, "status") ?? "",
-                            Plan = Str(a, "plan"),
-                            Error = Str(a, "error"),
-                            Ok = Flag(a, "ok"),
-                            Quiet = Flag(a, "quiet"),
-                        };
-                        var wins = a.ContainsKey("windows") ? a["windows"] as ArrayList : null;
-                        if (wins != null)
-                            foreach (var wObj in wins)
-                            {
-                                var w = wObj as Dictionary<string, object>; if (w == null) continue;
-                                ad.Windows.Add(new WindowData
-                                {
-                                    Key = Str(w, "key") ?? "",
-                                    Base = Str(w, "base") ?? "",
-                                    Label = Str(w, "label") ?? "",
-                                    Group = Str(w, "group") ?? "",
-                                    GroupLabel = Str(w, "group_label") ?? "",
-                                    Available = Flag(w, "available"),
-                                    Rem = Num(w, "remaining_percent"),
-                                    Reset = Str(w, "resets_at"),
-                                    GatedBy = Str(w, "gated_by"),
-                                    AssumedFull = Flag(w, "assumed_full"),
-                                    DurationMinutes = Num(w, "duration_minutes"),
-                                });
-                            }
-                        newAccounts.Add(ad);
-                    }
-                var newClis = new List<CliInfo>();
-                var clis = root.ContainsKey("cli") ? root["cli"] as ArrayList : null;
-                if (clis != null)
-                    foreach (var cObj in clis)
-                    {
-                        var c = cObj as Dictionary<string, object>; if (c == null) continue;
-                        newClis.Add(new CliInfo
-                        {
-                            Key = Str(c, "key") ?? "", Label = Str(c, "label") ?? "",
-                            Installed = Flag(c, "installed"), Path = Str(c, "path") ?? "",
-                            Command = Str(c, "command") ?? "", PowerShell = Str(c, "powershell") ?? "",
-                            Source = Str(c, "source") ?? "", Target = Str(c, "target") ?? "",
-                        });
-                    }
-                PrevAccounts = Accounts; Accounts = CarryForward(newAccounts, PrevAccounts);
-                if (newClis.Count > 0) Clis = newClis;
+                if (snapshot.Clis.Count > 0) Clis = snapshot.Clis;
+                PrevAccounts = Accounts; Accounts = CarryForward(snapshot.Accounts, PrevAccounts);
                 Stale = false; LastError = ""; LastFetch = DateTime.Now.ToString("HH:mm:ss");
                 DetectResets();
                 RearmLowAlerts();
@@ -2669,9 +2618,10 @@ namespace Limisaw
                 var showEvent = new System.Threading.EventWaitHandle(false,
                     System.Threading.EventResetMode.AutoReset, "Local\\LimisawShow");
 
+                // Everything the app needs is inside the exe, so its own folder
+                // is the root: LIMISAW.ini is written there, and Themes\ /
+                // Sounds\ next to it override the embedded copies.
                 string dir = AppDomain.CurrentDomain.BaseDirectory;
-                if (!File.Exists(Path.Combine(dir, "Scripts", "limisaw_probe.py")))
-                { string p = Path.GetDirectoryName(dir); if (File.Exists(Path.Combine(p, "Scripts", "limisaw_probe.py"))) dir = p; }
                 var s = new LimisawSettings(dir); s.Load();
                 List<Theme> themes = Theme.Load(dir);
                 Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);

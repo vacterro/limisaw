@@ -71,8 +71,9 @@ public static class TrayError
         Check("footer surfaces the failure", Footer(180) == "Tray icon failed: InvalidOperationException: GetHicon failed", Footer(180));
 
         // 3. a fetch error outranks the tray error
-        LastError = "python not found";
-        Check("fetch error outranks tray error", Footer(180) == "Error: python not found", Footer(180));
+        LastError = "Codex CLI not found on PATH";
+        Check("fetch error outranks tray error",
+            Footer(180) == "Error: Codex CLI not found on PATH", Footer(180));
 
         // 4. recovery clears the tray error
         LastError = ""; FailRender = false;
