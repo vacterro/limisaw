@@ -1,6 +1,9 @@
 # Runtime config, generated on first launch; carries window position and machine paths
 LIMISAW.ini
 
+# SAIPEN project memory — private working state, not for the public repo
+.saipen/
+
 # Caches and build artifacts
 *.bak
 *.tmp

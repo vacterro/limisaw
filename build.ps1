@@ -88,20 +88,22 @@ foreach ($name in ($testRefs.Keys | Sort-Object)) {
     $source = Join-Path $root "tests\$name.cs"
     if (-not (Test-Path -LiteralPath $source)) { continue }
     $testExe = Join-Path $outDir "$name.exe"
-    $args = @('-nologo', "-out:$testExe")
-    $args += $testRefs[$name] | ForEach-Object { "-r:$_" }
+    # NOT $args: that is PowerShell's automatic variable for the caller's own
+    # arguments, and assigning it inside a script is a silent trap.
+    $testArgs = @('-nologo', "-out:$testExe")
+    $testArgs += $testRefs[$name] | ForEach-Object { "-r:$_" }
     # limits.cs asserts the probe's own rules, so it links the engine sources
     # rather than reflecting over the built exe. -main picks its entry point
     # over LIMISAW.cs's own.
     if ($name -eq 'limits') {
-        $args += @('-r:System.Web.Extensions.dll', '-r:System.Drawing.dll', '-r:System.Windows.Forms.dll',
-                   '-main:LimitsTest')
-        $args += @((Join-Path $root 'Probe.cs'), (Join-Path $root 'ProbeClaude.cs'),
-                   (Join-Path $root 'ProbeAntigravity.cs'), (Join-Path $root 'Assets.cs'),
-                   (Join-Path $root 'LIMISAW.cs'))
+        $testArgs += @('-r:System.Web.Extensions.dll', '-r:System.Drawing.dll', '-r:System.Windows.Forms.dll',
+                       '-main:LimitsTest')
+        $testArgs += @((Join-Path $root 'Probe.cs'), (Join-Path $root 'ProbeClaude.cs'),
+                       (Join-Path $root 'ProbeAntigravity.cs'), (Join-Path $root 'Assets.cs'),
+                       (Join-Path $root 'LIMISAW.cs'))
     }
-    $args += $source
-    & $csc @args
+    $testArgs += $source
+    & $csc @testArgs
     if ($LASTEXITCODE -ne 0) { $failed.Add("$name (build)"); continue }
 
     Write-Host "--- $name" -ForegroundColor Yellow
