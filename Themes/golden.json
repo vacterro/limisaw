@@ -1,0 +1,28 @@
+{
+  "slug": "golden",
+  "label": "Dark Golden (Win95)",
+  "order": 1,
+  "tokens": {
+    "background": "#342012",
+    "backgroundSoft": "#3A2616",
+    "surface": "#4A341B",
+    "surfaceRaised": "#5A4324",
+    "surfaceAlt": "#634B2B",
+    "borderDark": "#1C1208",
+    "borderHighlight": "#D3B57A",
+    "bevelLight": "#826941",
+    "borderMuted": "#665033",
+    "textPrimary": "#E2CA95",
+    "textSecondary": "#C5AB6E",
+    "textMuted": "#95804C",
+    "accentTeal": "#008080",
+    "accentTealDeep": "#006060",
+    "success": "#5B9630",
+    "warning": "#969630",
+    "danger": "#963030",
+    "dangerText": "#D37676",
+    "selection": "#5A4324",
+    "compareBack": "#24170C",
+    "link": "#D3B57A"
+  }
+}

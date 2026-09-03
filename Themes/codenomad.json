@@ -1,0 +1,29 @@
+{
+  "slug": "codenomad",
+  "label": "CodeNomad",
+  "order": 6,
+  "source": "AppData/@neuralnomads/codenomad-electron-app cache: #0E1116 ground, #24292E/#2F363D surfaces, indigo #624AFF / #615CED accent, #E1E4E8 text",
+  "tokens": {
+    "background": "#1C242A",
+    "backgroundSoft": "#21282F",
+    "surface": "#29313C",
+    "surfaceRaised": "#343D4A",
+    "surfaceAlt": "#3C4552",
+    "borderDark": "#0E1216",
+    "borderHighlight": "#9D86D1",
+    "bevelLight": "#575776",
+    "borderMuted": "#424A57",
+    "textPrimary": "#B099DE",
+    "textSecondary": "#9C84C8",
+    "textMuted": "#675091",
+    "accentTeal": "#008080",
+    "accentTealDeep": "#006060",
+    "success": "#5B9630",
+    "warning": "#969630",
+    "danger": "#963030",
+    "dangerText": "#D27272",
+    "selection": "#343D4A",
+    "compareBack": "#13181D",
+    "link": "#9D86D1"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "slug": "claudecode",
+  "label": "Claude Code",
+  "order": 2,
+  "source": "Anthropic's terminal palette: warm near-neutral surfaces (#1F1E1D/#262624), coral #D97757 accent, cream text",
+  "tokens": {
+    "background": "#29241D",
+    "backgroundSoft": "#2E2922",
+    "surface": "#3B362A",
+    "surfaceRaised": "#484436",
+    "surfaceAlt": "#514C3D",
+    "borderDark": "#15130F",
+    "borderHighlight": "#D1A27C",
+    "bevelLight": "#75644F",
+    "borderMuted": "#555144",
+    "textPrimary": "#E0B997",
+    "textSecondary": "#C39870",
+    "textMuted": "#93704E",
+    "accentTeal": "#008080",
+    "accentTealDeep": "#006060",
+    "success": "#5B9630",
+    "warning": "#969630",
+    "danger": "#963030",
+    "dangerText": "#D37575",
+    "selection": "#484436",
+    "compareBack": "#1C1914",
+    "link": "#D1A27C"
+  }
+}

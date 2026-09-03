@@ -1,0 +1,22 @@
+# Runtime config, generated on first launch; carries window position and machine paths
+LIMISAW.ini
+
+# Caches and build artifacts
+__pycache__/
+*.pyc
+*.bak
+*.tmp
+*.old
+
+# Test binaries built from tests\*.cs
+tests/*.exe
+tests/*.pdb
+tests/PROOF-*.txt
+
+# Windows junk
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Personal shortcuts
+*.lnk

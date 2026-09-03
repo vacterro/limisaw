@@ -1,0 +1,29 @@
+{
+  "slug": "freebuff",
+  "label": "FreeBuff",
+  "order": 5,
+  "source": "strings in the installed app.asar: #0C0D0F ground, #1F2937 slate surface, lime #7CFF3F / green #22C55E accent",
+  "tokens": {
+    "background": "#1B232B",
+    "backgroundSoft": "#202830",
+    "surface": "#28303D",
+    "surfaceRaised": "#333B4B",
+    "surfaceAlt": "#3A4354",
+    "borderDark": "#0E1116",
+    "borderHighlight": "#89D37A",
+    "bevelLight": "#506B5F",
+    "borderMuted": "#414958",
+    "textPrimary": "#A0E295",
+    "textSecondary": "#7AC56E",
+    "textMuted": "#55954C",
+    "accentTeal": "#008080",
+    "accentTealDeep": "#006060",
+    "success": "#5B9630",
+    "warning": "#969630",
+    "danger": "#963030",
+    "dangerText": "#D27272",
+    "selection": "#333B4B",
+    "compareBack": "#13181D",
+    "link": "#89D37A"
+  }
+}
