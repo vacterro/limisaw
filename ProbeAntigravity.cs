@@ -41,13 +41,14 @@ namespace Limisaw
                 return Unavailable(acc, "deadline_exceeded",
                     "no time left in this sweep to read Antigravity's quota");
 
-            List<ProbeWindow> windows = CliWindows(deadline);
+            string cliError;
+            List<ProbeWindow> windows = CliWindows(deadline, out cliError);
             if (windows != null && windows.Count > 0)
             {
                 acc.Status = Model.OK; acc.Ok = true; acc.Windows = windows;
                 return acc;
             }
-            return Journal(acc);
+            return Journal(acc, cliError);
         }
 
         static ProbeAccount Unavailable(ProbeAccount acc, string code, string summary)
@@ -75,19 +76,24 @@ namespace Limisaw
         // The groups are INDEPENDENT pools — "within each group, models share a
         // weekly limit and a 5-hour limit" — so every window carries its group
         // and gating never crosses pools.
-        static List<ProbeWindow> CliWindows(double deadline)
+        // `error` is why the CLI could not answer, or null when it is simply not
+        // installed — that is what the journal fallback exists for, not a fault.
+        static List<ProbeWindow> CliWindows(double deadline, out string error)
         {
+            error = null;
             string exe = Cli.Resolve("antigravity");
             if (exe.Length == 0) return null;
             Cli.Result res = Cli.Run(exe,
                 new[] { "-p", "/usage", "--output-format", "json" }, deadline, null);
-            if (!res.Ok) return null;
+            if (!res.Ok) { error = "agy /usage: " + res.Error; return null; }
             object payload = J.Parse(res.Stdout);
-            if (payload == null) return null;
+            if (payload == null) { error = "agy /usage did not return JSON"; return null; }
             string status = J.Str(J.Get(payload, "status"));
-            if (!string.IsNullOrEmpty(status) && status != "SUCCESS") return null;
+            if (!string.IsNullOrEmpty(status) && status != "SUCCESS")
+            { error = "agy /usage: " + status; return null; }
             List<Row> rows = ParseUsagePayload(payload);
-            if (rows.Count == 0) return null;
+            if (rows.Count == 0)
+            { error = "agy /usage reported no readable quota window"; return null; }
             return WindowsFrom(rows, "antigravity-cli-usage");
         }
 
@@ -219,17 +225,21 @@ namespace Limisaw
         //               reached. ... Resets in 81h17m43s."}
         //
         // That is the provider's own verdict: spent until timestamp + delay.
-        static ProbeAccount Journal(ProbeAccount acc)
+        //
+        // `cliError` is non-null when the CLI WAS tried and refused. Telling that
+        // user to install what they already have is the worst answer available:
+        // it hides an actionable failure (usually "not logged in") behind advice
+        // they have already followed.
+        static ProbeAccount Journal(ProbeAccount acc, string cliError)
         {
             double now = Stamp.Now;
             Refusal refusal = LatestRefusal(DataDir(), now);
             if (refusal == null)
-                return Unavailable(acc, "no_refusal_recorded",
-                    "install the Antigravity CLI for exact quota — without it "
-                    + "Antigravity only reports a limit when it refuses work");
+                return Unavailable(acc, NoQuotaCode(cliError), NoQuotaSummary(cliError));
             if (refusal.ResetEpoch <= now - ResetGraceS)
-                return Unavailable(acc, "quota_unknown",
-                    "last Antigravity block already reset — install the "
+                return Unavailable(acc,
+                    string.IsNullOrEmpty(cliError) ? "quota_unknown" : "probe_failed",
+                    cliError ?? "last Antigravity block already reset — install the "
                     + "Antigravity CLI for exact quota");
             acc.Status = Model.OK;
             acc.Ok = true;
@@ -242,6 +252,23 @@ namespace Limisaw
                 ResetEpoch = refusal.ResetEpoch, Source = "antigravity-brain-message",
             });
             return acc;
+        }
+
+        // A missing CLI is Antigravity working as designed — it can only quote
+        // quota when the backend refuses work, so "nothing to report" is its
+        // healthy resting state and stays Quiet (muted `idle:`). A CLI that IS
+        // installed and refused is a fault the user must act on, so it must be
+        // loud: `probe_failed` is outside Model.QuietCodes on purpose.
+        public static string NoQuotaCode(string cliError)
+        {
+            return string.IsNullOrEmpty(cliError) ? "no_refusal_recorded" : "probe_failed";
+        }
+
+        public static string NoQuotaSummary(string cliError)
+        {
+            if (!string.IsNullOrEmpty(cliError)) return cliError;
+            return "install the Antigravity CLI for exact quota — without it "
+                + "Antigravity only reports a limit when it refuses work";
         }
 
         class Refusal

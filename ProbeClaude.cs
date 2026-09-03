@@ -46,7 +46,8 @@ namespace Limisaw
             };
 
             var readings = new List<Reading>();
-            Reading cli = CliUsage(deadline, now);
+            string cliError;
+            Reading cli = CliUsage(deadline, now, out cliError);
             if (cli != null) readings.Add(cli);
             string bridgeError = null;
             Reading bridge = BridgeCache(out bridgeError);
@@ -64,7 +65,7 @@ namespace Limisaw
             if (readings.Count == 0 && blocks.Count == 0)
             {
                 acc.Status = Model.UNAVAILABLE;
-                acc.Error = bridgeError ?? "Claude has not supplied rate limits yet";
+                acc.Error = Summary(cliError, bridgeError);
                 acc.Quiet = false;
                 acc.Windows.Add(ProbeWindow.Unavailable(Model.FIVE_HOUR));
                 acc.Windows.Add(ProbeWindow.Unavailable(Model.WEEKLY));
@@ -179,13 +180,32 @@ namespace Limisaw
             public string Source = "";
         }
 
+        // Which sentence the card gets when no source produced a reading.
+        //
+        // The CLI's own words win. It is the primary source and the only one that
+        // can say WHY: "Not logged in" is a thing the user can fix, while
+        // "has not supplied rate limits yet" reads as "nothing has run yet" and
+        // sends them to wait instead of to re-auth. The bridge's complaint is
+        // second because it only describes an optional status-line cache.
+        public static string Summary(string cliError, string bridgeError)
+        {
+            if (!string.IsNullOrEmpty(cliError)) return cliError;
+            if (!string.IsNullOrEmpty(bridgeError)) return bridgeError;
+            return "Claude has not supplied rate limits yet";
+        }
+
         // ── source 0: the CLI ────────────────────────────────────────────────
         // `claude -p "/usage"` is the only local source carrying BOTH the
         // percentage and the reset time, and it comes from Anthropic's own
         // endpoint. In print mode it answers with 0 turns / $0.00, so reading
         // the quota never spends any.
-        static Reading CliUsage(double deadline, double now)
+        //
+        // `error` is the reason the CLI could not answer, or null when there was
+        // nothing to ask (not installed) — that is not a failure to report, the
+        // CLIs tab already says which vendors are missing.
+        static Reading CliUsage(double deadline, double now, out string error)
         {
+            error = null;
             string exe = Cli.Resolve("claude");
             if (exe.Length == 0) return null;
             string session = Guid.NewGuid().ToString();
@@ -194,13 +214,19 @@ namespace Limisaw
                 new[] { "-p", "/usage", "--output-format", "json", "--session-id", session },
                 deadline, dir);
             DropTranscript(session, dir);
-            if (!res.Ok) return null;
+            if (!res.Ok) { error = "claude /usage: " + res.Error; return null; }
             object payload = J.Parse(res.Stdout);
-            if (payload == null || J.Flag(J.Get(payload, "is_error"))) return null;
+            if (payload == null || J.Flag(J.Get(payload, "is_error")))
+            { error = "claude /usage reported an error"; return null; }
             string answer = J.Str(J.Get(payload, "result"));
-            if (string.IsNullOrEmpty(answer)) return null;
+            if (string.IsNullOrEmpty(answer))
+            { error = "claude /usage returned no text"; return null; }
             Dictionary<string, Slot> windows = ParseUsageText(answer, now);
-            if (windows.Count == 0) return null;   // API-key account: no plan quota
+            // An API-key (non-subscription) account has no plan quota and the CLI
+            // answers with a cost summary instead. That is not a fault, but it is
+            // still the reason the card is empty, so it is worth saying.
+            if (windows.Count == 0)
+            { error = "claude /usage reported no subscription limits"; return null; }
             return new Reading { Windows = windows, CapturedAt = now, Source = "claude-cli-usage" };
         }
 

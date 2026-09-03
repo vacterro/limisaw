@@ -76,6 +76,7 @@ public static class LimitsTest
             Codex();
             Claude();
             Clis();
+            Reasons();
             Console.WriteLine("---");
             Console.WriteLine(checks + " checks");
             Console.WriteLine(fails == 0 ? "PASS (0 failures)" : "FAILED (" + fails + " failures)");
@@ -88,6 +89,116 @@ public static class LimitsTest
             Console.WriteLine(ex.StackTrace);
             return 1;
         }
+    }
+
+    // A probe failure the user cannot read is a probe failure the user cannot
+    // fix. Two halves, both of which were broken (T-006): the vendor's own
+    // reason has to survive the provider, and the card has to draw it.
+    static void Reasons()
+    {
+        Console.WriteLine("== a failure says WHY, in the vendor's own words ==");
+
+        // The CLI is the primary source and the only one that can say "Not
+        // logged in". "has not supplied rate limits yet" reads as "nothing has
+        // run yet" and sends the user to wait instead of to re-auth.
+        Check("the Claude CLI's own reason outranks the generic wording",
+            ClaudeSource.Summary("claude /usage: Not logged in", null)
+                == "claude /usage: Not logged in", ClaudeSource.Summary("claude /usage: Not logged in", null));
+        Check("...and outranks the optional status-line cache's complaint",
+            ClaudeSource.Summary("claude /usage: Not logged in", "connect Claude Code in Clock settings")
+                == "claude /usage: Not logged in", "");
+        Check("the bridge speaks only when the CLI had nothing to say",
+            ClaudeSource.Summary(null, "connect Claude Code in Clock settings")
+                == "connect Claude Code in Clock settings", "");
+        Check("with no source at all the wording stays honest, not blank",
+            ClaudeSource.Summary(null, null) == "Claude has not supplied rate limits yet",
+            ClaudeSource.Summary(null, null));
+        Check("an empty reason is treated as no reason, never printed as one",
+            ClaudeSource.Summary("", "") == "Claude has not supplied rate limits yet", "");
+
+        // Telling a user to install what they already have is worse than saying
+        // nothing: it hides the actionable failure behind advice already taken.
+        Check("a refusing Antigravity CLI is not told to install itself",
+            AntigravitySource.NoQuotaSummary("agy /usage: not authenticated")
+                == "agy /usage: not authenticated", "");
+        Check("a missing Antigravity CLI still gets the install advice",
+            AntigravitySource.NoQuotaSummary(null).IndexOf("install the Antigravity CLI",
+                StringComparison.Ordinal) >= 0, AntigravitySource.NoQuotaSummary(null));
+        // Quiet draws muted "idle:", which is right for a vendor that is idle BY
+        // DESIGN and wrong for one that just refused work.
+        Check("a refusing CLI is loud, not idle",
+            !Model.Quiet(AntigravitySource.NoQuotaCode("agy /usage: not authenticated")),
+            AntigravitySource.NoQuotaCode("agy /usage: not authenticated"));
+        Check("no CLI at all stays quiet — nothing to report is Antigravity's resting state",
+            Model.Quiet(AntigravitySource.NoQuotaCode(null)),
+            AntigravitySource.NoQuotaCode(null));
+
+        // End-to-end: a real child process that exits nonzero, and its first
+        // stderr line arriving as the reason. Without this the string plumbing
+        // above could be perfect over a value nothing ever produces.
+        string cmd = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe";
+        Cli.Result bad = Cli.Run(cmd,
+            new[] { "/c", "echo Not logged in 1>&2 & exit /b 1" }, Stamp.Now + 20, null);
+        Check("a CLI that exits nonzero yields its first stderr line",
+            !bad.Ok && bad.Error == "Not logged in", "ok=" + bad.Ok + " error=" + bad.Error);
+        Cli.Result good = Cli.Run(cmd, new[] { "/c", "echo fine" }, Stamp.Now + 20, null);
+        Check("a CLI that succeeds reports no error (the gate is not stuck red)",
+            good.Ok && good.Error.Length == 0, "ok=" + good.Ok + " error=" + good.Error);
+
+        // The surface half. A failed sweep leaves unavailable windows behind, so
+        // a reason drawn only for an EMPTY window list is a reason no user ever
+        // sees — measured on 1762f03: codex/Codex ERROR, 2 windows, reason
+        // "Codex CLI not found on PATH", nothing on the card.
+        var failed = new AccountData
+        {
+            Provider = "codex", ProviderLabel = "Codex", Name = "Codex",
+            Status = Model.ERROR, Ok = false, Error = "Codex CLI not found on PATH",
+        };
+        failed.Windows.Add(new WindowData { Key = Model.FIVE_HOUR, Available = false });
+        failed.Windows.Add(new WindowData { Key = Model.WEEKLY, Available = false });
+        bool loud;
+        string note = LimisawForm.CardNote(failed, out loud);
+        Check("a card with unavailable windows still shows the reason",
+            note == "ERROR: Codex CLI not found on PATH", note ?? "null");
+        Check("...and it is drawn as a fault", loud, "bad=" + loud);
+        Check("the card reserves a line for it, so the last window cannot clip",
+            LimisawForm.CardLines(failed) == 3, LimisawForm.CardLines(failed) + " lines");
+
+        var idle = new AccountData
+        {
+            Provider = "antigravity", ProviderLabel = "Antigravity", Name = "Antigravity",
+            Status = Model.UNAVAILABLE, Ok = false, Quiet = true,
+            Error = "install the Antigravity CLI for exact quota",
+        };
+        idle.Windows.Add(new WindowData { Key = "quota", Available = false });
+        string idleNote = LimisawForm.CardNote(idle, out loud);
+        Check("an idle-by-design provider reads idle, not ERROR",
+            idleNote != null && idleNote.StartsWith("idle: ", StringComparison.Ordinal) && !loud,
+            (idleNote ?? "null") + " bad=" + loud);
+
+        // A carried card's note already holds the failure text (CarryForward
+        // copies Error into CarriedNote), so printing both would say it twice.
+        var carried = new AccountData
+        {
+            Provider = "claude", ProviderLabel = "Claude Code", Name = "Claude",
+            Status = Model.ERROR, Ok = false, Carried = true,
+            CarriedAt = "12:00:00", CarriedNote = "claude /usage: timeout",
+            Error = "claude /usage: timeout",
+        };
+        carried.Windows.Add(new WindowData { Key = Model.FIVE_HOUR, Available = true, Rem = 40 });
+        string carriedNote = LimisawForm.CardNote(carried, out loud);
+        Check("a carried card says stale once, not stale AND error",
+            carriedNote == "stale: claude /usage: timeout" && !loud, carriedNote ?? "null");
+
+        var healthy = new AccountData
+        {
+            Provider = "codex", ProviderLabel = "Codex", Name = "Codex",
+            Status = Model.OK, Ok = true,
+        };
+        healthy.Windows.Add(new WindowData { Key = Model.FIVE_HOUR, Available = true, Rem = 80 });
+        string none = LimisawForm.CardNote(healthy, out loud);
+        Check("a healthy card carries no line at all",
+            none == null && LimisawForm.CardLines(healthy) == 1, none ?? "null");
     }
 
     static void Antigravity()

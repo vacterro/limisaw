@@ -834,8 +834,7 @@ namespace Limisaw
             if (Accounts.Count == 0) return 26;
             int total = 0;
             foreach (AccountData a in Accounts)
-                total += CardHeight + Math.Max(1, a.Windows.Count) * RowH + Gap + Gap
-                    + (a.Carried && a.CarriedNote.Length > 0 ? RowH : 0);
+                total += CardHeight + CardLines(a) * RowH + Gap + Gap;
             return total;
         }
 
@@ -1369,9 +1368,9 @@ namespace Limisaw
             int nameW = pctX - 18 - Gap;
             foreach (AccountData a in Accounts)
             {
-                int rows = Math.Max(1, a.Windows.Count);
-                bool note = a.Carried && a.CarriedNote.Length > 0;
-                int cardH = CardHeight + rows * RowH + Gap + (note ? RowH : 0);
+                bool bad;
+                string lead = CardNote(a, out bad);
+                int cardH = CardHeight + CardLines(a) * RowH + Gap;
                 using (var bg = new SolidBrush(Palette.RAISED)) g.FillRectangle(bg, 8, cursor, cw, cardH);
                 DrawBevel(g, 8, cursor, cw, cardH, false);
                 string tag = a.Carried ? "last good" + (a.CarriedAt.Length > 0 ? " " + a.CarriedAt : "")
@@ -1381,17 +1380,14 @@ namespace Limisaw
                 if (tagW > 0) DrawText(g, tag, 8 + cw - 8 - tagW, cursor + 6,
                     a.Carried ? Palette.WARNING : Palette.TEXT2, 10);
                 int ry = cursor + CardHeight - 4;
-                if (a.Windows.Count == 0)
+                if (lead != null)
                 {
-                    string msg = a.Error != null ? a.Error : a.Status;
-                    DrawTextFit(g, (a.Quiet ? "idle: " : "ERROR: ") + msg, 14, ry, cw - 20,
-                        a.Quiet ? Palette.MUTED : Palette.DANGERTXT, 10);
-                }
-                else if (note)
-                {
-                    // The stale numbers follow; this line is WHY they are stale,
-                    // which is the actionable half.
-                    DrawTextFit(g, "stale: " + a.CarriedNote, 14, ry, cw - 20, Palette.WARNING, 10);
+                    // The reason goes ABOVE the rows, whether or not there are
+                    // any: a failed sweep still leaves unavailable windows
+                    // behind, and drawing this only for an empty list is what
+                    // hid every provider's error message (see T-006).
+                    DrawTextFit(g, lead, 14, ry, cw - 20,
+                        a.Carried ? Palette.WARNING : bad ? Palette.DANGERTXT : Palette.MUTED, 10);
                     ry += RowH;
                 }
                 foreach (WindowData win in a.Windows)
@@ -1408,6 +1404,34 @@ namespace Limisaw
                 }
                 cursor += cardH + Gap;
             }
+        }
+
+        // The one line a card may carry above its window rows, and whether it is
+        // a fault. Reason and stale note are the same slot on purpose: a carried
+        // card's note already holds the failure text (CarryForward copies Error
+        // into CarriedNote), so showing both would print it twice.
+        //
+        // `bad` separates a fault from a provider that is idle by design —
+        // Antigravity can only quote quota when its backend refuses work, and a
+        // permanently lit red line with nothing to fix trains the user to ignore
+        // it (Model.QuietCodes).
+        public static string CardNote(AccountData a, out bool bad)
+        {
+            bad = false;
+            if (a.Carried)
+                return a.CarriedNote.Length > 0 ? "stale: " + a.CarriedNote : null;
+            if (a.Ok) return null;
+            bad = !a.Quiet;
+            return (a.Quiet ? "idle: " : "ERROR: ") + (a.Error ?? a.Status);
+        }
+
+        // Height and paint read the SAME count, so a card can never be measured
+        // shorter than it draws and clip its last row.
+        public static int CardLines(AccountData a)
+        {
+            bool bad;
+            int lines = a.Windows.Count + (CardNote(a, out bad) != null ? 1 : 0);
+            return Math.Max(1, lines);
         }
 
         void PaintInstallPanel(Graphics g, int cursor, int w)
@@ -2277,18 +2301,13 @@ namespace Limisaw
                     Right = a.Carried ? "last good" + (a.CarriedAt.Length > 0 ? " " + a.CarriedAt : "")
                         : a.Plan != null ? a.Plan : (a.Ok ? "" : a.Status.ToLowerInvariant()),
                 });
-                if (a.Windows.Count == 0)
-                {
+                // Same slot and same rule as the card (CardNote): the reason is
+                // drawn whether or not unavailable windows follow it.
+                bool bad;
+                string lead = CardNote(a, out bad);
+                if (lead != null)
                     rows.Add(new TrayPopup.Row
-                    {
-                        Left = (a.Quiet ? "idle: " : "error: ") + (a.Error ?? a.Status),
-                        Available = false, Dim = true,
-                    });
-                    continue;
-                }
-                if (a.Carried && a.CarriedNote.Length > 0)
-                    rows.Add(new TrayPopup.Row
-                    { Left = "stale: " + a.CarriedNote, Available = false, Dim = true });
+                    { Left = lead, Available = false, Dim = true });
                 foreach (WindowData w in a.Windows)
                 {
                     string id = a.Provider + "/" + a.Name + "/" + w.Key;

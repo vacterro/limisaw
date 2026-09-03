@@ -1,3 +1,24 @@
+# LIMISAW 0.0.3 (2026-09-03)
+
+## Fixed
+
+- **A vendor that is installed but refusing now says so, in its own words, on
+  the card.** Two defects stacked. The probe discarded the vendor's first stderr
+  line ("Not logged in", "timeout") on the way out, so Claude read as "has not
+  supplied rate limits yet" — which sounds like nothing has run yet — and
+  Antigravity advised installing the CLI that was already on PATH, muted as an
+  idle card. And the card could not have shown any of it anyway: the reason was
+  drawn only for an account with an empty window list, while every failed
+  snapshot ships with unavailable windows filling it, so the sentence existed in
+  the model and reached nothing but the tray tooltip. Both halves fixed: the
+  vendor's reason survives to the card and hover panel, a refusing CLI is loud
+  rather than idle (a vendor that is idle *by design* stays muted), and the card
+  height accounts for the line, so a real reason can no longer clip the last row.
+  `tests/limits.cs` grew 17 checks (50 -> 67) with a red control against the
+  pre-fix behaviour.
+- A failing CLI's own first stderr line is now the message the user sees, found
+  end-to-end against a real child process, not just through string plumbing.
+
 # LIMISAW 0.0.2 (2026-09-03)
 
 `LIMISAW.exe` drops from 442 KB to **248 KB**, and the icon is no longer stored
