@@ -75,6 +75,7 @@ public static class LimitsTest
             Gating();
             Resets();
             Codex();
+            Banked();
             Claude();
             Zcode();
             FreeToRead();
@@ -392,6 +393,192 @@ public static class LimitsTest
             CodexSource.ParseWindows(J.Parse("{}"), out plan).Count == 0, "");
         Check("an unusable duration is dropped rather than keyed",
             CodexSource.DurationLabel(0) == null && CodexSource.DurationLabel(null) == null, "");
+    }
+
+    // Verbatim `account/rateLimits/read`, captured live from a Plus account that
+    // had a banked reset and a second quota pool. Both were being thrown away.
+    const string CodexFull = @"{""rateLimits"":{""limitId"":""codex"",""planType"":""plus"",
+        ""primary"":{""usedPercent"":0,""windowDurationMins"":300,""resetsAt"":1788533201},
+        ""secondary"":{""usedPercent"":100,""windowDurationMins"":10080,""resetsAt"":1788748070}},
+      ""rateLimitsByLimitId"":{
+        ""codex"":{""limitId"":""codex"",""planType"":""plus"",
+          ""primary"":{""usedPercent"":0,""windowDurationMins"":300,""resetsAt"":1788533201},
+          ""secondary"":{""usedPercent"":100,""windowDurationMins"":10080,""resetsAt"":1788748070}},
+        ""base_model_inference"":{""limitId"":""base_model_inference"",""limitName"":""gpt-reserve"",
+          ""primary"":{""usedPercent"":0,""windowDurationMins"":10080,""resetsAt"":1789120001},
+          ""secondary"":null}},
+      ""rateLimitResetCredits"":{""availableCount"":1,""credits"":[
+        {""id"":""RateLimitResetCredit_ca616cd1"",""resetType"":""codexRateLimits"",""status"":""available"",
+         ""grantedAt"":1788483108,""expiresAt"":1791075108,""title"":""Full reset (Weekly + 5 hr)"",
+         ""description"":""Thanks for using Codex!""}]}}";
+
+    // Two things Codex reports that LIMISAW used to discard: a SECOND quota pool,
+    // and banked resets. Both arrive in the same payload as the windows, so
+    // reading one and dropping the others was pure loss.
+    static void Banked()
+    {
+        Console.WriteLine("== a second pool, and the banked resets Codex grants ==");
+        string plan;
+        List<ProbeWindow> windows = CodexSource.ParseWindows(J.Parse(CodexFull), out plan);
+
+        // Keying on duration alone made the reserve pool's weekly collide with
+        // the main pool's and lose to first-match-wins, so a whole pool vanished.
+        Check("the reserve pool is no longer swallowed by the main one",
+            windows.Count == 3, Keys(windows));
+        Check("the main pool keeps the bare keys a saved tray choice points at",
+            Win(windows, Model.FIVE_HOUR) != null && Win(windows, Model.WEEKLY) != null, Keys(windows));
+        ProbeWindow reserve = Win(windows, "weekly@base_model_inference");
+        Check("the reserve pool arrives pool-qualified",
+            reserve != null, Keys(windows));
+        Check("...carrying the vendor's own name for it, not an id",
+            reserve != null && reserve.GroupLabel == "gpt-reserve",
+            reserve == null ? "missing" : reserve.GroupLabel);
+        Check("...with its own reset, not the main pool's",
+            reserve != null && reserve.ResetEpoch != Win(windows, Model.WEEKLY).ResetEpoch, "");
+        Check("the default pool sorts first, so a reserve weekly cannot split it",
+            windows[0].Key == Model.FIVE_HOUR && windows[1].Key == Model.WEEKLY,
+            Keys(windows));
+
+        // The pool split is what makes gating correct here: the main weekly is
+        // spent, but that says nothing about the reserve.
+        //
+        // `now` sits just BEFORE the fixture's own reset stamps. Past them, the
+        // elapsed-reset pass refills every window and correctly lifts the gate —
+        // which would prove nothing about pools.
+        double now = 1788500000;
+        List<ProbeWindow> resolved = Model.Resolve(windows, now);
+        Check("a spent main weekly gates its own 5-hour window",
+            Win(resolved, Model.FIVE_HOUR).GatedBy == Model.WEEKLY,
+            Win(resolved, Model.FIVE_HOUR).GatedBy ?? "none");
+        Check("...and does NOT touch the reserve pool",
+            Win(resolved, "weekly@base_model_inference").GatedBy == null
+            && Win(resolved, "weekly@base_model_inference").Remaining == 100.0,
+            "reserve rem=" + Win(resolved, "weekly@base_model_inference").Remaining);
+
+        // ── banked resets ────────────────────────────────────────────────────
+        ResetCredits credits = CodexSource.ParseResetCredits(J.Parse(CodexFull));
+        Check("the banked reset is read at all", credits != null && credits.Available == 1,
+            credits == null ? "null" : credits.Available + " available");
+        Check("the vendor's own title is kept — it says what the credit refills",
+            credits != null && credits.Title == "Full reset (Weekly + 5 hr)",
+            credits == null ? "null" : credits.Title);
+        Check("the expiry is parsed, so the card can say how long it lasts",
+            credits != null && credits.ExpiresEpoch.HasValue, "");
+        Check("the credit's own id is kept, so redeeming names an exact one",
+            credits != null && credits.Id == "RateLimitResetCredit_ca616cd1",
+            credits == null ? "null" : credits.Id);
+
+        // A spent or expired credit shown as available is the one wrong answer.
+        Check("a used credit is not offered",
+            CodexSource.ParseResetCredits(J.Parse(
+                @"{""rateLimitResetCredits"":{""availableCount"":0,""credits"":[
+                   {""id"":""x"",""status"":""redeemed"",""title"":""Old""}]}}")) == null, "");
+        Check("no credit block at all is null, not zero-with-a-title",
+            CodexSource.ParseResetCredits(J.Parse(@"{""rateLimits"":{}}")) == null, "");
+        // The server's count is authoritative when it disagrees: under-reporting
+        // a credit the user HAS is worse than missing a detail about it.
+        ResetCredits trimmed = CodexSource.ParseResetCredits(J.Parse(
+            @"{""rateLimitResetCredits"":{""availableCount"":3,""credits"":[
+               {""id"":""a"",""status"":""available"",""title"":""One""}]}}"));
+        Check("a trimmed credit list still reports the server's count",
+            trimmed != null && trimmed.Available == 3 && trimmed.Title == "One",
+            trimmed == null ? "null" : trimmed.Available + " / " + trimmed.Title);
+        // The earliest expiry is the one that matters: it is the deadline.
+        ResetCredits two = CodexSource.ParseResetCredits(J.Parse(
+            @"{""rateLimitResetCredits"":{""availableCount"":2,""credits"":[
+               {""id"":""a"",""status"":""available"",""expiresAt"":1791075108},
+               {""id"":""b"",""status"":""available"",""expiresAt"":1789075108}]}}"));
+        Check("with several credits the SOONEST expiry is reported",
+            two != null && two.ExpiresEpoch.HasValue
+            && Math.Abs(two.ExpiresEpoch.Value - 1789075108) < 1,
+            two == null ? "null" : two.ExpiresEpoch.ToString());
+
+        // Flatten is what the card reads.
+        var acc = new ProbeAccount
+        {
+            Provider = "codex", ProviderLabel = "Codex", Name = "Codex",
+            Status = Model.OK, Ok = true, Plan = plan, Windows = windows,
+            Credits = credits,
+        };
+        AccountData card = Model.Flatten(acc, now);
+        Check("the card carries the credit through Flatten",
+            card.ResetCredits == 1 && card.ResetCreditTitle == "Full reset (Weekly + 5 hr)",
+            card.ResetCredits + " / " + (card.ResetCreditTitle ?? "null"));
+        Check("the card says it in words",
+            LimisawForm.CreditNote(card) == "banked: Full reset (Weekly + 5 hr)",
+            LimisawForm.CreditNote(card) ?? "null");
+        Check("...and reserves a line for it, so the last window cannot clip",
+            LimisawForm.CardLines(card) == 4, LimisawForm.CardLines(card) + " lines");
+
+        var none = new AccountData { Provider = "zcode", Name = "Zcode", Ok = true, Status = Model.OK };
+        none.Windows.Add(new WindowData { Key = Model.FIVE_HOUR, Available = true, Rem = 50 });
+        Check("a vendor that grants no resets shows no line",
+            LimisawForm.CreditNote(none) == null && LimisawForm.CardLines(none) == 1, "");
+
+        // Several credits read as a count, not as one anonymous "reset".
+        var many = new AccountData { Provider = "codex", Name = "Codex", Ok = true, Status = Model.OK,
+            ResetCredits = 3, ResetCreditTitle = "Full reset (Weekly + 5 hr)" };
+        Check("several credits say how many",
+            (LimisawForm.CreditNote(many) ?? "").IndexOf("3x", StringComparison.Ordinal) >= 0,
+            LimisawForm.CreditNote(many) ?? "null");
+        var untitled = new AccountData { Provider = "codex", Name = "Codex", Ok = true, Status = Model.OK,
+            ResetCredits = 1 };
+        Check("a credit with no title still reads as one",
+            (LimisawForm.CreditNote(untitled) ?? "").IndexOf("1 reset", StringComparison.Ordinal) >= 0,
+            LimisawForm.CreditNote(untitled) ?? "null");
+
+        // ── spending one is the only state change in this app ────────────────
+        // The outcomes are the vendor's, and they are not interchangeable:
+        // "nothing to reset" means the credit was NOT spent, while "already
+        // redeemed" means it is gone. Collapsing them into ok/failed would send
+        // the user to the wrong place.
+        Check("a successful reset says so plainly",
+            Outcome("reset").IndexOf("reset", StringComparison.OrdinalIgnoreCase) >= 0, Outcome("reset"));
+        Check("nothing-to-reset states that the credit was KEPT",
+            Outcome("nothingToReset").IndexOf("NOT spent", StringComparison.Ordinal) >= 0,
+            Outcome("nothingToReset"));
+        Check("no-credit and already-redeemed are told apart",
+            Outcome("noCredit") != Outcome("alreadyRedeemed")
+            && Outcome("alreadyRedeemed").IndexOf("already", StringComparison.OrdinalIgnoreCase) >= 0,
+            Outcome("noCredit") + " / " + Outcome("alreadyRedeemed"));
+        Check("an outcome the vendor invents later is passed through, not swallowed",
+            Outcome("somethingNew") == "somethingNew", Outcome("somethingNew"));
+        Check("a missing outcome is reported rather than read as success",
+            Outcome("").IndexOf("no outcome", StringComparison.Ordinal) >= 0, Outcome(""));
+
+        // The command named in the confirmation must be the command that runs.
+        // A dialog that promises one thing and calls another is worse than no
+        // dialog, and this one spends something that cannot be given back.
+        string root = SourceRoot();
+        if (root != null)
+        {
+            string probe = File.ReadAllText(Path.Combine(root, "Probe.cs"));
+            string ui = File.ReadAllText(Path.Combine(root, "LIMISAW.cs"));
+            Check("the redeem call uses the vendor's own method name",
+                probe.IndexOf("\"account/rateLimitResetCredit/consume\"", StringComparison.Ordinal) >= 0, "");
+            Check("...and the confirmation dialog names that exact method",
+                ui.IndexOf("account/rateLimitResetCredit/consume", StringComparison.Ordinal) >= 0, "");
+            Check("...says it cannot be undone",
+                ui.IndexOf("CANNOT be undone", StringComparison.Ordinal) >= 0, "");
+            Check("...and defaults to No",
+                ui.IndexOf("MessageBoxDefaultButton.Button2", StringComparison.Ordinal) >= 0, "");
+            // Two clicks must not spend two credits for one intention.
+            Check("a redemption in flight blocks a second one",
+                ui.IndexOf("if (Redeeming)", StringComparison.Ordinal) >= 0, "");
+            // The button is painted from a count; the action must re-check who
+            // the account belongs to before calling a Codex method on it.
+            Check("the provider is re-checked at the point of action, not only where the button was drawn",
+                ui.IndexOf("a.Provider != \"codex\"", StringComparison.Ordinal) >= 0, "");
+        }
+    }
+
+    // `Outcome` is private; it is the vocabulary the user reads, so it is worth
+    // pinning. Reflection keeps it private to the app and visible to the test.
+    static string Outcome(string raw)
+    {
+        var m = typeof(CodexSource).GetMethod("Outcome",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        return (string)m.Invoke(null, new object[] { raw });
     }
 
     // Verbatim `claude -p "/usage"` text (2.1.259).

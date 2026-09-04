@@ -9,7 +9,7 @@ vendor's own read-only call, so **reading your quota never spends any of it**. I
 does not parse `auth.json`, does not send prompts, and installs nothing on its
 own.
 
-`LIMISAW.exe` is **266 KB and complete**: every palette, both alert sounds and
+`LIMISAW.exe` is **272 KB and complete**: every palette, both alert sounds and
 the icon are inside it. Drop it in an empty folder and run it.
 
 ```
@@ -23,7 +23,7 @@ LIMISAW.ini          <- written on first launch, next to the exe
 
 | Vendor | Source | Windows |
 | --- | --- | --- |
-| **Codex** | `codex app-server` JSON-RPC `account/rateLimits/read`, one call per `CODEX_HOME` | 5-hour, weekly, monthly (Free plan) |
+| **Codex** | `codex app-server` JSON-RPC `account/rateLimits/read`, one call per `CODEX_HOME` | 5-hour, weekly, monthly (Free plan), plus any reserve pool the plan carries |
 | **Claude Code** | `claude -p "/usage"` (0 turns, $0.00), plus a status-line cache, Claude Desktop's own usage sampler and Claude Code's refusal journal as fallbacks | 5-hour, weekly, per-model weeklies |
 | **Antigravity** | `agy -p "/usage" --output-format json`, plus the IDE's 429 journal | weekly **and** 5-hour **per model pool** (Gemini / Claude & GPT) |
 | **Zcode** | `GET /api/monitor/usage/quota/limit` — the same monitor endpoint the app itself uses, on `api.z.ai` or `open.bigmodel.cn` | 5-hour, weekly (GLM Coding Plan) |
@@ -35,15 +35,26 @@ monitor endpoint. Measured, not assumed: Claude reports `num_turns: 0` and
 asserts it against the source, so nobody can later "improve" a probe into asking
 a model how much quota is left.
 
+**Banked resets.** Codex grants one-off credits that refill a spent window on
+demand. The card shows what you have and when it expires —
+`banked: Full reset (Weekly + 5 hr)  expires in 29d` — and a `Use reset` button
+spends one, but only after a dialog that names the exact command
+(`account/rateLimitResetCredit/consume`) and says it cannot be undone. It is the
+only thing in LIMISAW that changes anything at a vendor, and it never happens
+implicitly.
+
 **Discovered, not hardcoded.** Every account each vendor exposes becomes a card,
 a tray reading and a menu row — a new login needs no code change. `~/.codex`,
-`~/.codex-account2`, `~/.codex-whatever`: all of them, automatically.
+`~/.codex-account2`, `~/.codex-whatever`: all of them, automatically. A plan with
+a reserve pool gets its own rows for it, labelled with the vendor's name for that
+pool.
 
 **Pool-aware gating.** A spent long window zeroes the shorter ones *in its own
 quota pool only*, so an exhausted Claude/GPT weekly never fakes a dead Gemini
-5-hour window. The card says `locked by <window>`. Antigravity's `disabled`
-5-hour bucket is kept as a real window — gated to 0% when its pool is spent,
-`--` when it is not — instead of reading as 100% free.
+5-hour window, and a spent Codex weekly never fakes a dead `gpt-reserve` one. The
+card says `locked by <window>`. Antigravity's `disabled` 5-hour bucket is kept as
+a real window — gated to 0% when its pool is spent, `--` when it is not — instead
+of reading as 100% free.
 
 **A failed sweep does not blank a card.** A vendor CLI that fails once is not a
 vendor without quota. The last good numbers stay, dimmed and tagged
@@ -174,7 +185,7 @@ pwsh .\build.ps1            # -> LIMISAW.exe
 pwsh .\build.ps1 -Tests     # build + run the whole suite
 ```
 
-`tests\` is 14 harnesses / ~5400 assertions: the quota rules and the
+`tests\` is 14 harnesses / ~5500 assertions: the quota rules and the
 costs-nothing-to-read contract (`limits.cs`), the settings panel's own rules
 (`settings_ux.cs`), the one-file claim (`standalone.cs`), tray rendering pixel
 purity, window layout, alert timing, carry-forward, gating, tooltips and the tray

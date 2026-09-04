@@ -334,6 +334,11 @@ namespace Limisaw
         // last known numbers (dimmed, with the reason) instead of going blank on
         // a transient CLI hiccup.
         public bool Carried; public string CarriedAt = "", CarriedNote = "";
+        // Banked resets: a one-off credit that refills a spent window on demand.
+        // Zero for every vendor that does not grant them. Not a window — there is
+        // no percentage to draw — so it rides on the account, not in Windows.
+        public int ResetCredits;
+        public string ResetCreditTitle, ResetCreditExpires, ResetCreditId;
         public List<WindowData> Windows = new List<WindowData>();
         public string Key { get { return Provider + "/" + Name; } }
 
@@ -1699,6 +1704,32 @@ namespace Limisaw
                     DrawTextFit(g, when, whenX, ry, whenW, Palette.MUTED, 10);
                     ry += RowH;
                 }
+                // A banked reset goes BELOW the windows, because it is what to do
+                // about them. The button says exactly what it will run; nothing
+                // happens without the confirmation behind it.
+                string banked = CreditNote(a);
+                if (banked != null)
+                {
+                    AccountData target = a;
+                    // Only Codex exposes a command for this. Another vendor's
+                    // credit is still reported — it is real — but without a
+                    // button LIMISAW has no way to honour.
+                    bool actionable = a.Provider == "codex" && !Redeeming;
+                    string useLabel = Redeeming ? "working..." : "Use reset";
+                    int useW = ButtonWidth(g, "Use reset");
+                    var useBtn = new Rectangle(8 + cw - 8 - useW, ry - 2, useW, 20);
+                    if (a.Provider == "codex")
+                    {
+                        if (actionable) { Buttons.Add(useBtn); ButtonActions.Add(() => RedeemCredit(target)); }
+                        Hint(useBtn, "runs codex account/rateLimitResetCredit/consume — asks first, and cannot be undone");
+                        DrawButton(g, useBtn, useLabel, false, actionable);
+                    }
+                    string expiry = string.IsNullOrEmpty(a.ResetCreditExpires)
+                        ? "" : "  expires " + FriendlyTime(a.ResetCreditExpires);
+                    int textRight = a.Provider == "codex" ? useBtn.Left - Gap : 8 + cw - 8;
+                    DrawTextFit(g, banked + expiry, 18, ry, textRight - 18, Palette.LINK, 10);
+                    ry += RowH;
+                }
                 cursor += cardH + Gap;
             }
 
@@ -1729,12 +1760,27 @@ namespace Limisaw
             return (a.Quiet ? "idle: " : "ERROR: ") + (a.Error ?? a.Status);
         }
 
+        // A banked reset is the one thing that can get a blocked user working
+        // again, so it earns its own line rather than a corner tag. The vendor's
+        // own title says what it refills ("Full reset (Weekly + 5 hr)"), which is
+        // more than LIMISAW could infer.
+        public static string CreditNote(AccountData a)
+        {
+            if (a.ResetCredits <= 0) return null;
+            string what = string.IsNullOrEmpty(a.ResetCreditTitle)
+                ? (a.ResetCredits == 1 ? "1 reset available" : a.ResetCredits + " resets available")
+                : (a.ResetCredits > 1 ? a.ResetCredits + "x " : "") + a.ResetCreditTitle;
+            return "banked: " + what;
+        }
+
         // Height and paint read the SAME count, so a card can never be measured
         // shorter than it draws and clip its last row.
         public static int CardLines(AccountData a)
         {
             bool bad;
-            int lines = a.Windows.Count + (CardNote(a, out bad) != null ? 1 : 0);
+            int lines = a.Windows.Count
+                + (CardNote(a, out bad) != null ? 1 : 0)
+                + (CreditNote(a) != null ? 1 : 0);
             return Math.Max(1, lines);
         }
 
@@ -2559,6 +2605,68 @@ namespace Limisaw
             catch (Exception ex) { Note = cli.Label + ": could not start installer (" + ex.GetType().Name + ")"; }
             Refresh();
         }
+
+        // Spending a banked reset. The FIRST thing in this app that changes
+        // state at a vendor rather than reading it, so it gets the same treatment
+        // as Install CLIs: name the exact operation, say it cannot be undone,
+        // default the dialog to No, and never act implicitly. The credit is
+        // one-off — there is no second chance to reconsider.
+        void RedeemCredit(AccountData a)
+        {
+            if (a.ResetCredits <= 0) { Note = "No banked reset on this account"; Refresh(); return; }
+            // Codex is the only vendor that grants these. A button drawn from a
+            // count is not authority to call a Codex method on someone else's
+            // account, so the provider is checked at the point of ACTION and not
+            // only where the button was painted.
+            if (a.Provider != "codex")
+            { Note = a.ProviderLabel + " has no reset command LIMISAW can run"; Refresh(); return; }
+            if (Redeeming) { Note = "A reset is already in flight"; Refresh(); return; }
+            string what = string.IsNullOrEmpty(a.ResetCreditTitle) ? "a usage limit reset" : a.ResetCreditTitle;
+            string body = AccountTitle(a) + "\n\nThis spends one banked reset:\n\n  " + what
+                + (string.IsNullOrEmpty(a.ResetCreditExpires) ? "" : "\n  expires " + FriendlyTime(a.ResetCreditExpires))
+                + "\n\nLIMISAW will run the vendor's own command:\n\n  codex app-server"
+                + "\n  account/rateLimitResetCredit/consume"
+                + "\n\nYou have " + a.ResetCredits + " left. Spending one CANNOT be undone."
+                + "\n\nUse it now?";
+            if (MessageBox.Show(this, body, "LIMISAW — use a banked reset",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+            {
+                Note = "Banked reset left alone";
+                Refresh();
+                return;
+            }
+            Redeeming = true;
+            Note = "Using the banked reset...";
+            Refresh();
+            AccountData target = a;
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string outcome;
+                try { outcome = CodexSource.ConsumeResetCredit(target.Name, Stamp.Now + 30); }
+                catch (Exception ex) { outcome = ex.GetType().Name; }
+                try
+                {
+                    Action done = () =>
+                    {
+                        Redeeming = false;
+                        Note = "Reset: " + outcome;
+                        Refresh();
+                        // Whatever the outcome, the windows on screen are now
+                        // wrong: a redeemed credit refills them and a refused one
+                        // means the count was stale. Re-reading is the only way to
+                        // show the truth.
+                        RefreshData();
+                    };
+                    if (InvokeRequired) BeginInvoke(done); else done();
+                }
+                catch { Redeeming = false; }
+            });
+        }
+
+        // One redemption at a time. Double-clicking the button would otherwise
+        // spend two credits for one intention, and there is no way to give one
+        // back.
+        bool Redeeming;
 
         static string ShortText(string value, int max)
         {

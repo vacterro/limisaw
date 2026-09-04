@@ -1,3 +1,40 @@
+# LIMISAW 0.0.6 (2026-09-04)
+
+Two things Codex had been reporting all along, and LIMISAW threw both away.
+
+## Added
+
+- **Banked resets.** Codex grants one-off credits that refill a spent window on
+  demand — the "You have 1 usage limit reset available" its own CLI prints on
+  startup — and reports them in the *same* payload as the windows, under
+  `rateLimitResetCredits`. LIMISAW read the windows and discarded the credits, so
+  the one thing that could get a blocked user working again was invisible here.
+  The card now carries a line of its own: `banked: Full reset (Weekly + 5 hr)
+  expires in 29d`. With several credits it says how many, and the *soonest*
+  expiry is the one shown, because that is the deadline.
+- **A `Use reset` button, behind a confirmation that names the command.** This is
+  the first thing LIMISAW does that changes state at a vendor rather than reading
+  it, and a one-off credit cannot be given back, so it gets the `Install CLIs`
+  treatment: the dialog names the account, the credit, its expiry and the exact
+  call (`codex app-server` -> `account/rateLimitResetCredit/consume`), says
+  plainly that it **cannot be undone**, and defaults to No. One redemption at a
+  time — two clicks must not spend two credits for one intention — and the
+  provider is re-checked at the point of action, not only where the button was
+  drawn. The vendor's four outcomes are reported as themselves rather than as
+  ok/failed: `nothing to reset; the credit was NOT spent` and `that credit was
+  already used` send the user to different places.
+
+## Fixed
+
+- **A whole quota pool was silently discarded.** `rateLimitsByLimitId` can name
+  more than one pool, and a Plus account carries `base_model_inference`
+  ("gpt-reserve") alongside the main `codex` one — each with its own weekly and
+  its own reset. Windows were keyed on duration alone, so the reserve pool's
+  weekly collided with the main pool's and lost to first-match-wins. Keys are now
+  pool-qualified, the same mechanism Antigravity's two model pools already used,
+  which also makes gating correct for free: measured live, a spent main weekly
+  gates its own 5-hour window while the reserve pool sits at 100% untouched.
+
 # LIMISAW 0.0.5 (2026-09-04)
 
 ## Fixed

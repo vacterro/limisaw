@@ -165,6 +165,20 @@ namespace Limisaw
         public string Provider = "", ProviderLabel = "", Name = "", Status = "", Plan, Error;
         public bool Ok, Quiet;
         public List<ProbeWindow> Windows = new List<ProbeWindow>();
+        // Banked resets this account holds, or null. Not a window: no percentage,
+        // nothing to fill — a count, an expiry and the vendor's own title.
+        public ResetCredits Credits;
+    }
+
+    // A one-off credit that refills a spent window on demand. `Id` is the
+    // vendor's own handle for it, kept so redeeming names the exact credit
+    // instead of "whatever is first".
+    class ResetCredits
+    {
+        public int Available;
+        public double? ExpiresEpoch;
+        public string Title;
+        public string Id;
     }
 
     class ProbeResult
@@ -327,6 +341,13 @@ namespace Limisaw
                 Status = acc.Status, Plan = acc.Plan, Error = acc.Error,
                 Ok = acc.Ok, Quiet = acc.Quiet,
             };
+            if (acc.Credits != null)
+            {
+                ad.ResetCredits = acc.Credits.Available;
+                ad.ResetCreditTitle = acc.Credits.Title;
+                ad.ResetCreditExpires = Stamp.Iso(acc.Credits.ExpiresEpoch);
+                ad.ResetCreditId = acc.Credits.Id;
+            }
             foreach (ProbeWindow w in Resolve(acc.Windows, now))
             {
                 int rem = 0;
@@ -636,6 +657,10 @@ namespace Limisaw
                 {
                     Provider = "codex", ProviderLabel = "Codex", Name = name,
                     Status = Model.OK, Ok = true, Plan = plan,
+                    // The same payload that carries the windows carries the
+                    // banked resets; reading one and dropping the other is how
+                    // "you have 1 reset available" stayed invisible here.
+                    Credits = ParseResetCredits(result),
                 };
                 if (windows.Count == 0)
                 {
@@ -663,9 +688,20 @@ namespace Limisaw
             return "window_" + n + "m";
         }
 
-        // Every window the server reported, shortest first. Windows this plan
-        // does not have are dropped as soon as a real one exists — otherwise a
-        // Free plan drew two dead bars next to its only live window.
+        // Every window the server reported, shortest first.
+        //
+        // Windows are grouped by POOL, not merged by duration. `rateLimits` is
+        // the default pool; `rateLimitsByLimitId` names the rest, and a plan can
+        // hold more than one — measured live: `codex` (5h + weekly) alongside
+        // `base_model_inference` ("gpt-reserve", its own weekly with its own
+        // reset). Keying only on duration made the second weekly collide with the
+        // first and lose to first-match-wins, so a whole reserve pool was
+        // silently discarded. Pool-qualified keys are the same mechanism
+        // Antigravity's two model pools already use.
+        //
+        // Windows this plan does not have are dropped as soon as a real one
+        // exists — otherwise a Free plan drew two dead bars next to its only
+        // live window.
         public static List<ProbeWindow> ParseWindows(object result, out string plan)
         {
             plan = null;
@@ -674,31 +710,49 @@ namespace Limisaw
             object snap = J.Get(result, "rateLimits") ?? new Dictionary<string, object>();
             plan = J.Str(J.Get(snap, "planType"));
 
-            var candidates = new List<object>();
-            foreach (string side in new[] { "primary", "secondary" })
+            // (pool id, pool label, window) — the default pool first, so it keeps
+            // the bare `five_hour` / `weekly` keys a saved tray selection points
+            // at. A pool that only repeats the default's own numbers adds
+            // nothing, so it is skipped by id.
+            string mainId = (J.Str(J.Get(snap, "limitId")) ?? "").Trim();
+            var candidates = new List<KeyValuePair<KeyValuePair<string, string>, object>>();
+            Action<string, string, object> add = (id, label, w) =>
             {
-                object w = J.Get(snap, side);
-                if (w != null) candidates.Add(w);
-            }
+                if (w == null) return;
+                candidates.Add(new KeyValuePair<KeyValuePair<string, string>, object>(
+                    new KeyValuePair<string, string>(id, label), w));
+            };
+            foreach (string side in new[] { "primary", "secondary" })
+                add("", "", J.Get(snap, side));
+
             Dictionary<string, object> byId = J.Obj(J.Get(result, "rateLimitsByLimitId"));
             if (byId != null)
-                foreach (object sub in byId.Values)
+                foreach (KeyValuePair<string, object> pool in byId)
+                {
+                    // The default pool appears here too, under its own id.
+                    if (pool.Key == mainId) continue;
+                    string label = (J.Str(J.Get(pool.Value, "limitName")) ?? "").Trim();
+                    if (label.Length == 0) label = pool.Key;
+                    string id = Regex.Replace(pool.Key.ToLowerInvariant(), "[^a-z0-9]+", "_").Trim('_');
                     foreach (string side in new[] { "primary", "secondary" })
-                    {
-                        object w = J.Get(sub, side);
-                        if (w != null) candidates.Add(w);
-                    }
+                        add(id, label, J.Get(pool.Value, side));
+                }
 
-            foreach (object w in candidates)
+            foreach (var candidate in candidates)
             {
+                string pool = candidate.Key.Key, label = candidate.Key.Value;
+                object w = candidate.Value;
                 double? dur = J.Num(J.Get(w, "windowDurationMins"));
-                string key = DurationLabel(dur);
-                if (key == null) continue;
+                string baseKey = DurationLabel(dur);
+                if (baseKey == null) continue;
+                string key = Model.Qualified(baseKey, pool);
                 if (byKey.ContainsKey(key)) continue;     // first match wins
                 double? used = J.Num(J.Get(w, "usedPercent"));
                 var win = new ProbeWindow
                 {
                     Key = key,
+                    Group = pool,
+                    GroupLabel = label,
                     DurationMinutes = dur.HasValue ? (int)Math.Round(dur.Value) : (int?)null,
                     Available = true,
                     Remaining = used.HasValue ? Math.Max(0.0, Math.Min(100.0, 100.0 - used.Value)) : (double?)null,
@@ -711,13 +765,114 @@ namespace Limisaw
 
             var windows = new List<ProbeWindow>();
             foreach (string key in order) windows.Add(byKey[key]);
+            // Default pool first, then by duration: gating is per pool anyway
+            // (Model.GateWindows), and a reserve pool's weekly must not sort
+            // between the main pool's own two windows.
             windows.Sort((a, b) =>
             {
+                int ga = a.Group.Length == 0 ? 0 : 1, gb = b.Group.Length == 0 ? 0 : 1;
+                if (ga != gb) return ga.CompareTo(gb);
+                int pool = string.Compare(a.Group, b.Group, StringComparison.Ordinal);
+                if (pool != 0) return pool;
                 int da = a.DurationMinutes.HasValue ? a.DurationMinutes.Value : int.MaxValue;
                 int db = b.DurationMinutes.HasValue ? b.DurationMinutes.Value : int.MaxValue;
                 return da != db ? da.CompareTo(db) : string.Compare(a.Key, b.Key, StringComparison.Ordinal);
             });
             return windows;
+        }
+
+        // Banked resets: a one-off credit that refills a spent window on demand.
+        //
+        // Codex grants these ("You have 1 usage limit reset available", which its
+        // own CLI prints on startup) and reports them in the SAME payload as the
+        // windows, under `rateLimitResetCredits`. LIMISAW read the windows and
+        // threw the credits away, so the one thing that could get a blocked user
+        // working again was invisible here.
+        //
+        // A credit is NOT a window: it has no percentage and nothing to fill, so
+        // it is a count and an expiry on the account rather than a reading.
+        public static ResetCredits ParseResetCredits(object result)
+        {
+            object block = J.Get(result, "rateLimitResetCredits");
+            if (block == null) return null;
+            var credits = new ResetCredits();
+            double? count = J.Num(J.Get(block, "availableCount"));
+            foreach (object credit in J.Arr(J.Get(block, "credits")))
+            {
+                // Only what is usable now. A spent or expired credit is history,
+                // and showing it as available is the one wrong answer here.
+                string status = (J.Str(J.Get(credit, "status")) ?? "").Trim().ToLowerInvariant();
+                if (status != "available") continue;
+                credits.Available++;
+                double? expires = Stamp.Epoch(J.Get(credit, "expiresAt"));
+                if (expires.HasValue && (!credits.ExpiresEpoch.HasValue || expires.Value < credits.ExpiresEpoch.Value))
+                    credits.ExpiresEpoch = expires;
+                string title = (J.Str(J.Get(credit, "title")) ?? "").Trim();
+                if (title.Length > 0 && credits.Title == null) credits.Title = title;
+                string id = (J.Str(J.Get(credit, "id")) ?? "").Trim();
+                if (id.Length > 0 && credits.Id == null) credits.Id = id;
+            }
+            // The server's own count is authoritative when it disagrees with the
+            // list: the list may be trimmed, and under-reporting a credit the
+            // user has is worse than over-reporting a detail about it.
+            if (count.HasValue && (int)count.Value > credits.Available)
+                credits.Available = (int)count.Value;
+            return credits.Available > 0 ? credits : null;
+        }
+
+        // Spend one banked reset on the named account. Returns a sentence for the
+        // user, always — this is the only call in LIMISAW that CHANGES anything
+        // at a vendor, so "it did nothing and said nothing" is not an option.
+        //
+        // The vendor's own outcomes are `reset`, `nothingToReset`, `noCredit` and
+        // `alreadyRedeemed`; they are reported verbatim-ish rather than collapsed
+        // into ok/failed, because "you had nothing to reset" and "you have no
+        // credit" send the user to different places.
+        public static string ConsumeResetCredit(string accountName, double deadline)
+        {
+            string home = null;
+            foreach (KeyValuePair<string, string> h in Homes())
+                if (h.Value == accountName) { home = h.Key; break; }
+            if (home == null) return "account " + accountName + " is no longer listed";
+            string exe = Cli.Resolve("codex");
+            if (exe.Length == 0) return "Codex CLI not found on PATH";
+            RpcSession session = null;
+            try
+            {
+                session = RpcSession.Start(exe, home);
+                if (session == null) return "codex app-server did not start";
+                object init = session.Call("initialize", new Dictionary<string, object> {
+                    { "clientInfo", new Dictionary<string, object> { { "name", "limisaw" }, { "version", "1.0.0" } } },
+                    { "capabilities", null },
+                }, deadline);
+                if (init == null) return "codex app-server did not answer initialize";
+                if (J.Get(init, "error") != null) return Trim(J.Write(J.Get(init, "error")));
+                session.Notify("initialized", null);
+                object res = session.Call("account/rateLimitResetCredit/consume", null, deadline);
+                if (res == null) return "the reset request timed out — check `codex` before trying again";
+                object err = J.Get(res, "error");
+                if (err != null)
+                {
+                    string message = J.Str(J.Get(err, "message"));
+                    return Trim(string.IsNullOrEmpty(message) ? J.Write(err) : message);
+                }
+                return Outcome(J.Str(J.Get(J.Get(res, "result"), "outcome")));
+            }
+            catch (Exception ex) { return ex.GetType().Name; }
+            finally { if (session != null) session.Dispose(); }
+        }
+
+        static string Outcome(string outcome)
+        {
+            switch ((outcome ?? "").Trim())
+            {
+                case "reset": return "done — the limit was reset";
+                case "nothingToReset": return "nothing to reset; the credit was NOT spent";
+                case "noCredit": return "no banked reset on this account any more";
+                case "alreadyRedeemed": return "that credit was already used";
+                case "": return "the vendor gave no outcome";
+            }
+            return outcome;
         }
 
         // Minimal JSON-RPC 2.0 client over the child's stdio. A reader thread
