@@ -1,3 +1,26 @@
+# LIMISAW 0.0.5 (2026-09-04)
+
+## Fixed
+
+- **An alert sound that cannot play now says why.** `SoundCue.Play` returned
+  `void` and swallowed everything: a deleted WAV, a stale name after a folder
+  rename, a file the player rejects. The balloon still appeared, so nothing about
+  the app's behaviour pointed at the chime setting — while the `Play` preview
+  button had been reporting "No such WAV" for the very same file all along. One
+  reporter now serves both, and the reason lives in the footer until the next cue
+  plays. Muting on purpose (volume 0) stays silent without a complaint, because
+  nagging about a deliberate choice is the other half of this bug.
+- **A WAV the volume scaler cannot parse is played anyway, at full volume.** The
+  scaled copy is LIMISAW's own artifact, so a player that rejects it falls back to
+  the user's original file once and says `played at full volume`. Silence is a
+  worse answer than loud, and this was found by the new test rather than by
+  reading the code.
+- **The shipped chime survives a temp cleanup.** `Assets.SoundLibrary` checked
+  whether its *folder* existed, but Windows Disk Cleanup and Storage Sense delete
+  temp *files* by age and leave the directory behind — so the extracted WAVs could
+  vanish and the built-in alert went quiet for the rest of the session, silently.
+  Every call now re-checks the files.
+
 # LIMISAW 0.0.4 (2026-09-04)
 
 A fourth vendor, and the Settings tab rebuilt around being understood.

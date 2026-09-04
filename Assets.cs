@@ -64,18 +64,23 @@ namespace Limisaw
 
         static string SoundDir;
 
-        // The shipped WAVs unpacked once, so the sound picker can list them and
-        // SoundPlayer can open them by path (it has no stream+volume path that
-        // also survives the scaling step). Re-extracts whatever is missing, so
-        // a cleaned temp folder heals itself on the next alert.
+        // The shipped WAVs, unpacked so the picker can list them and SoundPlayer
+        // can open them by path (it has no stream+volume path that survives the
+        // scaling step).
+        //
+        // Every call re-checks the FILES, not just the folder. Windows Disk
+        // Cleanup and Storage Sense delete temp files by age and leave the
+        // directory behind, so a "does the folder exist" shortcut left the
+        // shipped chime pointing at a file that was gone — silently, since
+        // nothing else looks at it until an alert fires. Re-extraction is
+        // File.Exists per name, which costs two stat calls on the hot path.
         public static string SoundLibrary()
         {
             string[] names = Names(SoundPrefix);
             if (names.Length == 0) return null;
-            if (SoundDir != null && Directory.Exists(SoundDir)) return SoundDir;
             try
             {
-                string dir = Path.Combine(Path.GetTempPath(), "limisaw_sounds", "lib");
+                string dir = SoundDir ?? Path.Combine(Path.GetTempPath(), "limisaw_sounds", "lib");
                 Directory.CreateDirectory(dir);
                 foreach (string name in names)
                 {
@@ -91,7 +96,7 @@ namespace Limisaw
                 SoundDir = dir;
                 return dir;
             }
-            catch { return null; }
+            catch { return SoundDir; }
         }
 
         // The app icon, at the exact size the shell asked for.

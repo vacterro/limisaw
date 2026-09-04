@@ -190,6 +190,26 @@ public static class Standalone
             Check("...and the shipped default still plays from inside the exe",
                 stillThere != null && File.Exists(stillThere), stillThere ?? "null");
 
+            // Windows Disk Cleanup and Storage Sense delete temp FILES by age and
+            // leave the folder. A "does the directory exist" shortcut therefore
+            // left the shipped chime pointing at a file that was gone — and since
+            // nothing looks at it until an alert fires, the first thing the user
+            // would notice is silence (T-014, and T-007's other half).
+            MethodInfo soundLib = assets.GetMethod("SoundLibrary", BindingFlags.Public | BindingFlags.Static);
+            string lib = (string)soundLib.Invoke(null, null);
+            Check("the extracted library is a real folder", lib != null && Directory.Exists(lib), lib ?? "null");
+            foreach (string wav in Directory.GetFiles(lib, "*.wav")) File.Delete(wav);
+            Check("...and it is now empty, as a temp cleanup would leave it",
+                Directory.GetFiles(lib, "*.wav").Length == 0, "");
+            string healed = (string)soundLib.Invoke(null, null);
+            Check("the next call re-extracts the WAVs instead of trusting the folder",
+                healed != null && Directory.GetFiles(healed, "*.wav").Length >= 2,
+                Directory.GetFiles(healed ?? lib, "*.wav").Length + " WAVs back");
+            string afterClean = (string)cue.GetMethod("Resolve", BindingFlags.Public | BindingFlags.Static)
+                .Invoke(null, new object[] { temp, "", "success_powerup.wav" });
+            Check("...so the shipped chime resolves again after a temp cleanup",
+                afterClean != null && File.Exists(afterClean), afterClean ?? "null");
+
             // A folder the ini cannot be written in is the "drop it in Program
             // Files" install, and losing every setting to it without a word was
             // T-011: the theme, volume, tray order and window position all work

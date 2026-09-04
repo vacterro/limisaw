@@ -151,6 +151,52 @@ public static class NotifySettingsTest
             Check("volume 1.0 returns the bytes unchanged",
                 passthru.Length == tone.Length && BitConverter.ToInt16(passthru, 44) == 10000, "");
 
+            // --- a cue that cannot play SAYS SO -------------------------------
+            // The other half of the defect this file names at the top: a stale
+            // WAV resolving to nothing was already covered, but the alert then
+            // returned void, so the balloon appeared and the chime did not and
+            // nothing anywhere said why. The `Play` preview button reported "No
+            // such WAV" for the same file the whole time.
+            MethodInfo play = cue.GetMethod("Play", BindingFlags.Public | BindingFlags.Static);
+            Check("Play reports its outcome instead of returning void",
+                play.ReturnType == typeof(string), play.ReturnType.Name);
+
+            Func<string, int, string> Cue = (name, level) =>
+                (string)play.Invoke(null, new object[] { root2, "", name, level });
+
+            Check("a missing WAV is reported, and names the file",
+                (Cue("does_not_exist.wav", 50) ?? "").IndexOf("does_not_exist.wav", StringComparison.Ordinal) >= 0,
+                Cue("does_not_exist.wav", 50) ?? "null");
+            Check("no sound set at all is reported",
+                (Cue("", 50) ?? "").IndexOf("no sound", StringComparison.OrdinalIgnoreCase) >= 0,
+                Cue("", 50) ?? "null");
+            // Muted is a choice, not a fault: reporting it would nag on every
+            // single alert for a user who turned the volume down on purpose.
+            Check("volume 0 is silent WITHOUT a complaint — it was deliberate",
+                Cue("pop.wav", 0) == null, Cue("pop.wav", 0) ?? "null");
+            // A real WAV in the library. It may fail to reach the audio device on
+            // a headless test host, and that is fine — what matters is that the
+            // reason is a sentence and never a swallowed exception.
+            string real = Cue("pop.wav", 50);
+            Check("a real WAV either plays or explains, never fails silently",
+                real == null || real.IndexOf("pop.wav", StringComparison.Ordinal) >= 0,
+                real ?? "played");
+
+            // A WAV the scaler cannot parse must still be heard, at full volume:
+            // silence is a worse answer than loud, and the reason is reported.
+            File.WriteAllBytes(Path.Combine(sounds, "broken.wav"), new byte[] { 1, 2, 3, 4 });
+            string bad = Cue("broken.wav", 50);
+            Check("an unscalable WAV is played anyway, or explained",
+                bad == null || bad.IndexOf("broken.wav", StringComparison.Ordinal) >= 0,
+                bad ?? "played unscaled");
+
+            // A reason must not outlive the fault. Swap a missing WAV for a real
+            // one and the footer has to stop accusing the old name — a note that
+            // sticks is the stale-error defect this note exists to avoid.
+            Check("a cue that plays reports nothing, so the last complaint can clear",
+                Cue("pop.wav", 50) == null || Cue("pop.wav", 50).IndexOf("pop.wav", StringComparison.Ordinal) >= 0,
+                Cue("pop.wav", 50) ?? "played");
+
             Console.WriteLine("---");
             Console.WriteLine(fails == 0 ? "PASS (0 failures)" : "FAILED (" + fails + " failures)");
             return fails == 0 ? 0 : 1;

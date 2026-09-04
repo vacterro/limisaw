@@ -525,13 +525,52 @@ namespace Limisaw
             return File.Exists(file) ? file : null;
         }
 
-        public static void Play(string root, string library, string file, int volume)
+        // Play a cue, and say what stopped it.
+        //
+        // `null` = it played. Anything else is a sentence for the user, because a
+        // muted alert is indistinguishable from a quiet account: the balloon
+        // still appears, so nothing about the app's behaviour suggests the chime
+        // setting is the thing that is broken. The `Play` preview button already
+        // reported "No such WAV" for the very same file — the alert path just
+        // threw the reason away.
+        public static string Play(string root, string library, string file, int volume)
         {
+            if (string.IsNullOrEmpty(file)) return "no sound is set";
+            if (volume <= 0) return null;   // muted on purpose is not a fault
             string path = Resolve(root, library, file);
-            if (path == null || volume <= 0) return;
+            if (path == null) return "no such WAV: " + file;
+            string name = Path.GetFileName(file);
             try
             {
-                if (volume < 100) path = Scaled(path, volume) ?? path;
+                if (volume < 100)
+                {
+                    string scaled = Scaled(path, volume);
+                    // The scaled copy is OUR artifact, not the user's file. If it
+                    // will not play — an odd container survives Scale untouched
+                    // and can still be rejected by the player — fall back to the
+                    // original once: loud beats silent, and the user's own file is
+                    // the one thing here they did not derive.
+                    if (scaled != null && PlayFile(scaled) == null) return null;
+                    string why = PlayFile(path);
+                    if (why == null)
+                        return scaled == null
+                            ? name + " played at full volume (it could not be scaled)"
+                            : null;
+                    return name + ": " + why;
+                }
+                string direct = PlayFile(path);
+                return direct == null ? null : name + ": " + direct;
+            }
+            catch (Exception ex) { return name + ": " + ex.GetType().Name; }
+        }
+
+        // Null = playing. Otherwise the exception's type name; the CALLER owns
+        // the display name, because the path here may be a cache artifact whose
+        // name the user has never seen.
+        static string PlayFile(string path)
+        {
+            try
+            {
                 if (Player == null) Player = new System.Media.SoundPlayer();
                 else Player.Stop();
                 Player.SoundLocation = path;
@@ -539,8 +578,9 @@ namespace Limisaw
                 // miss the first play of a file this process has not heard yet.
                 Player.Load();
                 Player.Play();
+                return null;
             }
-            catch { }
+            catch (Exception ex) { return ex.GetType().Name; }
         }
 
         static string CacheDir() { return Path.Combine(Path.GetTempPath(), "limisaw_sounds"); }
@@ -1136,10 +1176,33 @@ namespace Limisaw
             catch { }
         }
 
+        // A cue that could not be played leaves its reason in the footer. The
+        // alert itself already happened (the balloon is up), so this is a note
+        // about the sound and not an error about the quota — but it has to be
+        // visible, or a muted chime looks exactly like a quiet account.
+        //
+        // Raised on the UI thread: DetectResets and DetectLow run on the refresh
+        // worker, and Refresh() from there is an illegal cross-thread touch.
         void Play(string file)
         {
-            SoundCue.Play(RootPath, Settings.SoundDir, file, Settings.SoundVolume);
+            string why = SoundCue.Play(RootPath, Settings.SoundDir, file, Settings.SoundVolume);
+            // A cue that plays clears the last complaint. Without this the note
+            // outlives the fault it described: swap a deleted WAV for a real one
+            // and the footer would still be accusing the old name, which is the
+            // stale-error defect the note exists to avoid.
+            SoundNote = why == null ? "" : "Alert sound: " + why;
+            if (why == null) return;
+            try
+            {
+                Action show = () => { Note = SoundNote; Refresh(); };
+                if (InvokeRequired) BeginInvoke(show); else show();
+            }
+            catch { }
         }
+
+        // Last sound failure, kept so the footer can restate it after a repaint
+        // clears Note. Cleared by the next cue that plays.
+        string SoundNote = "";
 
         // "You are down to the last few percent" is a different alert from a
         // reset: it fires once per quota window per cycle, not once per refill.
@@ -1527,7 +1590,11 @@ namespace Limisaw
             string problem = Settings.LastSaveFailed
                 ? "Settings NOT saved — LIMISAW.ini is not writable"
                 : LastError.Length > 0 ? "Error: " + LastError
-                : TrayError.Length > 0 ? "Tray icon failed: " + TrayError : "";
+                : TrayError.Length > 0 ? "Tray icon failed: " + TrayError
+                // A cue that could not play is a real fault the user cannot
+                // otherwise notice, so it outlives one repaint — but it yields to
+                // anything about the quota itself.
+                : SoundNote.Length > 0 ? SoundNote : "";
             // Hover explanation beats the keyboard cheatsheet but yields to a
             // real problem and to the note about what just changed: an
             // explanation of a control is only useful while nothing is wrong.
@@ -2445,12 +2512,17 @@ namespace Limisaw
         // volume", so flooring to 25% was the exact lie being removed.
         void Preview(string file)
         {
-            if (SoundCue.Resolve(RootPath, Settings.SoundDir, file) == null)
-            {
-                Note = "No such WAV: " + file; Refresh(); return;
-            }
-            SoundCue.Play(RootPath, Settings.SoundDir, file, Settings.SoundVolume);
-            Note = "Preview at " + Settings.SoundVolume + "%";
+            // One reporter for both paths (SoundCue.Play): the preview button and
+            // the alert used to disagree about the same file, which is how the
+            // silent-alert defect hid — the button said "No such WAV" while the
+            // alert said nothing at all.
+            string why = SoundCue.Play(RootPath, Settings.SoundDir, file, Settings.SoundVolume);
+            SoundNote = why == null ? "" : "Alert sound: " + why;
+            Note = why != null ? SoundNote
+                // Muted is not a failure, but a preview button that appears to do
+                // nothing needs saying out loud.
+                : Settings.SoundVolume <= 0 ? "Volume is 0% — nothing to hear"
+                : "Preview at " + Settings.SoundVolume + "%";
             Refresh();
         }
 
