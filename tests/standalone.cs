@@ -190,6 +190,38 @@ public static class Standalone
             Check("...and the shipped default still plays from inside the exe",
                 stillThere != null && File.Exists(stillThere), stillThere ?? "null");
 
+            // A folder the ini cannot be written in is the "drop it in Program
+            // Files" install, and losing every setting to it without a word was
+            // T-011: the theme, volume, tray order and window position all work
+            // until restart and then revert, which the user can only discover
+            // after the fact. Save() must say it could not save.
+            Type settingsType = asm.GetType("Limisaw.LimisawSettings");
+            FieldInfo failed = settingsType.GetField("LastSaveFailed");
+            string ini = Path.Combine(temp, "LIMISAW.ini");
+            File.WriteAllText(ini, "[limisaw]\r\nTheme=oled\r\n");
+            new FileInfo(ini).IsReadOnly = true;
+            object ro = Activator.CreateInstance(settingsType, new object[] { temp });
+            settingsType.GetMethod("Load").Invoke(ro, null);
+            settingsType.GetField("ThemeSlug").SetValue(ro, "nord");
+            settingsType.GetMethod("Save").Invoke(ro, null);
+            Check("Save() against a read-only ini reports the failure",
+                (bool)failed.GetValue(ro), "LastSaveFailed=" + failed.GetValue(ro));
+            object reload = Activator.CreateInstance(settingsType, new object[] { temp });
+            settingsType.GetMethod("Load").Invoke(reload, null);
+            Check("...and the theme really did not land",
+                (string)settingsType.GetField("ThemeSlug").GetValue(reload) == "oled",
+                (string)settingsType.GetField("ThemeSlug").GetValue(reload) + " (still the disk value)");
+            new FileInfo(ini).IsReadOnly = false;
+            settingsType.GetMethod("Save").Invoke(ro, null);
+            Check("a later successful Save clears the flag",
+                !(bool)failed.GetValue(ro), "LastSaveFailed=" + failed.GetValue(ro));
+            object reload2 = Activator.CreateInstance(settingsType, new object[] { temp });
+            settingsType.GetMethod("Load").Invoke(reload2, null);
+            Check("...and this time the theme lands",
+                (string)settingsType.GetField("ThemeSlug").GetValue(reload2) == "nord",
+                (string)settingsType.GetField("ThemeSlug").GetValue(reload2));
+            File.Delete(ini);
+
             Console.WriteLine("---");
             Console.WriteLine(checks + " checks");
             Console.WriteLine(fails == 0 ? "PASS (0 failures)" : "FAILED (" + fails + " failures)");

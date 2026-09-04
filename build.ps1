@@ -27,7 +27,7 @@ $cscCandidates = @(
 $csc = $cscCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if (-not $csc) { throw "no .NET Framework 4.x compiler found; looked in: $($cscCandidates -join ', ')" }
 
-$sources = @('LIMISAW.cs', 'Probe.cs', 'ProbeClaude.cs', 'ProbeAntigravity.cs', 'Assets.cs') |
+$sources = @('LIMISAW.cs', 'Probe.cs', 'ProbeClaude.cs', 'ProbeAntigravity.cs', 'ProbeZcode.cs', 'Assets.cs') |
     ForEach-Object { Join-Path $root $_ }
 $missing = $sources | Where-Object { -not (Test-Path -LiteralPath $_) }
 if ($missing) { throw "missing source file(s): $($missing -join ', ')" }
@@ -74,6 +74,7 @@ $testRefs = @{
     'notify_settings' = @('System.dll')
     'pixel_purity'    = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll', 'System.Web.Extensions.dll')
     'reset_lock'      = @('System.dll')
+    'settings_ux'     = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll', 'System.Runtime.Serialization.dll')
     'standalone'      = @('System.dll', 'System.Drawing.dll')
     'tray_countdown'  = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll', 'System.Web.Extensions.dll')
     'tray_error'      = @('System.dll')
@@ -101,8 +102,8 @@ foreach ($name in ($testRefs.Keys | Sort-Object)) {
         $testArgs += @('-r:System.Web.Extensions.dll', '-r:System.Drawing.dll', '-r:System.Windows.Forms.dll',
                        '-main:LimitsTest')
         $testArgs += @((Join-Path $root 'Probe.cs'), (Join-Path $root 'ProbeClaude.cs'),
-                       (Join-Path $root 'ProbeAntigravity.cs'), (Join-Path $root 'Assets.cs'),
-                       (Join-Path $root 'LIMISAW.cs'))
+                       (Join-Path $root 'ProbeAntigravity.cs'), (Join-Path $root 'ProbeZcode.cs'),
+                       (Join-Path $root 'Assets.cs'), (Join-Path $root 'LIMISAW.cs'))
     }
     $testArgs += $source
     & $csc @testArgs

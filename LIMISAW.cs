@@ -171,14 +171,42 @@ namespace Limisaw
         public string SoundDir = "";
         public bool AutoStart = false;
         public bool ShowUsed = false;
+        // Zcode has no CLI to ask, so its quota needs an API key. Every other
+        // vendor authenticates through its own CLI and LIMISAW never holds a
+        // credential; taking Zcode's key out of Zcode's config is a different
+        // permission, so it is off until the user writes this line themselves.
+        // `ZAI_API_KEY` in the environment needs no switch — that key was handed
+        // over deliberately.
+        public bool ZcodeReadConfig = false;
+        // Account card order on the Accounts tab, '|' separated account keys.
+        // Empty = discovery order, which is the vendor sweep order.
+        public string AccountOrder = "";
+        // What the Settings preview pretends the quota is. A preview wired to the
+        // live number can only show one picture, which is useless for choosing a
+        // layout: the whole question is "what does 8% look like in this mode".
+        public int PreviewPct = 65;
         public int WindowX = int.MinValue, WindowY = int.MinValue;
 
         public static readonly string[] Modes = { "single", "dual", "bars", "grid" };
         public static readonly string[] ModeLabels = { "Single number", "Two numbers (short / long)", "One bar per item", "One cell per item" };
         public static readonly string[] ModeShort = { "Number", "Two", "Bars", "Cells" };
+        // What each layout is FOR. Four characters in a button cannot say it, and
+        // guessing from "Two" is what the Settings tab was asking users to do.
+        public static readonly string[] ModeHints = {
+            "one number: the reading you pick, biggest and clearest",
+            "two numbers: worst short window over worst long one",
+            "one vertical bar per reading, no digits",
+            "one cell per reading in a 1x1 / 2x2 / 3x3 grid",
+        };
         public static readonly int[] Fills = { 2, 4, 8, 100 };
         public static readonly string[] FillLabels = { "Halves (1/2)", "Quarters (1/4)", "Eighths (1/8)", "Exact (per pixel)" };
         public static readonly string[] FillShort = { "1/2", "1/4", "1/8", "Exact" };
+        public static readonly string[] FillHints = {
+            "halves: empty, half, full — readable at a glance, no detail",
+            "quarters: four steps, the usual compromise",
+            "eighths: eight steps, still countable at 16px",
+            "exact: fills by the pixel, most detail, hardest to read fast",
+        };
         public const int MaxTrayItems = 9;
 
         public LimisawSettings(string dir) { Dir = dir; IniPath = Path.Combine(dir, "LIMISAW.ini"); }
@@ -191,7 +219,45 @@ namespace Limisaw
         // 260 chars is not enough for an ordered list of every window three
         // vendors can expose; the buffer must fit the value it reads back.
         string Read(string key, string def) { var sb = new System.Text.StringBuilder(2048); GetPrivateProfileString("limisaw", key, def, sb, sb.Capacity, IniPath); return sb.ToString(); }
-        void Write(string key, string val) { WritePrivateProfileString("limisaw", key, val, IniPath); }
+        bool Write(string key, string val) { return WritePrivateProfileString("limisaw", key, val, IniPath); }
+
+        // Last write outcome, so a caller can tell the user WHY their settings
+        // will not survive a restart. One bool, not a list of failures: the ini
+        // is one file, so if writing one key fails they all fail, and reporting
+        // 21 errors about one read-only file is noise. Set only by Save(); false
+        // again only after a Save() that succeeded.
+        public bool LastSaveFailed;
+
+        public void Save()
+        {
+            // The first key doubles as the write probe: with a read-only ini all
+            // 21 writes fail, and one failing syscall already says everything —
+            // hammering the file 20 more times for identical failures is noise.
+            if (!Write("RefreshSeconds", RefreshSeconds.ToString()))
+            {
+                LastSaveFailed = true;
+                return;
+            }
+            LastSaveFailed = false;
+            Write("TrayMetric", TrayMetric); Write("TrayMode", TrayMode); Write("TrayShow", TrayShow);
+            Write("TrayFill", TrayFill.ToString()); Write("TrayMax", TrayMax.ToString());
+            Write("TrayItems", TrayItems); Write("TrayHidden", TrayHidden);
+            Write("Theme", ThemeSlug);
+            Write("NotifyOnReset", NotifyOnReset ? "1" : "0");
+            Write("ResetSound", ResetSound ? "1" : "0");
+            Write("ResetSoundFile", ResetSoundFile);
+            Write("NotifyLow", NotifyLow ? "1" : "0");
+            Write("LowPct", LowPct.ToString());
+            Write("LowSoundFile", LowSoundFile);
+            Write("SoundVolume", SoundVolume.ToString());
+            Write("SoundDir", SoundDir);
+            Write("AutoStart", AutoStart ? "1" : "0");
+            Write("ShowUsed", ShowUsed ? "1" : "0");
+            Write("ZcodeReadConfig", ZcodeReadConfig ? "1" : "0");
+            Write("AccountOrder", AccountOrder);
+            Write("PreviewPct", PreviewPct.ToString());
+            Write("WindowX", WindowX.ToString()); Write("WindowY", WindowY.ToString());
+        }
 
         public static List<string> Split(string value)
         {
@@ -205,6 +271,8 @@ namespace Limisaw
         public List<string> HiddenItems() { return Split(TrayHidden); }
         public void SetItemOrder(List<string> ids) { TrayItems = string.Join("|", ids.ToArray()); }
         public void SetHiddenItems(List<string> ids) { TrayHidden = string.Join("|", ids.ToArray()); }
+        public List<string> CardOrder() { return Split(AccountOrder); }
+        public void SetCardOrder(List<string> keys) { AccountOrder = string.Join("|", keys.ToArray()); }
 
         public void Load()
         {
@@ -236,26 +304,12 @@ namespace Limisaw
             SoundDir = Read("SoundDir", "");
             AutoStart = Read("AutoStart", "0") == "1";
             ShowUsed = Read("ShowUsed", "0") == "1";
+            ZcodeReadConfig = Read("ZcodeReadConfig", "0") == "1";
+            AccountOrder = Read("AccountOrder", "");
+            int.TryParse(Read("PreviewPct", "65"), out PreviewPct);
+            if (PreviewPct < 0) PreviewPct = 0; if (PreviewPct > 100) PreviewPct = 100;
             int.TryParse(Read("WindowX", int.MinValue.ToString()), out WindowX);
             int.TryParse(Read("WindowY", int.MinValue.ToString()), out WindowY);
-        }
-        public void Save()
-        {
-            Write("RefreshSeconds", RefreshSeconds.ToString()); Write("TrayMetric", TrayMetric); Write("TrayMode", TrayMode); Write("TrayShow", TrayShow);
-            Write("TrayFill", TrayFill.ToString()); Write("TrayMax", TrayMax.ToString());
-            Write("TrayItems", TrayItems); Write("TrayHidden", TrayHidden);
-            Write("Theme", ThemeSlug);
-            Write("NotifyOnReset", NotifyOnReset ? "1" : "0");
-            Write("ResetSound", ResetSound ? "1" : "0");
-            Write("ResetSoundFile", ResetSoundFile);
-            Write("NotifyLow", NotifyLow ? "1" : "0");
-            Write("LowPct", LowPct.ToString());
-            Write("LowSoundFile", LowSoundFile);
-            Write("SoundVolume", SoundVolume.ToString());
-            Write("SoundDir", SoundDir);
-            Write("AutoStart", AutoStart ? "1" : "0");
-            Write("ShowUsed", ShowUsed ? "1" : "0");
-            Write("WindowX", WindowX.ToString()); Write("WindowY", WindowY.ToString());
         }
     }
 
@@ -769,13 +823,49 @@ namespace Limisaw
         const int DragSlop = 4;
         List<Rectangle> ItemRows = new List<Rectangle>(); List<string> ItemRowIds = new List<string>();
         int ItemRowsTop = 0;
+        // Account-card row tops, measured before the drag preview reorders
+        // anything: DropIndex needs geometry that does not move under the
+        // pointer (see DropIndex).
+        List<int> CardTops = new List<int>();
         string DragId; int DragStartY, DragY; bool Dragging;
         // Problip-style drag slider: one active at a time, armed by OnMouseDown
         // on the knob OR anywhere on the rail. Null = no slider in flight.
         // Both rails' rects persist across paints so OnMouseDown can hit-test
         // without repainting.
         string VolDrag; Rectangle VolRail;
-        Rectangle VolRailVolume, VolKnobVolume, VolRailLow, VolKnobLow;
+        Rectangle VolRailVolume, VolKnobVolume, VolRailLow, VolKnobLow, VolRailPreview;
+        Rectangle VolKnobPreview;
+
+        // ── hints ────────────────────────────────────────────────────────────
+        // Four characters and a prayer is what "1/4" and "Off" amount to without
+        // an explanation, so every control on a settings row registers the
+        // sentence that says what it does. Shown in the footer on hover, which is
+        // the one place already reserved for "what is going on" and the only one
+        // that cannot cover the thing being explained — a floating tooltip over a
+        // preview hides exactly what the user is trying to see.
+        List<Rectangle> HintZones = new List<Rectangle>();
+        List<string> HintTexts = new List<string>();
+        string Hover = "";
+
+        void Hint(Rectangle area, string text)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            HintZones.Add(area); HintTexts.Add(text);
+        }
+
+        // A labelled row: the label itself explains the row, so hovering anywhere
+        // on it — including the dead space — answers the question.
+        void HintRow(int x, int y, int w, string text) { Hint(new Rectangle(x, y, w, SetRowH), text); }
+
+        string HintAt(Point p)
+        {
+            // Last registered wins: rows are added before the controls that sit
+            // on them, so a control's own sentence beats its row's.
+            for (int i = HintZones.Count - 1; i >= 0; i--)
+                if (HintZones[i].Contains(p)) return HintTexts[i];
+            return "";
+        }
+
 
         // One font per size, reused for the whole process life: DrawText is
         // called dozens of times per repaint and measuring adds more, so
@@ -853,9 +943,15 @@ namespace Limisaw
         {
             int cols = ThemeColumns();
             int themeRows = (Themes.Count + cols - 1) / cols;
-            // Three option rows, the tray-preview row, four alert rows, up to two
-            // rows of toggles, the ini path line, the theme header and grid.
-            return SetRowH * 10 + 18 + 16 + themeRows * ThemeRowH + Gap * 2;
+            // Counted from what PaintSettingsPanel actually draws, in its order:
+            // three section headings (18 each), the icon group's four rows plus
+            // the 52px preview, the alerts group's three or four rows, and the
+            // app group's two rows plus the theme grid's own header.
+            int rows = 4                                  // layout, shows, fill, readings
+                + 3                                       // volume, refill, low alert
+                + (Settings.NotifyLow ? 1 : 0)             // low sound, only while armed
+                + 2;                                      // numbers, refresh
+            return 18 * 3 + rows * SetRowH + 52 + 20 + themeRows * ThemeRowH + Gap * 2;
         }
 
         protected override void WndProc(ref Message m)
@@ -891,11 +987,11 @@ namespace Limisaw
                 try
                 {
                     // The probe runs IN this process (Probe.cs / ProbeClaude.cs /
-                    // ProbeAntigravity.cs): no interpreter, no script folder, no
-                    // child of our own to time out. Each vendor CLI still gets a
-                    // hard deadline of its own, and Probe.Run's total budget is
-                    // what bounds the sweep.
-                    Apply(Probe.Run());
+                    // ProbeAntigravity.cs / ProbeZcode.cs): no interpreter, no
+                    // script folder, no child of our own to time out. Each vendor
+                    // CLI still gets a hard deadline of its own, and Probe.Run's
+                    // total budget is what bounds the sweep.
+                    Apply(Probe.Run(Settings.ZcodeReadConfig));
                 }
                 catch (Exception ex) { SetError(ex.Message); }
             });
@@ -1047,8 +1143,6 @@ namespace Limisaw
 
         // "You are down to the last few percent" is a different alert from a
         // reset: it fires once per quota window per cycle, not once per refill.
-        // The stamp is the window's own reset time, so the alert re-arms by
-        // itself when that window rolls over instead of needing a restart.
         void DetectLow()
         {
             if (!Settings.NotifyLow) return;
@@ -1066,11 +1160,37 @@ namespace Limisaw
                     string key = cur.Key + "_" + w.Key;
                     string stamp = w.Reset ?? "";
                     string seen;
-                    if (NotifiedLow.TryGetValue(key, out seen) && seen == stamp) continue;
+                    if (NotifiedLow.TryGetValue(key, out seen) && !NewCycle(w, seen, stamp)) continue;
                     NotifiedLow[key] = stamp;
                     if (!silent) NotifyLowAlert(cur, w);
                 }
             }
+        }
+
+        // Has this window ROLLED OVER since the alert, or has its reset merely
+        // drifted?
+        //
+        // A fixed window (Codex, Claude) holds one reset time for the whole
+        // window and then jumps forward by its own length. A ROLLING window
+        // (Zcode's 5-hour credit pool) pushes its reset out a little every time
+        // quota is spent, so its stamp is different on almost every sweep — and
+        // comparing stamps for inequality made that window alert on every single
+        // refresh, which is the "sound plays constantly" defect. Recovery above
+        // the threshold is the primary re-arm (RearmLowAlerts); this is the
+        // secondary one, for a window that refilled and was spent back down
+        // between two sweeps.
+        //
+        // Half the window's own duration separates the two: consumption drift is
+        // minutes, a rollover is the full window. A window that does not state a
+        // duration re-arms on recovery alone rather than on a guess.
+        static bool NewCycle(WindowData w, string alertedFor, string now)
+        {
+            if (alertedFor == now) return false;
+            if (w.DurationMinutes <= 0) return false;
+            double? before = Stamp.Epoch(alertedFor);
+            double? after = Stamp.Epoch(now);
+            if (!before.HasValue || !after.HasValue) return false;
+            return after.Value - before.Value >= w.DurationMinutes * 30.0;   // half, in seconds
         }
 
         void NotifyLowAlert(AccountData acc, WindowData w)
@@ -1157,6 +1277,41 @@ namespace Limisaw
         // TrayMax. Four vendors' worth of windows cannot fit in 16 pixels, so
         // the cap is the whole point - the alternative is unreadable mush.
         public List<Metric> TrayMetrics()
+        {
+            List<Metric> picked = SelectedMetrics();
+            // While the Settings preview renders, every reading reports the
+            // pretend level: a preview that mixes one fake number with three real
+            // ones cannot answer "what does this layout look like at 5%".
+            if (PreviewPct >= 0)
+            {
+                if (picked.Count == 0)
+                {
+                    // Nothing discovered yet (first launch, no vendor logged in)
+                    // still deserves a preview, so the shapes are inventable.
+                    int n = Settings.TrayMode == "single" || Settings.TrayMode == "dual" ? 2 : 4;
+                    for (int i = 0; i < n; i++)
+                        picked.Add(new Metric
+                        {
+                            Id = "preview/" + i, Label = "preview", Short = "pv",
+                            Value = PreviewPct, Available = true, IsShort = i % 2 == 0,
+                            Reset = PreviewReset(),
+                        });
+                    return picked;
+                }
+                var faked = new List<Metric>();
+                foreach (Metric m in picked)
+                    faked.Add(new Metric
+                    {
+                        Id = m.Id, Label = m.Label, Short = m.Short,
+                        Value = PreviewPct, Available = true, IsShort = m.IsShort,
+                        Reset = PreviewReset(),
+                    });
+                return faked;
+            }
+            return picked;
+        }
+
+        List<Metric> SelectedMetrics()
         {
             List<Metric> all = AllMetrics();
             List<string> hidden = Settings.HiddenItems();
@@ -1260,6 +1415,31 @@ namespace Limisaw
             return order;
         }
 
+        // The same rule for account cards: the saved order first, then anything
+        // newly discovered. A vendor that logs in mid-session lands at the
+        // bottom rather than shuffling the cards the user arranged.
+        List<string> PaintedCardOrder()
+        {
+            var order = new List<string>();
+            foreach (string key in Settings.CardOrder())
+                foreach (AccountData a in Accounts)
+                    if (a.Key == key && !order.Contains(key)) { order.Add(key); break; }
+            foreach (AccountData a in Accounts) if (!order.Contains(a.Key)) order.Add(a.Key);
+            return order;
+        }
+
+        // Cards in the order they are drawn, which is the order OnMouseUp
+        // commits against — one list, so the insertion marker cannot lie.
+        List<AccountData> OrderedAccounts()
+        {
+            var cards = new List<AccountData>();
+            foreach (string key in PaintedCardOrder())
+                foreach (AccountData a in Accounts)
+                    if (a.Key == key && !cards.Contains(a)) { cards.Add(a); break; }
+            foreach (AccountData a in Accounts) if (!cards.Contains(a)) cards.Add(a);
+            return cards;
+        }
+
         void ToggleItem(string id)
         {
             List<string> hidden = Settings.HiddenItems();
@@ -1292,6 +1472,7 @@ namespace Limisaw
             g.TextRenderingHint = TextRenderingHint.SingleBitPerPixelGridFit;
             g.SmoothingMode = SmoothingMode.None; g.InterpolationMode = InterpolationMode.NearestNeighbor;
             g.Clear(Palette.BG); Buttons.Clear(); ButtonActions.Clear(); Marks.Clear(); Cropped.Clear();
+            HintZones.Clear(); HintTexts.Clear();
             int w = Width, h = Height;
             using (var b = new SolidBrush(Palette.SURFACE)) g.FillRectangle(b, 0, 0, w, HeaderH);
             DrawText(g, "LIMISAW", 6, 3, Palette.TEXT, 12, true);
@@ -1339,13 +1520,24 @@ namespace Limisaw
             g.ResetClip();
 
             // A fetch error outranks a tray-render error: without data the icon
-            // has nothing to draw anyway.
-            string problem = LastError.Length > 0 ? "Error: " + LastError
+            // has nothing to draw anyway. A save failure outranks both hints:
+            // every change the user makes in this session is being thrown away,
+            // and they cannot know that from behaviour alone — the settings work
+            // until the app restarts and then revert, the worst possible moment.
+            string problem = Settings.LastSaveFailed
+                ? "Settings NOT saved — LIMISAW.ini is not writable"
+                : LastError.Length > 0 ? "Error: " + LastError
                 : TrayError.Length > 0 ? "Tray icon failed: " + TrayError : "";
-            string footer = Note.Length > 0 ? Note
-                : problem.Length > 0 ? problem
+            // Hover explanation beats the keyboard cheatsheet but yields to a
+            // real problem and to the note about what just changed: an
+            // explanation of a control is only useful while nothing is wrong.
+            string footer = problem.Length > 0 ? problem
+                : Note.Length > 0 ? Note
+                : Hover.Length > 0 ? Hover
                 : "F5 refresh · U used/left · T theme · 1-4 tabs · drag to reorder · Esc hide";
-            DrawTextFit(g, footer, 8, h - 20, w - 16, problem.Length > 0 ? Palette.DANGERTXT : Palette.MUTED, 10);
+            DrawTextFit(g, footer, 8, h - 20, w - 16,
+                problem.Length > 0 ? Palette.DANGERTXT
+                    : Hover.Length > 0 && Note.Length == 0 ? Palette.TEXT2 : Palette.MUTED, 10);
         }
 
         // Card geometry is shared with AccountsPanelHeight/InstallPanelHeight
@@ -1366,13 +1558,51 @@ namespace Limisaw
             int gaugeX = whenX - Gap - gaugeW;
             int pctX = gaugeX - Gap - pctW;
             int nameW = pctX - 18 - Gap;
-            foreach (AccountData a in Accounts)
+
+            // Cards are reordered by dragging, same gesture as the Tray tab: the
+            // vendor that matters most belongs at the top, and which one that is
+            // is the user's call, not the sweep order's.
+            List<AccountData> cards = OrderedAccounts();
+            // Row tops of the UNPREVIEWED list, measured before anything moves,
+            // because DropIndex must not compute against geometry the preview is
+            // still shifting. A card's height is known from its own contents, so
+            // this needs no paint.
+            CardTops.Clear();
+            {
+                int probe = cursor;
+                foreach (AccountData a in cards)
+                {
+                    CardTops.Add(probe);
+                    probe += CardHeight + CardLines(a) * RowH + Gap + Gap;
+                }
+            }
+            int dragFrom = -1;
+            if (Dragging && DragId != null)
+            {
+                for (int i = 0; i < cards.Count; i++) if (cards[i].Key == DragId) { dragFrom = i; break; }
+                if (dragFrom >= 0)
+                {
+                    int target = DropIndex(cards.Count);
+                    if (target != dragFrom)
+                    {
+                        AccountData moved = cards[dragFrom];
+                        cards.RemoveAt(dragFrom);
+                        cards.Insert(Math.Min(target, cards.Count), moved);
+                    }
+                }
+            }
+
+            foreach (AccountData a in cards)
             {
                 bool bad;
                 string lead = CardNote(a, out bad);
                 int cardH = CardHeight + CardLines(a) * RowH + Gap;
-                using (var bg = new SolidBrush(Palette.RAISED)) g.FillRectangle(bg, 8, cursor, cw, cardH);
+                bool held = Dragging && a.Key == DragId;
+                ItemRows.Add(new Rectangle(8, cursor, cw, cardH + Gap));
+                ItemRowIds.Add(a.Key);
+                using (var bg = new SolidBrush(held ? Palette.ALT : Palette.RAISED)) g.FillRectangle(bg, 8, cursor, cw, cardH);
                 DrawBevel(g, 8, cursor, cw, cardH, false);
+                Hint(new Rectangle(8, cursor, cw, cardH), "drag a card to reorder the accounts");
                 string tag = a.Carried ? "last good" + (a.CarriedAt.Length > 0 ? " " + a.CarriedAt : "")
                     : a.Plan != null ? a.Plan : (a.Ok ? "" : a.Status.ToLowerInvariant());
                 int tagW = tag.Length > 0 ? TextWidth(g, tag, 10) : 0;
@@ -1403,6 +1633,13 @@ namespace Limisaw
                     ry += RowH;
                 }
                 cursor += cardH + Gap;
+            }
+
+            // Insertion marker, same as the Tray tab: where the held card lands.
+            if (Dragging && dragFrom >= 0 && CardTops.Count > 0)
+            {
+                int slot = Math.Min(DropIndex(cards.Count), CardTops.Count - 1);
+                using (var p = new Pen(Palette.LINK)) g.DrawLine(p, 10, CardTops[slot], w - 10, CardTops[slot]);
             }
         }
 
@@ -1605,9 +1842,27 @@ namespace Limisaw
         }
 
         // Which slot the pointer is currently over, clamped to the list.
+        //
+        // Row height differs per tab: the Tray tab's picker rows are a constant,
+        // while an account card is as tall as its window count. The Accounts tab
+        // therefore measures against CardTops — the row tops of the list BEFORE
+        // the drag preview moved anything.
+        //
+        // Not against the painted rects: OnPaint clears them before dispatching
+        // to the panel, so the preview would be computing against an empty list
+        // and every drag would read as "move to the bottom". Measuring against
+        // the pre-preview geometry is also what keeps the answer stable — tops
+        // derived from the previewed order shift under the pointer and make the
+        // marker oscillate.
         int DropIndex(int count)
         {
             if (count <= 0) return 0;
+            if (Tab == TabAccounts)
+            {
+                for (int i = 0; i < CardTops.Count && i < count; i++)
+                    if (DragY < CardTops[i]) return Math.Max(0, i - 1);
+                return Math.Max(0, count - 1);
+            }
             int rel = DragY - ItemRowsTop;
             int slot = (rel + PickRowH / 2) / PickRowH;
             if (slot < 0) slot = 0;
@@ -1622,26 +1877,75 @@ namespace Limisaw
         void PaintSettingsPanel(Graphics g, int cursor, int w)
         {
             int right = w - 8;
-            // One shared label column, wide enough for the widest label, so the
-            // three option rows line up instead of stair-stepping.
-            int labelW = Math.Max(TextWidth(g, "Tray layout", 10),
-                Math.Max(TextWidth(g, "Fill steps", 10), TextWidth(g, "Refresh every", 10)));
+            // Every row: a label column wide enough for the widest label so the
+            // rows line up, and controls that start after it.
+            int labelW = 0;
+            foreach (string s in new[] { "Tray layout", "Tray shows", "Fill steps",
+                "Readings", "Refresh", "Volume", "On refill", "Low alert",
+                "Low sound", "Numbers", "Theme" })
+                labelW = Math.Max(labelW, TextWidth(g, s, 10));
             int optX = 14 + labelW + Gap * 2;
 
+            // Which controls actually do anything depends on the layout: a fill
+            // granularity means nothing when the icon draws a bare number, and a
+            // number readout means nothing when the icon draws bars. A control
+            // that is visibly dead is honest; one that silently ignores you is
+            // what makes settings feel broken.
+            bool drawsNumber = Settings.TrayMode == "single" || Settings.TrayMode == "dual";
+            bool drawsFill = Settings.TrayMode == "bars" || Settings.TrayMode == "grid";
+            bool multiReading = Settings.TrayMode != "single";
+
+            // ── group 1: what the tray icon looks like ───────────────────────
+            cursor = Section(g, "TRAY ICON", cursor, right);
+
+            HintRow(14, cursor, right - 14, "what the 16x16 tray icon draws");
             DrawText(g, "Tray layout", 14, cursor + 5, Palette.TEXT2, 10);
             int bw = (right - optX) / LimisawSettings.Modes.Length;
             for (int i = 0; i < LimisawSettings.Modes.Length; i++)
             {
                 string value = LimisawSettings.Modes[i];
                 string label = LimisawSettings.ModeShort[i];
+                string why = LimisawSettings.ModeHints[i];
                 var r = new Rectangle(optX + i * bw, cursor, bw - 2, 22);
                 Buttons.Add(r); ButtonActions.Add(() =>
-                { Settings.TrayMode = value; Settings.Save(); Note = "Layout: " + label; Refresh(); UpdateTray(); });
+                { Settings.TrayMode = value; Settings.Save(); Note = "Layout: " + label; FitWindow(); Refresh(); UpdateTray(); });
+                Hint(r, why);
                 DrawButton(g, r, label, Settings.TrayMode == value);
             }
             cursor += SetRowH;
 
-            DrawText(g, "Fill steps", 14, cursor + 5, Palette.TEXT2, 10);
+            // The readout belongs to the number, so it sits directly under the
+            // layout that produces one and greys out for the ones that do not.
+            HintRow(14, cursor, right - 14, drawsNumber
+                ? "what the number in the icon reads"
+                : "only a number layout has a readout — pick Number or Two above");
+            DrawText(g, "Tray shows", 14, cursor + 5, drawsNumber ? Palette.TEXT2 : Palette.MUTED, 10);
+            string[] showLabels = { "Off", "%", "Time" };
+            string[] showVals = { "off", "pct", "time" };
+            string[] showHints = {
+                "no number at all — the icon is the picture",
+                "percent left (or used, see Numbers below)",
+                "time until this window's own reset: 12m, 3h, 2d",
+            };
+            int sw = (right - optX) / showVals.Length;
+            for (int i = 0; i < showVals.Length; i++)
+            {
+                string sv = showVals[i], sl = showLabels[i], sh = showHints[i];
+                var r = new Rectangle(optX + i * sw, cursor, sw - 2, 22);
+                if (drawsNumber)
+                {
+                    Buttons.Add(r); ButtonActions.Add(() =>
+                    { Settings.TrayShow = sv; Settings.Save(); Note = "Tray shows: " + sl; Refresh(); UpdateTray(); });
+                    Hint(r, sh);
+                }
+                DrawButton(g, r, sl, Settings.TrayShow == sv, drawsNumber);
+            }
+            cursor += SetRowH;
+
+            HintRow(14, cursor, right - 14, drawsFill
+                ? "how coarsely a bar or cell fills — coarse reads faster at 16px"
+                : "only bars and cells have a fill — pick Bars or Cells above");
+            DrawText(g, "Fill steps", 14, cursor + 5, drawsFill ? Palette.TEXT2 : Palette.MUTED, 10);
             bw = (right - optX) / LimisawSettings.Fills.Length;
             for (int i = 0; i < LimisawSettings.Fills.Length; i++)
             {
@@ -1650,179 +1954,225 @@ namespace Limisaw
                 // `i` would index past the end when it finally runs.
                 int value = LimisawSettings.Fills[i];
                 string label = LimisawSettings.FillShort[i];
+                string why = LimisawSettings.FillHints[i];
                 var r = new Rectangle(optX + i * bw, cursor, bw - 2, 22);
-                Buttons.Add(r); ButtonActions.Add(() =>
-                { Settings.TrayFill = value; Settings.Save(); Note = "Fill: " + label; Refresh(); UpdateTray(); });
-                DrawButton(g, r, label, Settings.TrayFill == value);
+                if (drawsFill)
+                {
+                    Buttons.Add(r); ButtonActions.Add(() =>
+                    { Settings.TrayFill = value; Settings.Save(); Note = "Fill: " + label; Refresh(); UpdateTray(); });
+                    Hint(r, why);
+                }
+                DrawButton(g, r, label, Settings.TrayFill == value, drawsFill);
             }
             cursor += SetRowH;
 
-            DrawText(g, "Refresh every", 14, cursor + 5, Palette.TEXT2, 10);
-            int x = optX;
-            var slower = new Rectangle(x, cursor, 24, 22); Buttons.Add(slower); ButtonActions.Add(() => SetRefresh(-60));
-            DrawButton(g, slower, "-", false);
-            x += 24 + Gap;
-            string mins = (Settings.RefreshSeconds / 60) + " min";
-            int minsW = TextWidth(g, mins, 11);
-            DrawText(g, mins, x, cursor + 4, Palette.LINK, 11, true);
-            x += minsW + Gap;
-            var faster = new Rectangle(x, cursor, 24, 22); Buttons.Add(faster); ButtonActions.Add(() => SetRefresh(60));
-            DrawButton(g, faster, "+", false);
-            x += 24 + Gap;
-            DrawTextFit(g, "one sweep asks every vendor CLI", x, cursor + 5, right - x, Palette.MUTED, 10);
-            cursor += SetRowH;
-
-            // ── tray preview: the live 16x16, blown up, next to a 3-way readout
-            // switch. What the tray shows is no longer a guess: the layout row
-            // above changes this picture the same repaint.
-            DrawText(g, "Tray shows", 14, cursor + 5, Palette.TEXT2, 10);
+            // ── the preview, on its own row ──────────────────────────────────
+            // Its own row on purpose: the volume slider used to run across this
+            // strip and covered the very thing it was meant to help judge.
+            //
+            // The picture is drawn from a PRETEND quota, not the live one. A
+            // preview locked to whatever the account happens to be at can only
+            // ever answer one question, and the question is "what does 5% look
+            // like in this mode" — which a healthy account can never show.
+            HintRow(14, cursor, right - 14, "drag to see any quota level in the layout above — nothing real changes");
+            DrawText(g, "Preview", 14, cursor + 5, Palette.TEXT2, 10);
             int pvX = optX;
-            using (Bitmap prev = RenderTrayBitmap())
+            using (Bitmap prev = RenderPreviewBitmap())
             {
                 int zoom = 3, pw = 16 * zoom, ph = 16 * zoom;
                 g.InterpolationMode = InterpolationMode.NearestNeighbor;
                 g.PixelOffsetMode = PixelOffsetMode.Half;
                 g.DrawImage(prev, pvX, cursor + 2, pw, ph);
-                g.InterpolationMode = InterpolationMode.NearestNeighbor;
                 using (var edge = new Pen(Palette.BEVEL)) g.DrawRectangle(edge, pvX, cursor + 2, pw - 1, ph - 1);
-                Marks.Add(new Rectangle(pvX, cursor + 2, pw, ph));
+                var box = new Rectangle(pvX, cursor + 2, pw, ph);
+                Marks.Add(box);
+                Hint(box, "the real tray renderer, on a pretend " + Settings.PreviewPct + "% remaining");
                 pvX += pw + Gap * 2;
             }
-            string[] showLabels = { "Off", "%", "Time" };
-            string[] showVals = { "off", "pct", "time" };
-            int sw = (right - pvX) / showVals.Length;
-            for (int i = 0; i < showVals.Length; i++)
-            {
-                string sv = showVals[i], sl = showLabels[i];
-                var r = new Rectangle(pvX + i * sw, cursor, sw - 2, 22);
-                Buttons.Add(r); ButtonActions.Add(() =>
-                { Settings.TrayShow = sv; Settings.Save(); Note = "Tray shows: " + sl; Refresh(); UpdateTray(); });
-                DrawButton(g, r, sl, Settings.TrayShow == sv);
-            }
+            string pvText = ShownRem(Settings.PreviewPct) + "%";
+            int pvNumW = TextWidth(g, pvText, 11);
+            int pvSliderW = Math.Max(60, right - pvX - pvNumW - Gap * 2);
+            PaintVolSlider(g, pvX, cursor, pvSliderW, 0, 100, Settings.PreviewPct, "preview");
+            Hint(new Rectangle(pvX, cursor, pvSliderW, 22), "pretend quota for the preview only");
+            pvX += pvSliderW + Gap;
+            DrawText(g, pvText, pvX, cursor + 4, PctColor(Settings.PreviewPct), 11, true);
+            Marks.Add(new Rectangle(pvX, cursor + 4, pvNumW, 15));
+            // The preview is 48px tall, taller than one 28px row.
+            cursor += 52;
+
+            HintRow(14, cursor, right - 14, multiReading
+                ? "how many readings reach the icon, and in what order"
+                : "one number shows one reading — the Tray tab picks which");
+            DrawText(g, "Readings", 14, cursor + 5, Palette.TEXT2, 10);
+            int shownCount = TrayMetrics().Count, totalCount = AllMetrics().Count;
+            string pickLabel = multiReading
+                ? shownCount + " of " + totalCount + " — pick and reorder"
+                : "pick which reading";
+            int pickW = Math.Min(right - optX, ButtonWidth(g, pickLabel));
+            var pickBtn = new Rectangle(optX, cursor, pickW, 22);
+            Buttons.Add(pickBtn); ButtonActions.Add(() => ShowTab(TabTray));
+            Hint(pickBtn, "opens the Tray tab, where readings are ordered, hidden and capped");
+            DrawButton(g, pickBtn, pickLabel, false);
             cursor += SetRowH;
 
-            // ── alerts ───────────────────────────────────────────────────────
-            // Volume once for every alert, then one row per alert. Which WAV
-            // belongs to which event is the user's call, never hardcoded here:
-            // the name comes from the settings, the list behind the picker from
-            // whatever WAVs the sound folder actually holds.
-            int labelW2 = Math.Max(labelW, Math.Max(TextWidth(g, "When left <=", 10),
-                Math.Max(TextWidth(g, "On reset", 10), TextWidth(g, "Low sound", 10))));
-            int opt2 = 14 + labelW2 + Gap * 2;
+            // ── group 2: alerts ─────────────────────────────────────────────
+            cursor = Section(g, "ALERTS", cursor, right);
 
-            DrawText(g, "Sounds", 14, cursor + 5, Palette.TEXT2, 10);
-            x = opt2;
-            int volSliderW = Math.Max(60, Math.Min(140, right - x - 90));
-            PaintVolSlider(g, x, cursor, volSliderW, 0, 100, Settings.SoundVolume, "volume");
-            x += volSliderW + Gap;
+            bool anySound = Settings.ResetSound || Settings.NotifyLow;
+            HintRow(14, cursor, right - 14, anySound
+                ? "one volume for every alert — Windows has no per-sound volume, so the WAV itself is scaled"
+                : "both alert sounds are off, so there is nothing to set a volume for");
+            DrawText(g, "Volume", 14, cursor + 5, anySound ? Palette.TEXT2 : Palette.MUTED, 10);
+            int x = optX;
             string volText = Settings.SoundVolume + "%";
-            // Leave room for Folder + at least a stub of the library path: the
-            // percent yields first on narrow windows, same as the low row.
-            int dirW0 = ButtonWidth(g, "Folder");
-            int volW = 0;
-            if (right - x - dirW0 - Gap * 3 >= TextWidth(g, volText, 11))
-            {
-                volW = TextWidth(g, volText, 11);
-                DrawText(g, volText, x, cursor + 4, Palette.LINK, 11, true);
-                Marks.Add(new Rectangle(x, cursor + 4, volW, 15));
-                x += volW + Gap;
-            }
+            int volNumW = TextWidth(g, volText, 11);
             int dirW = ButtonWidth(g, "Folder");
-            var dirBtn = new Rectangle(x, cursor, dirW, 22); Buttons.Add(dirBtn); ButtonActions.Add(() => PickSoundDir());
+            int volSliderW = Math.Max(60, Math.Min(160, right - x - volNumW - dirW - Gap * 4));
+            PaintVolSlider(g, x, cursor, volSliderW, 0, 100, Settings.SoundVolume, "volume", anySound);
+            if (anySound) Hint(new Rectangle(x, cursor, volSliderW, 22), "alert volume, 0 = silent");
+            x += volSliderW + Gap;
+            DrawText(g, volText, x, cursor + 4, anySound ? Palette.LINK : Palette.MUTED, 11, true);
+            Marks.Add(new Rectangle(x, cursor + 4, volNumW, 15));
+            x += volNumW + Gap;
+            var dirBtn = new Rectangle(x, cursor, dirW, 22);
+            Buttons.Add(dirBtn); ButtonActions.Add(() => PickSoundDir());
+            Hint(dirBtn, "where the WAV pickers look — the shipped sounds keep working either way");
             DrawButton(g, dirBtn, "Folder", false);
             x += dirW + Gap;
             DrawTextFit(g, SoundCue.Library(RootPath, Settings.SoundDir), x, cursor + 5, right - x, Palette.MUTED, 10);
             cursor += SetRowH;
 
-            DrawText(g, "On reset", 14, cursor + 5, Palette.TEXT2, 10);
-            x = opt2;
-            string rstLabel = Settings.ResetSound ? "chime: on" : "chime: off";
-            int rstW = ButtonWidth(g, rstLabel);
-            var rstBtn = new Rectangle(x, cursor, rstW, 22); Buttons.Add(rstBtn);
-            ButtonActions.Add(() =>
-            {
-                Settings.ResetSound = !Settings.ResetSound; Settings.Save();
-                Note = "Reset chime " + (Settings.ResetSound ? "on" : "off"); Refresh();
-            });
-            DrawButton(g, rstBtn, rstLabel, Settings.ResetSound);
-            x += rstW + Gap;
-            PaintSoundTail(g, x, cursor, right, Settings.ResetSoundFile,
+            // Both alerts have the same shape — a balloon switch, a chime switch,
+            // the WAV and a preview — so they are drawn by one row builder. The
+            // old panel had the reset chime, the low threshold and the two sounds
+            // in four unrelated shapes, which is what made it unreadable.
+            cursor = AlertRow(g, cursor, right, optX,
+                "On refill", "a quota window refilled",
+                Settings.NotifyOnReset, () =>
+                {
+                    Settings.NotifyOnReset = !Settings.NotifyOnReset; Settings.Save();
+                    Note = "Refill balloon " + (Settings.NotifyOnReset ? "on" : "off"); Refresh();
+                },
+                "balloon: a Windows notification when a 5h or weekly window resets",
+                Settings.ResetSound, () =>
+                {
+                    Settings.ResetSound = !Settings.ResetSound; Settings.Save();
+                    Note = "Refill chime " + (Settings.ResetSound ? "on" : "off"); FitWindow(); Refresh();
+                },
+                "chime: play a sound when a window resets",
+                Settings.ResetSoundFile,
                 () => { string picked = PickSound(Settings.ResetSoundFile); if (picked == null) return;
-                        Settings.ResetSoundFile = picked; Settings.Save(); Note = "Reset sound: " + picked; Refresh(); },
+                        Settings.ResetSoundFile = picked; Settings.Save(); Note = "Refill sound: " + picked; Refresh(); },
                 () => Preview(Settings.ResetSoundFile));
-            cursor += SetRowH;
 
-            DrawText(g, "When left <=", 14, cursor + 5, Palette.TEXT2, 10);
-            x = opt2;
-            int lowSliderW = Math.Max(60, Math.Min(140, right - x - 150));
-            PaintVolSlider(g, x, cursor, lowSliderW, 5, 95, Settings.LowPct, "lowpct");
-            x += lowSliderW + Gap;
-            string pctText = Settings.LowPct + "%";
-            string lowLabel = Settings.NotifyLow ? "alert: on" : "alert: off";
-            int lowW = ButtonWidth(g, lowLabel);
-            // Narrow window: the percent yields FIRST (it duplicates the slider
-            // position), so the toggle and the explanation never clip.
-            int pctAvail = right - x - lowW - Gap * 2;
-            int pctW = 0;
-            if (pctAvail >= TextWidth(g, pctText, 11))
-            {
-                pctW = TextWidth(g, pctText, 11);
-                DrawText(g, pctText, x, cursor + 4, Palette.LINK, 11, true);
-                Marks.Add(new Rectangle(x, cursor + 4, pctW, 15));
-                x += pctW + Gap;
-            }
-            // Narrow window, last resort: the toggle shrinks to its ellipsis form
-            // rather than escaping the edge — DrawButton clips the label with
-            // ".." and logs Cropped, but escaping the window is worse.
-            int lowWA = Math.Min(lowW, Math.Max(20, right - x));
-            var lowBtn = new Rectangle(x, cursor, lowWA, 22); Buttons.Add(lowBtn);
-            ButtonActions.Add(() =>
+            // The threshold owns its own row, directly above the alert it arms:
+            // a slider three rows away from the switch it feeds is a guess.
+            HintRow(14, cursor, right - 14, "the level the low alert fires at, once per window per reset cycle");
+            DrawText(g, "Low alert", 14, cursor + 5, Palette.TEXT2, 10);
+            x = optX;
+            string lowLabel = Settings.NotifyLow ? "on" : "off";
+            int lowW = Math.Max(ButtonWidth(g, "on"), ButtonWidth(g, "off"));
+            var lowBtn = new Rectangle(x, cursor, lowW, 22);
+            Buttons.Add(lowBtn); ButtonActions.Add(() =>
             {
                 Settings.NotifyLow = !Settings.NotifyLow; Settings.Save();
-                Note = "Low alert " + (Settings.NotifyLow ? "on" : "off"); Refresh();
+                Note = "Low alert " + (Settings.NotifyLow ? "on" : "off"); FitWindow(); Refresh();
             });
+            Hint(lowBtn, "warn me when a window drops to the threshold on the right");
             DrawButton(g, lowBtn, lowLabel, Settings.NotifyLow);
-            x += lowWA + Gap;
-            DrawTextFit(g, "once per window per reset cycle", x, cursor + 5, right - x, Palette.MUTED, 10);
+            x += lowW + Gap;
+            string pctText = "at " + Settings.LowPct + "%";
+            int pctNumW = TextWidth(g, pctText, 11);
+            int lowSliderW = Math.Max(60, Math.Min(160, right - x - pctNumW - Gap * 3));
+            PaintVolSlider(g, x, cursor, lowSliderW, 5, 95, Settings.LowPct, "lowpct", Settings.NotifyLow);
+            if (Settings.NotifyLow)
+                Hint(new Rectangle(x, cursor, lowSliderW, 22), "fire the low alert when a window drops to this much left");
+            x += lowSliderW + Gap;
+            DrawText(g, pctText, x, cursor + 4,
+                Settings.NotifyLow ? Palette.LINK : Palette.MUTED, 11, true);
+            Marks.Add(new Rectangle(x, cursor + 4, pctNumW, 15));
             cursor += SetRowH;
 
-            DrawText(g, "Low sound", 14, cursor + 5, Palette.TEXT2, 10);
-            PaintSoundTail(g, opt2, cursor, right, Settings.LowSoundFile,
-                () => { string picked = PickSound(Settings.LowSoundFile); if (picked == null) return;
-                        Settings.LowSoundFile = picked; Settings.Save(); Note = "Low sound: " + picked; Refresh(); },
-                () => Preview(Settings.LowSoundFile));
-            cursor += SetRowH;
-
-            // Three toggles, each sized to its own text and packed left to
-            // right; whatever does not fit wraps to the next row.
-            string usedLabel = Settings.ShowUsed ? "Showing: Used" : "Showing: Left";
-            string notifyLabel = Settings.NotifyOnReset ? "Reset balloons: on" : "Reset balloons: off";
-            string autoLabel = Settings.AutoStart ? "Autostart: on" : "Autostart: off";
-            string iniLabel = "Open LIMISAW.ini";
-            string[] labels = { usedLabel, notifyLabel, autoLabel, iniLabel };
-            Action[] actions = {
-                () => ToggleShowUsed(),
-                () => { Settings.NotifyOnReset = !Settings.NotifyOnReset; Settings.Save(); Note = "Reset balloons " + (Settings.NotifyOnReset ? "on" : "off"); Refresh(); },
-                () => ToggleAutostart(),
-                () => OpenIni(),
-            };
-            bool[] states = { Settings.ShowUsed, Settings.NotifyOnReset, Settings.AutoStart, false };
-            x = 14;
-            for (int i = 0; i < labels.Length; i++)
+            // Its sound row only exists while the alert does.
+            if (Settings.NotifyLow)
             {
-                int bwidth = ButtonWidth(g, labels[i]);
-                if (x > 14 && x + bwidth > right) { cursor += SetRowH; x = 14; }
-                var r = new Rectangle(x, cursor, bwidth, 22);
-                Buttons.Add(r); ButtonActions.Add(actions[i]);
-                DrawButton(g, r, labels[i], states[i]);
-                x += bwidth + Gap;
+                HintRow(14, cursor, right - 14, "the sound the low alert plays");
+                DrawText(g, "Low sound", 14, cursor + 5, Palette.TEXT2, 10);
+                PaintSoundTail(g, optX, cursor, right, Settings.LowSoundFile,
+                    () => { string picked = PickSound(Settings.LowSoundFile); if (picked == null) return;
+                            Settings.LowSoundFile = picked; Settings.Save(); Note = "Low sound: " + picked; Refresh(); },
+                    () => Preview(Settings.LowSoundFile));
+                cursor += SetRowH;
+            }
+
+            // ── group 3: the rest ───────────────────────────────────────────
+            cursor = Section(g, "APP", cursor, right);
+
+            HintRow(14, cursor, right - 14, "whether every percentage counts what is LEFT or what is SPENT");
+            DrawText(g, "Numbers", 14, cursor + 5, Palette.TEXT2, 10);
+            x = optX;
+            string[] usedLabels = { "Left", "Used" };
+            bool[] usedStates = { !Settings.ShowUsed, Settings.ShowUsed };
+            string[] usedHints = {
+                "count down: 20% means 20% of the quota is still yours",
+                "count up: 80% means 80% is spent — bars fill as you work",
+            };
+            int uw = Math.Max(ButtonWidth(g, "Left"), ButtonWidth(g, "Used"));
+            for (int i = 0; i < usedLabels.Length; i++)
+            {
+                bool wantUsed = i == 1;
+                var r = new Rectangle(x, cursor, uw, 22);
+                Buttons.Add(r); ButtonActions.Add(() =>
+                { if (Settings.ShowUsed != wantUsed) ToggleShowUsed(); });
+                Hint(r, usedHints[i]);
+                DrawButton(g, r, usedLabels[i], usedStates[i]);
+                x += uw + Gap;
+            }
+            x += Gap;
+            DrawTextFit(g, "colours always warn on what is left", x, cursor + 5, right - x, Palette.MUTED, 10);
+            cursor += SetRowH;
+
+            HintRow(14, cursor, right - 14, "how often LIMISAW asks the vendors — one sweep runs every vendor CLI");
+            DrawText(g, "Refresh", 14, cursor + 5, Palette.TEXT2, 10);
+            x = optX;
+            var slower = new Rectangle(x, cursor, 24, 22);
+            Buttons.Add(slower); ButtonActions.Add(() => SetRefresh(60));
+            Hint(slower, "ask less often");
+            DrawButton(g, slower, "-", false);
+            x += 24 + Gap;
+            string mins = (Settings.RefreshSeconds / 60) + " min";
+            int minsW = Math.Max(TextWidth(g, mins, 11), TextWidth(g, "60 min", 11));
+            DrawText(g, mins, x, cursor + 4, Palette.LINK, 11, true);
+            Marks.Add(new Rectangle(x, cursor + 4, minsW, 15));
+            x += minsW + Gap;
+            var faster = new Rectangle(x, cursor, 24, 22);
+            Buttons.Add(faster); ButtonActions.Add(() => SetRefresh(-60));
+            Hint(faster, "ask more often");
+            DrawButton(g, faster, "+", false);
+            x += 24 + Gap * 2;
+            string autoLabel = Settings.AutoStart ? "Autostart: on" : "Autostart: off";
+            int autoW = ButtonWidth(g, autoLabel);
+            if (x + autoW <= right)
+            {
+                var autoBtn = new Rectangle(x, cursor, autoW, 22);
+                Buttons.Add(autoBtn); ButtonActions.Add(() => ToggleAutostart());
+                Hint(autoBtn, "start LIMISAW with Windows, silently in the tray");
+                DrawButton(g, autoBtn, autoLabel, Settings.AutoStart);
+                x += autoW + Gap;
+            }
+            int iniW = ButtonWidth(g, "Open the ini");
+            if (x + iniW <= right)
+            {
+                var iniBtn = new Rectangle(x, cursor, iniW, 22);
+                Buttons.Add(iniBtn); ButtonActions.Add(() => OpenIni());
+                Hint(iniBtn, Settings.IniPath);
+                DrawButton(g, iniBtn, "Open the ini", false);
             }
             cursor += SetRowH;
-            DrawTextFit(g, Settings.IniPath, 14, cursor, right - 14, Palette.MUTED, 10);
-            cursor += 18;
 
-            DrawText(g, "Theme (" + Themes.Count + ")", 14, cursor, Palette.TEXT2, 10);
-            cursor += 16;
+            HintRow(14, cursor, right - 14, "colours for the window, the tray icon and the hover panel");
+            DrawText(g, "Theme", 14, cursor + 5, Palette.TEXT2, 10);
+            cursor += 20;
             // Column count follows the widest theme name, so a long label like
             // "Dark Golden (Win95)" gets a wider cell instead of an ellipsis.
             int widest = 0;
@@ -1840,8 +2190,51 @@ namespace Limisaw
                     Settings.ThemeSlug = t.Slug; Settings.Save(); ApplyTheme(t.Slug);
                     Note = "Theme: " + t.Label; Refresh(); UpdateTray();
                 });
+                Hint(r, t.Label + " — press T to cycle themes from anywhere");
                 DrawButton(g, r, t.Label, active);
             }
+        }
+
+        // A group heading with a rule to its right. Three labelled groups beat
+        // eleven equal rows: the panel is scanned for a category first and a
+        // control second.
+        int Section(Graphics g, string title, int cursor, int right)
+        {
+            DrawText(g, title, 14, cursor, Palette.MUTED, 10, true);
+            int tw = TextWidth(g, title, 10);
+            int lineY = cursor + 7;
+            using (var p = new Pen(Palette.BDARK))
+                g.DrawLine(p, 14 + tw + Gap, lineY, right, lineY);
+            return cursor + 18;
+        }
+
+        // One alert = one row: two switches (balloon, chime) then the WAV and a
+        // preview. The sound half is only drawn when the chime is on, because a
+        // WAV picker for a muted alert is a control with no effect.
+        int AlertRow(Graphics g, int cursor, int right, int optX,
+            string label, string what,
+            bool balloonOn, Action toggleBalloon, string balloonHint,
+            bool chimeOn, Action toggleChime, string chimeHint,
+            string wav, Action pickWav, Action previewWav)
+        {
+            HintRow(14, cursor, right - 14, "when " + what);
+            DrawText(g, label, 14, cursor + 5, Palette.TEXT2, 10);
+            int x = optX;
+            int bw = Math.Max(ButtonWidth(g, "balloon"), ButtonWidth(g, "chime"));
+            var balloon = new Rectangle(x, cursor, bw, 22);
+            Buttons.Add(balloon); ButtonActions.Add(toggleBalloon);
+            Hint(balloon, balloonHint);
+            DrawButton(g, balloon, "balloon", balloonOn);
+            x += bw + Gap;
+            var chime = new Rectangle(x, cursor, bw, 22);
+            Buttons.Add(chime); ButtonActions.Add(toggleChime);
+            Hint(chime, chimeHint);
+            DrawButton(g, chime, "chime", chimeOn);
+            x += bw + Gap;
+            if (chimeOn) PaintSoundTail(g, x, cursor, right, wav, pickWav, previewWav);
+            else DrawTextFit(g, balloonOn ? "silent, balloon only" : "off", x, cursor + 5,
+                right - x, Palette.MUTED, 10);
+            return cursor + SetRowH;
         }
 
         int ThemeColumns()
@@ -1887,24 +2280,32 @@ namespace Limisaw
         // a drag is a press-move-release gesture, not a click.
         void PaintVolSlider(Graphics g, int x, int y, int w, int lo, int hi, int val, string id)
         {
+            PaintVolSlider(g, x, y, w, lo, hi, val, id, true);
+        }
+
+        void PaintVolSlider(Graphics g, int x, int y, int w, int lo, int hi, int val, string id, bool enabled)
+        {
             var rail = new Rectangle(x, y + 5, w, 12);
             float frac0 = hi <= lo ? 0 : (float)(val - lo) / (hi - lo);
             frac0 = Math.Max(0, Math.Min(1, frac0));
             int thx0 = rail.X + (int)((rail.Width - 10) * frac0);
             var knob0 = new Rectangle(thx0, y + 4, 10, 14);
-            if (id == "volume") { VolRailVolume = rail; VolKnobVolume = knob0; }
-            else { VolRailLow = rail; VolKnobLow = knob0; }
+            // A disabled rail registers no hit rectangle at all, so a drag cannot
+            // start on a control that does nothing in this mode.
+            if (id == "volume") { VolRailVolume = enabled ? rail : Rectangle.Empty; VolKnobVolume = enabled ? knob0 : Rectangle.Empty; }
+            else if (id == "preview") { VolRailPreview = enabled ? rail : Rectangle.Empty; VolKnobPreview = enabled ? knob0 : Rectangle.Empty; }
+            else { VolRailLow = enabled ? rail : Rectangle.Empty; VolKnobLow = enabled ? knob0 : Rectangle.Empty; }
             if (id == VolDrag) VolRail = rail;
             Draw.Bevel(g, rail.X, rail.Y, rail.Width, rail.Height, false);
             using (var bg = new SolidBrush(Palette.SURFACE))
                 g.FillRectangle(bg, rail.X + 1, rail.Y + 1, rail.Width - 2, rail.Height - 2);
-            using (var fill = new SolidBrush(Palette.LINK))
+            using (var fill = new SolidBrush(enabled ? Palette.LINK : Palette.MUTED))
                 g.FillRectangle(fill, rail.X + 1, rail.Y + 1, (int)((rail.Width - 2) * frac0), rail.Height - 2);
             // Knob is 14px tall inside the 22px row (y+4): an 18px knob bled
             // 1px into the next row's buttons and tripped layout_fit.
             var knob = new Rectangle(knob0.X, y + 4, knob0.Width, 14);
             Draw.Bevel(g, knob.X, knob.Y, knob.Width, knob.Height, true);
-            using (var kb = new SolidBrush(Palette.ALT))
+            using (var kb = new SolidBrush(enabled ? Palette.ALT : Palette.SURFACE))
                 g.FillRectangle(kb, knob.X + 1, knob.Y + 1, knob.Width - 2, knob.Height - 2);
             // The knob must not eat a layout-fit check: register it as content
             // the buttons may not cover, same as gauges.
@@ -1931,6 +2332,19 @@ namespace Limisaw
             // window that is now above the new one alert again.
             NotifiedLow.Clear();
             Note = "Low alert at " + next + "% left";
+            Refresh();
+        }
+
+        // The preview's pretend quota. Nothing real changes — it only moves the
+        // number the preview icon is drawn from, so a layout can be judged at 5%
+        // and at 90% without waiting for the account to get there.
+        void SetPreviewFromX(int px)
+        {
+            int next = (int)Math.Round((double)(px - VolRail.X) / Math.Max(1, VolRail.Width) * 100);
+            next = Math.Max(0, Math.Min(100, next));
+            if (next == Settings.PreviewPct) return;
+            Settings.PreviewPct = next; Settings.Save();
+            Note = "Preview at " + next + "% left";
             Refresh();
         }
 
@@ -2127,18 +2541,44 @@ namespace Limisaw
         void DrawTextFit(Graphics g, string s, int x, int y, int maxWidth, Color c, int pt, bool bold = false)
         {
             if (string.IsNullOrEmpty(s) || maxWidth <= 0) return;
-            string text = s;
-            if (TextWidth(g, text, pt) > maxWidth)
-            {
-                while (text.Length > 1 && TextWidth(g, text + "...", pt) > maxWidth) text = text.Substring(0, text.Length - 1);
-                text += "...";
-                // One char + "..." can still exceed maxWidth on a narrow panel;
-                // drawing it anyway put a mark past the right edge, so draw
-                // nothing rather than something clipped.
-                if (TextWidth(g, text, pt) > maxWidth) return;
-            }
+            string text = Elide(g, s, maxWidth, pt);
+            if (text.Length == 0) return;
             Marks.Add(new Rectangle(x, y, TextWidth(g, text, pt), pt + 4));
             DrawText(g, text, x, y, c, pt, bold);
+        }
+
+        // Shortened from the MIDDLE, not the end. Every identifier in this app is
+        // distinguished by its tail — "codex/Account2/five_hour" vs
+        // ".../weekly", "Antigravity · Claude and GPT models" vs "· Gemini
+        // models" — so a trailing ellipsis throws away the only part that says
+        // WHICH reading a row is. `Codex/Accou...` is three identical rows.
+        string Elide(Graphics g, string s, int maxWidth, int pt)
+        {
+            if (string.IsNullOrEmpty(s) || maxWidth <= 0) return "";
+            if (TextWidth(g, s, pt) <= maxWidth) return s;
+            const string cut = "..";
+            int cutW = TextWidth(g, cut, pt);
+            if (cutW > maxWidth) return "";
+            // Grow head and tail alternately, tail first: the tail carries the
+            // identity, so it wins the last available pixel.
+            int head = 0, tail = 0;
+            while (true)
+            {
+                bool grew = false;
+                if (head + tail < s.Length)
+                {
+                    string tryTail = s.Substring(0, head) + cut + s.Substring(s.Length - (tail + 1));
+                    if (TextWidth(g, tryTail, pt) <= maxWidth) { tail++; grew = true; }
+                }
+                if (head + tail < s.Length)
+                {
+                    string tryHead = s.Substring(0, head + 1) + cut + s.Substring(s.Length - tail);
+                    if (TextWidth(g, tryHead, pt) <= maxWidth) { head++; grew = true; }
+                }
+                if (!grew) break;
+            }
+            if (head == 0 && tail == 0) return "";
+            return s.Substring(0, head) + cut + s.Substring(s.Length - tail);
         }
 
         void DrawBevel(Graphics g, int x, int y, int w, int h, bool raised)
@@ -2150,8 +2590,18 @@ namespace Limisaw
         // a fixed 10pt label in a box measured for shorter text.
         void DrawButton(Graphics g, Rectangle r, string label, bool selected)
         {
-            using (var bg = new SolidBrush(selected ? Palette.ALT : Palette.RAISED)) g.FillRectangle(bg, r.X + 2, r.Y + 2, r.Width - 4, r.Height - 4);
-            DrawBevel(g, r.X, r.Y, r.Width, r.Height, !selected);
+            DrawButton(g, r, label, selected, true);
+        }
+
+        // `enabled: false` = the control exists but does nothing in the current
+        // mode. Drawn flat and muted rather than hidden: a row that disappears
+        // makes the panel jump, and the user cannot learn a setting they never
+        // see. The caller must also skip registering it in Buttons.
+        void DrawButton(Graphics g, Rectangle r, string label, bool selected, bool enabled)
+        {
+            Color face = !enabled ? Palette.SURFACE : selected ? Palette.ALT : Palette.RAISED;
+            using (var bg = new SolidBrush(face)) g.FillRectangle(bg, r.X + 2, r.Y + 2, r.Width - 4, r.Height - 4);
+            DrawBevel(g, r.X, r.Y, r.Width, r.Height, enabled && !selected);
             int inner = r.Width - 8;
             int pt = 10;
             while (pt > 8 && TextWidth(g, label, pt) > inner) pt--;
@@ -2159,11 +2609,10 @@ namespace Limisaw
             if (TextWidth(g, text, pt) > inner)
             {
                 Cropped.Add(label);
-                while (text.Length > 1 && TextWidth(g, text + "..", pt) > inner) text = text.Substring(0, text.Length - 1);
-                text += "..";
+                text = Elide(g, label, inner, pt);
             }
             var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-            using (var br = new SolidBrush(Palette.TEXT))
+            using (var br = new SolidBrush(enabled ? Palette.TEXT : Palette.MUTED))
                 g.DrawString(text, Cached(pt), br, new RectangleF(r.X + 2, r.Y + 2, r.Width - 4, r.Height - 4), fmt);
         }
 
@@ -2194,12 +2643,17 @@ namespace Limisaw
                     VolDrag = "lowpct"; VolRail = VolRailLow; Capture = true;
                     SetLowPctFromX(e.X); return;
                 }
+                if (VolRailPreview.Contains(e.Location) || VolKnobPreview.Contains(e.Location))
+                {
+                    VolDrag = "preview"; VolRail = VolRailPreview; Capture = true;
+                    SetPreviewFromX(e.X); return;
+                }
             }
             for (int i = 0; i < Buttons.Count; i++) { if (Buttons[i].Contains(e.Location)) { Note = ""; ButtonActions[i](); return; } }
             // A press on a tray row arms a drag but does not start one: the
             // pointer must travel DragSlop pixels first, so a plain click on a
             // row (which does nothing) never reorders anything by accident.
-            if (Tab == TabTray && e.Button == MouseButtons.Left)
+            if ((Tab == TabTray || Tab == TabAccounts) && e.Button == MouseButtons.Left)
                 for (int i = 0; i < ItemRows.Count; i++)
                     if (ItemRows[i].Contains(e.Location))
                     { DragId = ItemRowIds[i]; DragStartY = e.Y; DragY = e.Y; Dragging = false; Capture = true; return; }
@@ -2212,13 +2666,29 @@ namespace Limisaw
             // move re-sets from the x position, live, like Problip's slider.
             if (VolDrag != null && e.Button == MouseButtons.Left)
             {
-                if (VolDrag == "volume") SetVolumeFromX(e.X); else SetLowPctFromX(e.X);
+                if (VolDrag == "volume") SetVolumeFromX(e.X);
+                else if (VolDrag == "preview") SetPreviewFromX(e.X);
+                else SetLowPctFromX(e.X);
                 return;
             }
-            if (DragId == null) return;
+            if (DragId == null)
+            {
+                // Hover explanation. Only repaint when the sentence actually
+                // changes: a repaint per mouse-move over a panel of gauges is
+                // visible churn for nothing.
+                string next = HintAt(e.Location);
+                if (next != Hover) { Hover = next; Refresh(); }
+                return;
+            }
             DragY = e.Y;
             if (!Dragging && Math.Abs(e.Y - DragStartY) >= DragSlop) Dragging = true;
             if (Dragging) Refresh();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (Hover.Length > 0) { Hover = ""; Refresh(); }
         }
 
         protected override void OnMouseUp(MouseEventArgs e)
@@ -2231,13 +2701,15 @@ namespace Limisaw
             if (!dragged) { Refresh(); return; }
             // The drop is committed against the SAME ordered list the panel
             // painted, so the row lands exactly where the marker showed.
-            List<string> order = PaintedOrder();
+            List<string> order = Tab == TabAccounts ? PaintedCardOrder() : PaintedOrder();
             int from = order.IndexOf(id);
             if (from < 0) { Refresh(); return; }
             int to = DropIndex(order.Count);
             if (to == from) { Refresh(); return; }
             order.RemoveAt(from); order.Insert(Math.Min(to, order.Count), id);
-            Settings.SetItemOrder(order); Settings.Save();
+            if (Tab == TabAccounts) Settings.SetCardOrder(order);
+            else Settings.SetItemOrder(order);
+            Settings.Save();
             Refresh(); UpdateTray();
         }
 
@@ -2392,6 +2864,29 @@ namespace Limisaw
             int value; bool available; string label, reset;
             GetTrayMetric(out value, out available, out label, out reset);
             return RenderTrayBitmap(value, available, reset);
+        }
+
+        // The Settings preview: the SAME renderer the shell gets, driven by a
+        // pretend percentage. Going through the real path is the point — a
+        // hand-drawn mock-up can agree with the icon today and drift tomorrow.
+        Bitmap RenderPreviewBitmap()
+        {
+            PreviewPct = Settings.PreviewPct;
+            try { return RenderTrayBitmap(Settings.PreviewPct, true, PreviewReset()); }
+            finally { PreviewPct = -1; }
+        }
+
+        // >= 0 while a preview is rendering. The multi-reading layouts read the
+        // live metric list, so this is what makes them draw the pretend level
+        // too; -1 means "not previewing" and every path uses real values.
+        int PreviewPct = -1;
+
+        // A plausible reset for the Time readout, derived from the pretend level
+        // so it moves with the slider instead of sitting at a constant.
+        string PreviewReset()
+        {
+            double hours = 0.25 + 4.75 * Math.Max(0, Math.Min(100, Settings.PreviewPct)) / 100.0;
+            return DateTime.Now.AddHours(hours).ToString("yyyy-MM-ddTHH:mm:ss");
         }
 
         Bitmap RenderTrayBitmap(int value, bool available)

@@ -1,3 +1,82 @@
+# LIMISAW 0.0.4 (2026-09-04)
+
+A fourth vendor, and the Settings tab rebuilt around being understood.
+
+## Added
+
+- **Zcode (Z.ai / BigModel GLM Coding Plan), 5-hour and weekly.** Zcode is the
+  first vendor with no CLI to ask — it ships as an Electron desktop app and puts
+  nothing on PATH — so its quota comes from the same authenticated monitor
+  endpoint the app itself uses, `GET /api/monitor/usage/quota/limit`. Both
+  windows arrive in one answer: `unit:3/number:5` is the 5-hour pool,
+  `unit:6/number:1` the weekly one. `TIME_LIMIT` rows are the monthly MCP/tool
+  allowance and are not windows. Both hosts are supported (`api.z.ai`,
+  `open.bigmodel.cn`); remaining is taken from the exact credit counts rather
+  than the server's rounded percent, because at a 10 000-credit weekly cap one
+  percent is a hundred credits.
+- **Reading the quota still spends none of it — now pinned by test.** Every
+  provider uses its vendor's own "tell me, do not do" call: Codex's
+  `account/rateLimits/read`, `claude -p "/usage"` (measured `num_turns: 0`,
+  `$0.00`), `agy -p "/usage"`, and Zcode's monitor endpoint (measured: six
+  consecutive reads left the counters identical). `tests/limits.cs` now asserts
+  that against the sources, so a future "improvement" that asks a model how much
+  quota is left fails the build instead of quietly burning the thing it reports.
+- **The Zcode key is gated, and the gate is the point.** Every other vendor
+  authenticates through its own CLI, so LIMISAW never holds a credential. Zcode
+  needs an API key, and a key sitting in another application's config is not
+  LIMISAW's to take: `ZAI_API_KEY` / `ZCODE_API_KEY` from the environment work
+  always, while reading Zcode's own config requires `ZcodeReadConfig=1` in
+  `LIMISAW.ini`. With neither, the card says which two ways in exist and nothing
+  is read. The request is one GET, to one of two constant hosts, with redirects
+  refused so the key cannot be forwarded elsewhere, and the key is redacted out
+  of any text that reaches a card or an error.
+
+## Changed — Settings
+
+- **Three labelled groups** (`TRAY ICON`, `ALERTS`, `APP`) instead of eleven
+  equal rows, with related controls adjacent: the number readout sits under the
+  layout that produces one, and the low threshold directly beside the alert it
+  arms.
+- **Every control explains itself.** Hovering anything puts a sentence in the
+  footer — the footer rather than a floating tooltip, because a tooltip over the
+  preview hides exactly what the user is trying to judge. "1/4", "Two" and "Off"
+  are no longer four characters and a guess.
+- **A control that cannot matter looks and acts dead.** Fill granularity is
+  greyed and unclickable while the icon draws a bare number; the readout is
+  greyed for bars and cells; the volume is dead while both chimes are off; the
+  low-alert sound row does not exist until the alert is armed. A row that is
+  disabled says why, in the same footer.
+- **The preview is fake, and that is the feature.** It has its own quota slider,
+  so any layout can be judged at 5% and at 90% without waiting for the account to
+  get there — a preview locked to the live number can only ever answer one
+  question. It renders through the real tray path, so it cannot disagree with the
+  icon. It also has its own row now: the volume slider used to run across the
+  preview and cover it.
+- **Account cards reorder by dragging**, the same gesture as the Tray tab, with
+  an insertion marker. Cards are different heights, so the drop slot is measured
+  from real geometry rather than a row-height constant.
+
+## Fixed
+
+- **The low-quota chime no longer fires on every refresh.** A rolling window
+  (Zcode's 5-hour credit pool) pushes its reset time out a little on every spend,
+  and the alert treated any change of that stamp as a new cycle — so the "once
+  per window per reset cycle" rule degraded into "every sweep". A cycle now
+  requires a jump of at least half the window's own length: consumption drift is
+  minutes, a rollover is the whole window.
+- **A long reading name keeps its tail.** Names were shortened with a trailing
+  ellipsis, which threw away the only part that identifies them: four Codex
+  windows all read `codex/Accou...`. Shortening now happens in the middle.
+- **TLS.** A .NET Framework 4.0 target defaults to SSL3 + TLS 1.0, which the
+  Zcode host refuses outright (`SecureChannelFailure` on the first live call).
+  TLS 1.2/1.3 is now requested explicitly, added to whatever the process already
+  allows rather than replacing it.
+- Settings that could not be written were reported as saved. `Save()` now
+  surfaces a failed write, and the footer says `Settings NOT saved — LIMISAW.ini
+  is not writable` above every other hint. In a read-only folder — the "drop it
+  in Program Files" install — every change used to work until restart and then
+  silently revert.
+
 # LIMISAW 0.0.3 (2026-09-03)
 
 ## Fixed

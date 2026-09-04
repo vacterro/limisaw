@@ -3,12 +3,13 @@
 **One file. No runtime. Every AI agent limit in your tray.**
 
 LIMISAW is a Windows tray monitor for how much quota you have left across
-**Codex, Claude Code and Antigravity** — every account each of them exposes. It
-asks each vendor's own CLI, so the numbers come from the vendor's server, not
-from a file whose meaning someone guessed. It never reads `auth.json`, never
-touches a token, never installs anything on its own.
+**Codex, Claude Code, Antigravity and Zcode** — every account each of them
+exposes. It asks each vendor for the number the vendor already knows, using that
+vendor's own read-only call, so **reading your quota never spends any of it**. It
+does not parse `auth.json`, does not send prompts, and installs nothing on its
+own.
 
-`LIMISAW.exe` is **248 KB and complete**: every palette, both alert sounds and
+`LIMISAW.exe` is **266 KB and complete**: every palette, both alert sounds and
 the icon are inside it. Drop it in an empty folder and run it.
 
 ```
@@ -22,12 +23,20 @@ LIMISAW.ini          <- written on first launch, next to the exe
 
 | Vendor | Source | Windows |
 | --- | --- | --- |
-| **Codex** | `codex app-server` JSON-RPC, one call per `CODEX_HOME` | 5-hour, weekly, monthly (Free plan) |
+| **Codex** | `codex app-server` JSON-RPC `account/rateLimits/read`, one call per `CODEX_HOME` | 5-hour, weekly, monthly (Free plan) |
 | **Claude Code** | `claude -p "/usage"` (0 turns, $0.00), plus a status-line cache, Claude Desktop's own usage sampler and Claude Code's refusal journal as fallbacks | 5-hour, weekly, per-model weeklies |
 | **Antigravity** | `agy -p "/usage" --output-format json`, plus the IDE's 429 journal | weekly **and** 5-hour **per model pool** (Gemini / Claude & GPT) |
+| **Zcode** | `GET /api/monitor/usage/quota/limit` — the same monitor endpoint the app itself uses, on `api.z.ai` or `open.bigmodel.cn` | 5-hour, weekly (GLM Coding Plan) |
 
-**Discovered, not hardcoded.** Every account each CLI exposes becomes a card, a
-tray reading and a menu row — a new login needs no code change. `~/.codex`,
+**Reading costs nothing.** Every one of those is the vendor's own "tell me, do
+not do" call — a read method, or a slash command the CLI answers locally, or a
+monitor endpoint. Measured, not assumed: Claude reports `num_turns: 0` and
+`$0.00`, and six consecutive Zcode reads left the counters identical. A test
+asserts it against the source, so nobody can later "improve" a probe into asking
+a model how much quota is left.
+
+**Discovered, not hardcoded.** Every account each vendor exposes becomes a card,
+a tray reading and a menu row — a new login needs no code change. `~/.codex`,
 `~/.codex-account2`, `~/.codex-whatever`: all of them, automatically.
 
 **Pool-aware gating.** A spent long window zeroes the shorter ones *in its own
@@ -38,10 +47,35 @@ quota pool only*, so an exhausted Claude/GPT weekly never fakes a dead Gemini
 
 **A failed sweep does not blank a card.** A vendor CLI that fails once is not a
 vendor without quota. The last good numbers stay, dimmed and tagged
-`last good HH:MM:SS`, with one line saying *why* they are stale.
+`last good HH:MM:SS`, with one line saying *why* they are stale — in the vendor's
+own words, so "Not logged in" reads as something you can fix.
 
 **An elapsed window is full.** When a window's own reset time passes, it reads
 100% immediately — the clock already proved it; no probe needed.
+
+---
+
+## Zcode needs one line of permission
+
+Zcode is the only vendor here with no CLI: it is an Electron desktop app and puts
+nothing on PATH. Its quota needs an API key, and **a key sitting in another
+application's config file is not LIMISAW's to take**. So there are exactly two
+ways in:
+
+```powershell
+$env:ZAI_API_KEY = "..."        # works immediately, no switch
+```
+
+```ini
+; LIMISAW.ini — lets LIMISAW read the key out of Zcode's own config
+ZcodeReadConfig=1
+```
+
+With neither, the Zcode card stays idle and says which two options exist —
+nothing is read. With either, LIMISAW makes **one GET** to one of two constant
+hosts, refuses redirects so the key cannot be forwarded elsewhere, reads exactly
+one field out of one file, and redacts the key out of any message that could
+reach a card or a log.
 
 ---
 
@@ -50,8 +84,8 @@ vendor without quota. The last good numbers stay, dimmed and tagged
 - **Four layouts** — one number, two stacked numbers (worst short over worst
   long), one bar per reading, one cell per reading in a 1x1/2x2/3x3 grid — times
   **four fill granularities** (halves, quarters, eighths, exact per pixel).
-- **You choose what it shows.** Ten-plus windows across three vendors do not fit
-  a 16-pixel icon, so the `Tray` tab lists every discovered reading with its live
+- **You choose what it shows.** A dozen windows across four vendors do not fit a
+  16-pixel icon, so the `Tray` tab lists every discovered reading with its live
   value and lets you reorder it (**drag a row** or use the arrows), hide it, and
   cap how many reach the icon (1-9). Rows past the cap are dimmed, not hidden. A
   brand-new reading is visible by default — silently hiding a fresh login would
@@ -74,12 +108,13 @@ vendor without quota. The last good numbers stay, dimmed and tagged
 Each alert is **two switches** — the balloon and the sound — because muting one
 and keeping the other is a real preference:
 
-- **On reset**: a balloon and/or a chime when a window refills (ships
+- **On refill**: a balloon and/or a chime when a window resets (ships
   `success_powerup.wav`).
-- **When left <= N%**: fires the **first** time a window drops to the threshold
+- **Low alert at N%**: fires the **first** time a window drops to the threshold
   (ships `pop_cartoon_pop.wav`). Once per window per reset cycle, so it cannot
-  nag: the first sweep after launch only records what is already low, and a
-  window that stays low does not re-alert every refresh.
+  nag: the first sweep after launch only records what is already low, a window
+  that stays low does not re-alert every refresh, and a *rolling* window whose
+  reset time drifts as you spend is not mistaken for a new cycle.
 - A **volume** for all of them (Windows has no per-sound volume, so the WAV's
   samples are scaled into a cached copy), a folder picker for your own WAV
   library, a `WAV` button per event and a `Play` button that previews at the
@@ -90,9 +125,20 @@ and keeping the other is a real preference:
 ## The window
 
 Four tabs (`Accounts`, `Tray`, `Settings`, `CLIs`; keys `1`-`4`) carry every
-setting the tray menu has: layout, fill, refresh interval, Used/Left, alerts,
-autostart, themes, and a button that opens `LIMISAW.ini`.
+setting the tray menu has, in three labelled groups: `TRAY ICON`, `ALERTS`, `APP`.
 
+- **Everything explains itself.** Hover any control and the footer says what it
+  does — the footer rather than a floating tooltip, because a tooltip over the
+  preview would hide the thing you are judging.
+- **A control that cannot matter is visibly dead.** Fill granularity greys out
+  while the icon draws a bare number; the number readout greys out for bars and
+  cells; the volume greys out with both chimes off; the low-alert sound row does
+  not appear until the alert is armed. Each one says why.
+- **The preview is deliberately fake**, with its own quota slider: judge any
+  layout at 5% and at 90% without waiting for the account to get there. It renders
+  through the real tray path, so it cannot disagree with the icon.
+- **Drag to reorder** — tray readings on the `Tray` tab, account cards on
+  `Accounts`.
 - **Used/Left**: one button (or `U`) flips every percentage between remaining and
   spent — **and the bars fill the other way too**, so an exhausted account reads
   as a full bar at `100%` used instead of an empty one. Colours always warn on
@@ -128,17 +174,19 @@ pwsh .\build.ps1            # -> LIMISAW.exe
 pwsh .\build.ps1 -Tests     # build + run the whole suite
 ```
 
-`tests\` is 13 harnesses / ~5300 assertions: the quota rules (`limits.cs`), the
-one-file claim (`standalone.cs`), tray rendering pixel purity, window layout,
-alert timing, carry-forward, gating, tooltips and the tray item picker.
+`tests\` is 14 harnesses / ~5400 assertions: the quota rules and the
+costs-nothing-to-read contract (`limits.cs`), the settings panel's own rules
+(`settings_ux.cs`), the one-file claim (`standalone.cs`), tray rendering pixel
+purity, window layout, alert timing, carry-forward, gating, tooltips and the tray
+item picker.
 
 `tools\make_ico.cs` regenerates `heh.ico` with one point-sampled frame per size
 the shell asks for, when the artwork changes.
 
 ---
 
-**Requires** Windows 10/11 x64 and whichever vendor CLIs you actually use.
-LIMISAW deliberately does not log you into anything — those are your
-credentials, not a dependency.
+**Requires** Windows 10/11 x64 and whichever vendors you actually use. LIMISAW
+deliberately does not log you into anything — those are your credentials, not a
+dependency.
 
 **License** — MIT, see `LICENSE`.

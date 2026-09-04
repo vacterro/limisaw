@@ -409,6 +409,14 @@ namespace Limisaw
 
         public static ProbeResult Run()
         {
+            return Run(false);
+        }
+
+        // `zcodeReadConfig` is LIMISAW.ini's own switch, threaded in rather than
+        // read here: a credential permission belongs to the settings file, and
+        // one owner means the test can drive both halves.
+        public static ProbeResult Run(bool zcodeReadConfig)
+        {
             double now = Stamp.Now;
             double deadline = now + TotalBudgetS;
             var result = new ProbeResult();
@@ -436,6 +444,16 @@ namespace Limisaw
                 }
             }
             catch (Exception ex) { accounts.Add(Broken("antigravity", "Antigravity", ex)); }
+
+            try
+            {
+                if (ZcodeSource.Installed())
+                {
+                    double budget = Math.Min(PerAccountBudgetS, deadline - Stamp.Now);
+                    if (budget > 0.2) accounts.Add(ZcodeSource.Probe(Stamp.Now + budget, zcodeReadConfig));
+                }
+            }
+            catch (Exception ex) { accounts.Add(Broken("zcode", "Zcode", ex)); }
 
             double at = Stamp.Now;
             foreach (ProbeAccount acc in accounts) result.Accounts.Add(Model.Flatten(acc, at));

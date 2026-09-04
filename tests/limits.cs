@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using Limisaw;
 
 // The quota engine's rules, where a wrong answer is invisible but wrong on
@@ -75,6 +76,8 @@ public static class LimitsTest
             Resets();
             Codex();
             Claude();
+            Zcode();
+            FreeToRead();
             Clis();
             Reasons();
             Console.WriteLine("---");
@@ -476,5 +479,226 @@ public static class LimitsTest
         Check("a pool-qualified key still reports its base kind",
             Model.Base("weekly@gemini_models") == "weekly"
             && Model.Label("weekly@gemini_models") == "week", "");
+    }
+
+    // Verbatim `GET /api/monitor/usage/quota/limit`, captured from a live Lite
+    // account. `unit`/`number` is a calendar unit and its count: 3/5 is the
+    // 5-hour window, 6/1 the weekly one.
+    const string ZcodeQuota = @"{""code"":200,""msg"":""Operation successful"",""data"":{""limits"":[
+        {""type"":""CREDIT_LIMIT"",""unit"":3,""number"":5,""usage"":2000,""currentValue"":170,
+         ""remaining"":1829,""percentage"":8,""nextResetTime"":1788498595214},
+        {""type"":""CREDIT_LIMIT"",""unit"":6,""number"":1,""usage"":10000,""currentValue"":170,
+         ""remaining"":9829,""percentage"":1,""nextResetTime"":1789085298997}],
+        ""level"":""lite""},""success"":true}";
+
+    // Zcode is the only vendor with no CLI, so it is the only one that needs a
+    // credential — which makes the gate as load-bearing as the parse.
+    static void Zcode()
+    {
+        Console.WriteLine("== Zcode: two windows from one endpoint, key behind a gate ==");
+
+        string plan, error;
+        List<ProbeWindow> windows = ZcodeSource.ParseQuota(ZcodeQuota, out plan, out error);
+        Check("both windows are read", windows != null && windows.Count == 2,
+            windows == null ? ("null: " + error) : windows.Count + " windows");
+        Check("the plan level is carried and capitalised", plan == "Lite", plan ?? "null");
+        Check("unit 3 / number 5 is the 5-hour window",
+            Win(windows, Model.FIVE_HOUR) != null, Keys(windows));
+        Check("unit 6 / number 1 is the weekly window",
+            Win(windows, Model.WEEKLY) != null, Keys(windows));
+        // remaining/usage is exact where `percentage` is already rounded to a
+        // whole number by the server: at a 10 000 weekly cap, 1% is 100 credits.
+        Check("remaining comes from the exact counts, not the rounded percent",
+            Math.Abs((Win(windows, Model.WEEKLY).Remaining ?? -1) - 98.29) < 0.01,
+            "weekly=" + Win(windows, Model.WEEKLY).Remaining);
+        Check("...and the 5-hour window likewise",
+            Math.Abs((Win(windows, Model.FIVE_HOUR).Remaining ?? -1) - 91.45) < 0.01,
+            "5h=" + Win(windows, Model.FIVE_HOUR).Remaining);
+        Check("millisecond reset stamps are parsed",
+            Win(windows, Model.FIVE_HOUR).ResetEpoch.HasValue
+            && Win(windows, Model.WEEKLY).ResetEpoch.HasValue, "");
+        Check("the shortest window sorts first", windows[0].Key == Model.FIVE_HOUR, windows[0].Key);
+        Check("the source is recorded so a wrong number can be traced",
+            windows[0].Source == "zcode-quota-api", windows[0].Source);
+
+        // A 200 with `code: 401` is how an expired key answers. Reading the
+        // envelope as success would render a working account at 0 quota.
+        List<ProbeWindow> expired = ZcodeSource.ParseQuota(
+            @"{""code"":401,""msg"":""token expired or incorrect"",""success"":false}",
+            out plan, out error);
+        Check("a 200 carrying code 401 is a failure, not zero quota",
+            expired == null && error != null && error.IndexOf("token expired", StringComparison.Ordinal) >= 0,
+            error ?? "(no error)");
+        Check("garbage is refused rather than parsed into a window",
+            ZcodeSource.ParseQuota("not json", out plan, out error) == null, error ?? "");
+        // TIME_LIMIT is the monthly MCP/tool allowance — a different family in
+        // the vendor's own code, and not a quota window here.
+        List<ProbeWindow> toolOnly = ZcodeSource.ParseQuota(
+            @"{""code"":200,""data"":{""level"":""pro"",""limits"":[
+               {""type"":""TIME_LIMIT"",""unit"":5,""number"":1,""usage"":1000,""remaining"":900}]}}",
+            out plan, out error);
+        Check("a TIME_LIMIT row is the tool allowance, never a quota window",
+            toolOnly != null && toolOnly.Count == 0, toolOnly == null ? "null" : Keys(toolOnly));
+        // TOKENS_LIMIT and CREDIT_LIMIT are interchangeable upstream: which one
+        // appears depends on how the plan is metered.
+        List<ProbeWindow> tokens = ZcodeSource.ParseQuota(
+            @"{""code"":200,""data"":{""level"":""max"",""limits"":[
+               {""type"":""TOKENS_LIMIT"",""unit"":3,""number"":5,""usage"":100,""remaining"":25}]}}",
+            out plan, out error);
+        Check("TOKENS_LIMIT is the same family as CREDIT_LIMIT",
+            tokens != null && tokens.Count == 1 && tokens[0].Remaining == 25.0,
+            tokens == null ? "null" : Keys(tokens) + " rem=" + tokens[0].Remaining);
+
+        // ── the gate ─────────────────────────────────────────────────────────
+        // Reading another application's API key is a permission, not a
+        // convenience: every other provider avoids holding a credential at all
+        // by asking its vendor's CLI.
+        string saved = Environment.GetEnvironmentVariable(ZcodeSource.EnvPrimary);
+        string savedAlt = Environment.GetEnvironmentVariable(ZcodeSource.EnvAlternate);
+        try
+        {
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvPrimary, null);
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvAlternate, null);
+            ZcodeSource.Key denied = ZcodeSource.Resolve(false);
+            Check("with no env key and the switch off, NOTHING is read",
+                denied.Value.Length == 0 && denied.Refusal != null
+                && denied.Refusal.IndexOf("ZcodeReadConfig", StringComparison.Ordinal) >= 0,
+                denied.Refusal ?? "(no refusal)");
+            Check("...and the refusal names the env var too, so there are two ways in",
+                denied.Refusal.IndexOf(ZcodeSource.EnvPrimary, StringComparison.Ordinal) >= 0,
+                denied.Refusal);
+
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvPrimary, "env-key-1");
+            ZcodeSource.Key fromEnv = ZcodeSource.Resolve(false);
+            Check("an env key needs no switch — it was handed over deliberately",
+                fromEnv.Value == "env-key-1" && fromEnv.Refusal == null,
+                fromEnv.Origin);
+            Check("the origin names where the key came from, never the key",
+                fromEnv.Origin == "$" + ZcodeSource.EnvPrimary
+                && fromEnv.Origin.IndexOf("env-key-1", StringComparison.Ordinal) < 0,
+                fromEnv.Origin);
+
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvPrimary, null);
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvAlternate, "env-key-2");
+            Check("the alternate env var works too",
+                ZcodeSource.Resolve(false).Value == "env-key-2", "");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvPrimary, saved);
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvAlternate, savedAlt);
+        }
+
+        // Exactly one field out of one file, and the Coding Plan providers are
+        // preferred: a plan key reports plan windows, while the plain API key
+        // reports the same endpoint for a pay-as-you-go account.
+        string dir = Path.Combine(Path.GetTempPath(), "zc_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string cfg = Path.Combine(dir, "config.json");
+            File.WriteAllText(cfg, @"{""provider"":{
+                ""builtin:zai"":{""options"":{""apiKey"":""plain-key""}},
+                ""builtin:zai-coding-plan"":{""options"":{""apiKey"":""plan-key""}}}}");
+            Check("the Coding Plan key wins over the plain API key",
+                ZcodeSource.FromConfig(cfg) == "plan-key", ZcodeSource.FromConfig(cfg) ?? "null");
+            File.WriteAllText(cfg, @"{""provider"":{""builtin:zai"":{""options"":{""apiKey"":""plain-key""}}}}");
+            Check("a plain API key is still usable when no plan key exists",
+                ZcodeSource.FromConfig(cfg) == "plain-key", ZcodeSource.FromConfig(cfg) ?? "null");
+            File.WriteAllText(cfg, @"{""provider"":{""builtin:zai"":{""options"":{}}}}");
+            Check("a config with no key yields null, never an empty string",
+                ZcodeSource.FromConfig(cfg) == null, ZcodeSource.FromConfig(cfg) ?? "null");
+            File.WriteAllText(cfg, "{ this is not json");
+            Check("an unparseable config is refused, not guessed at",
+                ZcodeSource.FromConfig(cfg) == null, "");
+            Check("a missing config is not an exception",
+                ZcodeSource.FromConfig(Path.Combine(dir, "nope.json")) == null, "");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+
+        // A secret must not reach a card, a log or an exception message.
+        Check("the key is redacted out of any text that leaves the provider",
+            ZcodeSource.Redact("HTTP 401 for sk-secret-123", "sk-secret-123") == "HTTP 401 for <key>",
+            ZcodeSource.Redact("HTTP 401 for sk-secret-123", "sk-secret-123"));
+        Check("redaction of an empty secret is a no-op, not a crash",
+            ZcodeSource.Redact("plain text", "") == "plain text"
+            && ZcodeSource.Redact(null, "x") == null, "");
+    }
+
+    // Reading the quota must never spend it. That is a property of WHICH call
+    // each provider makes, so it is pinned by source: a future "improvement"
+    // that asks a model how much quota is left would burn the thing it reports,
+    // silently, and only on someone else's bill.
+    static void FreeToRead()
+    {
+        Console.WriteLine("== reading the quota spends none of it ==");
+
+        // Zcode: a monitor endpoint, and a GET. Measured — six consecutive reads
+        // left currentValue at 0 and both remainders identical.
+        Check("Zcode reads a monitor endpoint, not a completion one",
+            ZcodeSource.QuotaPath == "/api/monitor/usage/quota/limit"
+            && ZcodeSource.QuotaPath.IndexOf("chat", StringComparison.OrdinalIgnoreCase) < 0
+            && ZcodeSource.QuotaPath.IndexOf("completion", StringComparison.OrdinalIgnoreCase) < 0,
+            ZcodeSource.QuotaPath);
+
+        // Every vendor's own idiom for "tell me, do not do". Asserted against the
+        // sources so the rule survives a refactor of any single provider.
+        string root = SourceRoot();
+        Check("the harness found the sources to audit", root != null, root ?? "(not found)");
+        if (root == null) return;
+
+        string codex = File.ReadAllText(Path.Combine(root, "Probe.cs"));
+        Check("Codex asks the app-server's READ method, and sends no prompt",
+            codex.IndexOf("account/rateLimits/read", StringComparison.Ordinal) >= 0
+            && codex.IndexOf("sendUserMessage", StringComparison.Ordinal) < 0
+            && codex.IndexOf("\"prompt\"", StringComparison.Ordinal) < 0,
+            "account/rateLimits/read");
+
+        // `-p` is print mode: the CLI answers the slash command locally instead
+        // of starting a turn. Claude's own JSON reports num_turns 0 / $0.00.
+        string claude = File.ReadAllText(Path.Combine(root, "ProbeClaude.cs"));
+        Check("Claude asks the /usage slash command in print mode",
+            claude.IndexOf("\"-p\", \"/usage\"", StringComparison.Ordinal) >= 0,
+            "-p /usage");
+        string agy = File.ReadAllText(Path.Combine(root, "ProbeAntigravity.cs"));
+        Check("Antigravity likewise",
+            agy.IndexOf("\"-p\", \"/usage\"", StringComparison.Ordinal) >= 0,
+            "-p /usage");
+
+        // The one implementation that would burn quota to report it.
+        var offenders = new List<string>();
+        foreach (string file in new[] { "Probe.cs", "ProbeClaude.cs", "ProbeAntigravity.cs", "ProbeZcode.cs" })
+        {
+            string text = File.ReadAllText(Path.Combine(root, file));
+            foreach (string bad in new[] { "/chat/completions", "/v1/messages", "max_tokens" })
+                if (text.IndexOf(bad, StringComparison.OrdinalIgnoreCase) >= 0)
+                    offenders.Add(file + " -> " + bad);
+        }
+        Check("no provider talks to a completion API to find out about quota",
+            offenders.Count == 0, offenders.Count == 0 ? "4 providers clean" : offenders[0]);
+
+        // Zcode is the only provider that opens a socket itself, so it is the
+        // only one that could send a body. It must not.
+        string zcode = File.ReadAllText(Path.Combine(root, "ProbeZcode.cs"));
+        Check("the Zcode request is a bare GET with no request body",
+            zcode.IndexOf("request.Method = \"GET\"", StringComparison.Ordinal) >= 0
+            && zcode.IndexOf("GetRequestStream", StringComparison.Ordinal) < 0,
+            "GET, no body");
+        Check("...and it refuses a redirect, so the key cannot be forwarded",
+            zcode.IndexOf("AllowAutoRedirect = false", StringComparison.Ordinal) >= 0, "");
+    }
+
+    // The repository root, found from the harness's own location: build.ps1 runs
+    // the tests from there, but tests/bin is where the exe lives.
+    static string SourceRoot()
+    {
+        string dir = Directory.GetCurrentDirectory();
+        for (int i = 0; i < 4 && dir != null; i++)
+        {
+            if (File.Exists(Path.Combine(dir, "ProbeZcode.cs"))) return dir;
+            DirectoryInfo up = Directory.GetParent(dir);
+            dir = up == null ? null : up.FullName;
+        }
+        return null;
     }
 }
