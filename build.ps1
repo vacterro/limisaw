@@ -27,7 +27,7 @@ $cscCandidates = @(
 $csc = $cscCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if (-not $csc) { throw "no .NET Framework 4.x compiler found; looked in: $($cscCandidates -join ', ')" }
 
-$sources = @('LIMISAW.cs', 'Probe.cs', 'ProbeClaude.cs', 'ProbeAntigravity.cs', 'ProbeZcode.cs', 'Assets.cs') |
+$sources = @('LIMISAW.cs', 'Probe.cs', 'ProbeClaude.cs', 'ProbeAntigravity.cs', 'ProbeZcode.cs', 'Assets.cs', 'ChildSweeper.cs') |
     ForEach-Object { Join-Path $root $_ }
 $missing = $sources | Where-Object { -not (Test-Path -LiteralPath $_) }
 if ($missing) { throw "missing source file(s): $($missing -join ', ')" }
@@ -50,14 +50,37 @@ $icon = Join-Path $root 'heh.ico'
 if (-not (Test-Path -LiteralPath $icon)) { throw "missing heh.ico: the app icon lives in the win32 icon group, so the build needs it" }
 
 $exe = Join-Path $root 'LIMISAW.exe'
-$arguments = @('-nologo', '-target:winexe', "-out:$exe", '-optimize+', "-win32icon:$icon")
-$arguments += $references | ForEach-Object { "-r:$_" }
-$arguments += $resources
-$arguments += $sources
 
-if (-not $Quiet) { Write-Host "Building LIMISAW.exe ($($resources.Count) embedded resources + the win32 icon)..." -ForegroundColor Cyan }
-& $csc @arguments
-if ($LASTEXITCODE -ne 0) { throw "compiler returned $LASTEXITCODE" }
+# The release identity, stamped from the one file that owns it. VERSION is
+# canonical (the CHANGELOG's newest heading and the git tag must match it — the
+# ship gate checks), so the exe's file version is DERIVED here rather than
+# maintained in a second place that could drift.
+$version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim()
+if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "VERSION '$version' is not a release version" }
+
+# Written per build so csc picks it up as the assembly's version attributes.
+$info = Join-Path $env:TEMP "limisaw_version_$PID.cs"
+Set-Content -LiteralPath $info -Encoding UTF8 -Value @"
+using System.Reflection;
+[assembly: AssemblyVersion("$version.0")]
+[assembly: AssemblyFileVersion("$version.0")]
+[assembly: AssemblyProduct("LIMISAW")]
+[assembly: AssemblyTitle("LIMISAW")]
+[assembly: AssemblyCompany("vacterro")]
+[assembly: AssemblyCopyright("Copyright (c) 2026 vac34")]
+[assembly: AssemblyDescription("Agent quota monitor: Codex, Claude Code, Antigravity and Zcode limits in the tray.")]
+"@
+try {
+    $arguments = @('-nologo', '-target:winexe', "-out:$exe", '-optimize+', "-win32icon:$icon")
+    $arguments += $references | ForEach-Object { "-r:$_" }
+    $arguments += $resources
+    $arguments += $sources
+    $arguments += $info
+
+    if (-not $Quiet) { Write-Host "Building LIMISAW.exe v$version ($($resources.Count) embedded resources + the win32 icon)..." -ForegroundColor Cyan }
+    & $csc @arguments
+    if ($LASTEXITCODE -ne 0) { throw "compiler returned $LASTEXITCODE" }
+} finally { Remove-Item -LiteralPath $info -Force -ErrorAction SilentlyContinue }
 $size = [math]::Round((Get-Item -LiteralPath $exe).Length / 1KB)
 if (-not $Quiet) { Write-Host "LIMISAW.exe: ${size} KB" -ForegroundColor Green }
 
@@ -103,7 +126,8 @@ foreach ($name in ($testRefs.Keys | Sort-Object)) {
                        '-main:LimitsTest')
         $testArgs += @((Join-Path $root 'Probe.cs'), (Join-Path $root 'ProbeClaude.cs'),
                        (Join-Path $root 'ProbeAntigravity.cs'), (Join-Path $root 'ProbeZcode.cs'),
-                       (Join-Path $root 'Assets.cs'), (Join-Path $root 'LIMISAW.cs'))
+                       (Join-Path $root 'Assets.cs'), (Join-Path $root 'ChildSweeper.cs'),
+                       (Join-Path $root 'LIMISAW.cs'))
     }
     $testArgs += $source
     & $csc @testArgs

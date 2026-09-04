@@ -60,34 +60,51 @@ namespace Limisaw
         // Every palette LIMISAW ships is embedded in the exe; a Themes\ folder
         // next to it adds to them, and a file with the same slug REPLACES the
         // embedded one, so a palette can be edited without a rebuild.
+        //
+        // A file that fails to parse is NOT silent (T-010): LoadErrors collects
+        // the reason, and the Settings tab shows it next to the theme grid, so a
+        // typo in a user palette is a message rather than a theme that quietly
+        // never appears. The good ones still load.
         public static List<Theme> Load(string root)
         {
             var list = new List<Theme> { new Theme() };
             var bySlug = new Dictionary<string, Theme>(StringComparer.OrdinalIgnoreCase);
+            var errors = new List<string>();
             foreach (KeyValuePair<string, string> pair in Assets.ThemeFiles())
-                Add(list, bySlug, pair.Value, pair.Key);
+                Add(list, bySlug, pair.Value, pair.Key, errors, null);
             string dir = Path.Combine(root ?? "", "Themes");
             if (Directory.Exists(dir))
                 foreach (string file in Directory.GetFiles(dir, "*.json"))
                 {
                     string text;
-                    try { text = File.ReadAllText(file); } catch { continue; }
-                    Add(list, bySlug, text, Path.GetFileNameWithoutExtension(file));
+                    try { text = File.ReadAllText(file); }
+                    catch (Exception ex)
+                    { errors.Add(Path.GetFileName(file) + ": " + ex.GetType().Name); continue; }
+                    Add(list, bySlug, text, Path.GetFileNameWithoutExtension(file), errors, file);
                 }
             list.Sort((a, b) => a.Order != b.Order ? a.Order.CompareTo(b.Order)
                 : string.Compare(a.Label, b.Label, StringComparison.OrdinalIgnoreCase));
+            LoadErrors = errors;
             return list;
         }
 
+        // Why the last Load dropped a file. Empty = everything parsed. Read by
+        // the Settings tab; never cleared except by the next Load.
+        public static List<string> LoadErrors = new List<string>();
+
         static void Add(List<Theme> list, Dictionary<string, Theme> bySlug,
-                        string json, string fallbackSlug)
+                        string json, string fallbackSlug, List<string> errors, string path)
         {
             var ser = new JavaScriptSerializer();
             try
             {
                 var doc = ser.Deserialize<Dictionary<string, object>>(json);
                 var tok = doc.ContainsKey("tokens") ? doc["tokens"] as Dictionary<string, object> : null;
-                if (tok == null) return;
+                if (tok == null)
+                {
+                    if (path != null) errors.Add(Path.GetFileName(path) + ": no tokens block");
+                    return;
+                }
                 string slug = (doc.ContainsKey("slug") ? doc["slug"] as string : null) ?? fallbackSlug;
                 var t = new Theme { Slug = slug, Label = (doc.ContainsKey("label") ? doc["label"] as string : slug) ?? slug };
                 if (doc.ContainsKey("order")) try { t.Order = Convert.ToInt32(doc["order"]); } catch { }
@@ -111,7 +128,10 @@ namespace Limisaw
                 else list.Add(t);
                 bySlug[t.Slug] = t;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                if (path != null) errors.Add(Path.GetFileName(path) + ": " + ex.GetType().Name);
+            }
         }
 
         static object Get(Dictionary<string, object> d, string key) { return d.ContainsKey(key) ? d[key] : null; }
@@ -873,6 +893,11 @@ namespace Limisaw
         // pointer (see DropIndex).
         List<int> CardTops = new List<int>();
         string DragId; int DragStartY, DragY; bool Dragging;
+        // A tray-row press that has not yet become a drag. On release without a
+        // drag it becomes a pin (T-013): the tray number was reachable only from
+        // the context menu, which the README's "every setting is in the window"
+        // promise never covered.
+        string ClickPinCandidate;
         // Problip-style drag slider: one active at a time, armed by OnMouseDown
         // on the knob OR anywhere on the rail. Null = no slider in flight.
         // Both rails' rects persist across paints so OnMouseDown can hit-test
@@ -1926,8 +1951,14 @@ namespace Limisaw
                 else if (!off && !overflow) using (var bg = new SolidBrush(Palette.SURFACE)) g.FillRectangle(bg, row.X, row.Y, row.Width, row.Height);
 
                 Color name = off ? Palette.MUTED : overflow ? Palette.TEXT2 : Palette.TEXT;
+                // The pinned reading for the single-number layout is marked here,
+                // in the list that decides what the tray can draw at all.
+                bool pinned = Settings.TrayMetric == m.Id;
                 DrawText(g, off ? "-" : (overflow ? "·" : rank.ToString()), 16, cursor + 4, name, 10);
-                DrawTextFit(g, m.Label, nameX, cursor + 4, nameW, name, 10);
+                DrawTextFit(g, (pinned ? "▸ " : "") + m.Label, nameX, cursor + 4, nameW, name, 10);
+                Hint(row, pinned
+                    ? "pinned: this reading IS the tray number (Number layout) — click Pin lowest to unpin"
+                    : "click to pin this reading as the tray number, or drag to reorder");
                 DrawText(g, m.Available ? ShownRem(m.Value) + "%" : "--", pctX, cursor + 4,
                     off || overflow ? Palette.MUTED : PctColor(m.Value), 10, true);
                 DrawGauge(g, gaugeX, cursor + 7, gaugeW, 8, m.Available ? m.Value : 100, m.Available, off || overflow);
@@ -2263,6 +2294,17 @@ namespace Limisaw
             Hint(faster, "ask more often");
             DrawButton(g, faster, "+", false);
             x += 24 + Gap * 2;
+            // The version is read from the exe's own metadata, which build.ps1
+            // stamps from VERSION — one source of truth, and a bug report can
+            // finally name the build it came from.
+            string version = "";
+            try { version = GetType().Assembly.GetName().Version.ToString(3); } catch { }
+            if (version.Length > 0)
+            {
+                DrawText(g, "v" + version, x, cursor + 4, Palette.MUTED, 11);
+                Hint(new Rectangle(x, cursor + 2, TextWidth(g, "v" + version, 11) + 8, 18),
+                    "this build — " + version + "; also visible in Explorer's file properties");
+            }
             string autoLabel = Settings.AutoStart ? "Autostart: on" : "Autostart: off";
             int autoW = ButtonWidth(g, autoLabel);
             if (x + autoW <= right)
@@ -2285,6 +2327,18 @@ namespace Limisaw
 
             HintRow(14, cursor, right - 14, "colours for the window, the tray icon and the hover panel");
             DrawText(g, "Theme", 14, cursor + 5, Palette.TEXT2, 10);
+            // A palette that failed to parse is named HERE, where the user is
+            // looking for themes — not in some log. Good ones still load, and a
+            // green line only shows while something is actually wrong.
+            if (Theme.LoadErrors.Count > 0)
+            {
+                string why = Theme.LoadErrors[0];
+                DrawTextFit(g, why, optX, cursor + 5, right - optX, Palette.DANGERTXT, 10);
+                Hint(new Rectangle(optX - 4, cursor, right - optX + 4, 18),
+                    why + (Theme.LoadErrors.Count > 1
+                        ? "  (+" + (Theme.LoadErrors.Count - 1) + " more broken palette file(s))"
+                        : "  — fix the file and it will load without a restart"));
+            }
             cursor += 20;
             // Column count follows the widest theme name, so a long label like
             // "Dark Golden (Win95)" gets a wider cell instead of an ellipsis.
@@ -2466,27 +2520,6 @@ namespace Limisaw
             if (VolDrag == null) return;
             VolDrag = null; Capture = false;
             Refresh(); UpdateTray();
-        }
-
-        void SetVolume(int delta)
-        {
-            int next = Math.Max(0, Math.Min(100, Settings.SoundVolume + delta));
-            if (next == Settings.SoundVolume) return;
-            Settings.SoundVolume = next; Settings.Save();
-            Note = "Volume " + next + "%";
-            Refresh();
-        }
-
-        void SetLowPct(int delta)
-        {
-            int next = Math.Max(5, Math.Min(95, Settings.LowPct + delta));
-            if (next == Settings.LowPct) return;
-            Settings.LowPct = next; Settings.Save();
-            // The alert that already fired was for the old threshold, so let a
-            // window that is now above the new one alert again.
-            NotifiedLow.Clear();
-            Note = "Low alert at " + next + "% left";
-            Refresh();
         }
 
         // The tail of an alert row: the sound that is set, then the two buttons
@@ -2832,8 +2865,24 @@ namespace Limisaw
             for (int i = 0; i < Buttons.Count; i++) { if (Buttons[i].Contains(e.Location)) { Note = ""; ButtonActions[i](); return; } }
             // A press on a tray row arms a drag but does not start one: the
             // pointer must travel DragSlop pixels first, so a plain click on a
-            // row (which does nothing) never reorders anything by accident.
-            if ((Tab == TabTray || Tab == TabAccounts) && e.Button == MouseButtons.Left)
+            // row (which pins that reading) never reorders anything by accident.
+            if (Tab == TabTray && e.Button == MouseButtons.Left)
+            {
+                for (int i = 0; i < ItemRows.Count; i++)
+                    if (ItemRows[i].Contains(e.Location))
+                    {
+                        // A plain CLICK pins the row as the tray number; a DRAG
+                        // reorders. The two live on the same row because they are
+                        // both about that reading, and the disambiguation is the
+                        // gesture: click = pin, drag = move.
+                        string clicked = ItemRowIds[i];
+                        DragId = clicked; DragStartY = e.Y; DragY = e.Y;
+                        Dragging = false; Capture = true;
+                        ClickPinCandidate = clicked;
+                        return;
+                    }
+            }
+            if (Tab == TabAccounts && e.Button == MouseButtons.Left)
                 for (int i = 0; i < ItemRows.Count; i++)
                     if (ItemRows[i].Contains(e.Location))
                     { DragId = ItemRowIds[i]; DragStartY = e.Y; DragY = e.Y; Dragging = false; Capture = true; return; }
@@ -2878,7 +2927,33 @@ namespace Limisaw
             if (DragId == null) return;
             string id = DragId; bool dragged = Dragging;
             DragId = null; Dragging = false; Capture = false;
-            if (!dragged) { Refresh(); return; }
+            if (!dragged)
+            {
+                // A click, not a drag: on the Tray tab that PINS the reading as
+                // the tray number (or unpins, back to lowest). The pin used to
+                // live only in the context menu.
+                if (Tab == TabTray && ClickPinCandidate == id)
+                {
+                    if (Settings.TrayMetric == id)
+                    {
+                        Settings.TrayMetric = "lowest"; Settings.Save();
+                        Note = "Tray number: lowest remaining (recommended)";
+                    }
+                    else
+                    {
+                        Settings.TrayMetric = id; Settings.Save();
+                        string label = id;
+                        foreach (Metric m in AllMetrics())
+                            if (m.Id == id) { label = m.Label; break; }
+                        Note = "Tray number: " + label;
+                    }
+                    Refresh(); UpdateTray();
+                }
+                ClickPinCandidate = null;
+                Refresh();
+                return;
+            }
+            ClickPinCandidate = null;
             // The drop is committed against the SAME ordered list the panel
             // painted, so the row lands exactly where the marker showed.
             List<string> order = Tab == TabAccounts ? PaintedCardOrder() : PaintedOrder();
@@ -3298,6 +3373,10 @@ namespace Limisaw
         [STAThread]
         static void Main(string[] args)
         {
+            // Vendor CLIs must never outlive this process. Arm the job BEFORE any
+            // sweep can start: from here on, every spawned child is inside a
+            // kill-on-close job, so an exit mid-sweep sweeps the children too.
+            ChildSweeper.Arm();
             bool createdNew;
             using (var mutex = new System.Threading.Mutex(true, "Local\\LimisawApp", out createdNew))
             {

@@ -134,6 +134,7 @@ public static class SettingsUx
                     Context(formType, form, settings, st);
                     PreviewFake(formType, form, settings, st, asm);
                     CardDrag(asm, formType, form, settings, st);
+                    PinTray(asm, formType, form, settings, st);
                 }
             }
 
@@ -549,6 +550,113 @@ public static class SettingsUx
         finally
         {
             st.GetField("AccountOrder").SetValue(settings, saved);
+            accounts.Clear();
+            formType.GetMethod("ShowTab").Invoke(form, new object[] { 2 });
+        }
+    }
+
+    // ── the tray-number pin, reachable from the window ─────────────────────
+    // The tray menu had it; the window did not. A user who never opens the
+    // context menu could not set which reading the number reads, which is what
+    // "every setting is in the window too" promised.
+    static void PinTray(Assembly asm, Type formType, object form, object settings, Type st)
+    {
+        Console.WriteLine("== the tray number is pinnable from the window ==");
+        FieldInfo metric = st.GetField("TrayMetric");
+        FieldInfo rows = formType.GetField("ItemRows", NP);
+        FieldInfo rowIds = formType.GetField("ItemRowIds", NP);
+        MethodInfo hintAt = formType.GetMethod("HintAt", NP);
+
+        // Build a known fleet so the pin has something real to point at.
+        var accounts = (IList)formType.GetField("Accounts", NP).GetValue(form);
+        Type accType = asm.GetType("Limisaw.AccountData");
+        Type winType = asm.GetType("Limisaw.WindowData");
+        accounts.Clear();
+        foreach (var spec in new[] { new { p = "codex", n = "Codex", key = "five_hour" }, new { p = "zcode", n = "Zcode", key = "weekly" } })
+        {
+            object a = Activator.CreateInstance(accType);
+            accType.GetField("Provider").SetValue(a, spec.p);
+            accType.GetField("ProviderLabel").SetValue(a, spec.p);
+            accType.GetField("Name").SetValue(a, spec.n);
+            accType.GetField("Status").SetValue(a, "OK");
+            accType.GetField("Ok").SetValue(a, true);
+            var list = (IList)accType.GetField("Windows").GetValue(a);
+            object w = Activator.CreateInstance(winType);
+            winType.GetField("Key").SetValue(w, spec.key);
+            winType.GetField("Base").SetValue(w, spec.key);
+            winType.GetField("Label").SetValue(w, "5h");
+            winType.GetField("Group").SetValue(w, "");
+            winType.GetField("GroupLabel").SetValue(w, "");
+            winType.GetField("Available").SetValue(w, true);
+            winType.GetField("Rem").SetValue(w, 60);
+            winType.GetField("DurationMinutes").SetValue(w, 300);
+            list.Add(w);
+            accounts.Add(a);
+        }
+
+        string savedMetric = (string)metric.GetValue(settings);
+        try
+        {
+            metric.SetValue(settings, "lowest");
+            formType.GetMethod("ShowTab").Invoke(form, new object[] { 1 });
+            Frame f = Paint(formType, form, 560);
+
+            // A pinned reading is MARKED in the list, so the user can see what
+            // the number reads without hovering anything.
+            IList ids = (IList)rowIds.GetValue(form);
+            Check("the tray tab lists the fleet", ids != null && ids.Count == 2,
+                ids == null ? "no rows" : ids.Count + " rows");
+            Check("the pin hint exists in the lowest state",
+                HintZoneFor(f, "click to pin this reading") != Rectangle.Empty, "");
+
+            // Hovering a row explains pin vs drag.
+            IList rowList = (IList)rows.GetValue(form);
+            if (rowList != null && rowList.Count > 0)
+            {
+                Rectangle r0 = (Rectangle)rowList[0];
+                Check("a row hover explains the gesture",
+                    HintAt(formType, form, new Point(r0.X + 30, r0.Y + 5)).Length > 0, "");
+            }
+
+            // Simulate the CLICK path directly: OnMouseUp with no drag.
+            string target = (string)((IList)rowIds.GetValue(form))[0];
+            formType.GetField("DragId", NP).SetValue(form, target);
+            formType.GetField("ClickPinCandidate", NP).SetValue(form, target);
+            formType.GetField("Dragging", NP).SetValue(form, false);
+            formType.GetMethod("OnMouseUp", NP).Invoke(form,
+                new object[] { new MouseEventArgs(MouseButtons.Left, 1, 40, 20, 0) });
+            Check("a plain click on a row pins it as the tray number",
+                (string)metric.GetValue(settings) == target,
+                "TrayMetric=" + metric.GetValue(settings));
+
+            Frame pinned = Paint(formType, form, 560);
+            Check("the pinned row carries its own hover sentence",
+                HintZoneFor(pinned, "pinned:") != Rectangle.Empty
+                || HintZoneFor(pinned, "pinned: this reading") != Rectangle.Empty, "");
+
+            // Clicking the pinned row again returns to lowest.
+            formType.GetField("DragId", NP).SetValue(form, target);
+            formType.GetField("ClickPinCandidate", NP).SetValue(form, target);
+            formType.GetField("Dragging", NP).SetValue(form, false);
+            formType.GetMethod("OnMouseUp", NP).Invoke(form,
+                new object[] { new MouseEventArgs(MouseButtons.Left, 1, 40, 20, 0) });
+            Check("clicking the pinned row unpins it back to lowest",
+                (string)metric.GetValue(settings) == "lowest",
+                "TrayMetric=" + metric.GetValue(settings));
+
+            // A DRAG on the same row must NOT pin: the gestures are distinct.
+            formType.GetField("DragId", NP).SetValue(form, target);
+            formType.GetField("ClickPinCandidate", NP).SetValue(form, target);
+            formType.GetField("Dragging", NP).SetValue(form, true);
+            formType.GetMethod("OnMouseUp", NP).Invoke(form,
+                new object[] { new MouseEventArgs(MouseButtons.Left, 1, 40, 60, 0) });
+            Check("a drag on a row never pins it",
+                (string)metric.GetValue(settings) == "lowest",
+                "TrayMetric=" + metric.GetValue(settings));
+        }
+        finally
+        {
+            metric.SetValue(settings, savedMetric);
             accounts.Clear();
             formType.GetMethod("ShowTab").Invoke(form, new object[] { 2 });
         }

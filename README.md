@@ -9,11 +9,10 @@ vendor's own read-only call, so **reading your quota never spends any of it**. I
 does not parse `auth.json`, does not send prompts, and installs nothing on its
 own.
 
-`LIMISAW.exe` is **272 KB and complete**: every palette, both alert sounds and
-the icon are inside it. Drop it in an empty folder and run it.
+**Download `LIMISAW.exe` from [Releases](https://github.com/vacterro/limisaw/releases) — it is the whole install.** Every palette, both alert sounds and the icon are inside it. Drop it in an empty folder and run it.
 
 ```
-LIMISAW.exe          <- that's the whole install
+LIMISAW.exe          <- from Releases, that's the whole install
 LIMISAW.ini          <- written on first launch, next to the exe
 ```
 

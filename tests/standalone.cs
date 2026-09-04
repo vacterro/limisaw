@@ -177,6 +177,32 @@ public static class Standalone
                 golden != null && ((Color)themeType.GetField("BG").GetValue(golden)) == Color.FromArgb(1, 2, 3),
                 golden == null ? "missing" : themeType.GetField("BG").GetValue(golden).ToString());
 
+            // A BROKEN palette must be named, not silently skipped (T-010): the
+            // user wrote the file, so "my theme never appeared and nothing said
+            // why" is the worst possible answer. The good ones must still load.
+            File.WriteAllText(Path.Combine(themeDir, "broken.json"),
+                "{ this is not json at all");
+            IList afterBad = (IList)themeType.GetMethod("Load", BindingFlags.Public | BindingFlags.Static)
+                .Invoke(null, new object[] { temp });
+            Check("the good palettes still load beside a broken one",
+                afterBad.Count == after.Count, afterBad.Count + " themes");
+            FieldInfo loadErrors = themeType.GetField("LoadErrors", BindingFlags.Public | BindingFlags.Static);
+            IList errors = loadErrors == null ? null : (IList)loadErrors.GetValue(null);
+            bool named = false;
+            if (errors != null)
+                foreach (string e in errors)
+                    if (e.IndexOf("broken.json", StringComparison.Ordinal) >= 0) named = true;
+            Check("a malformed palette file is NAMED, not silently skipped",
+                named, "LoadErrors reported: " + (errors == null ? "NOTHING (the field is gone)" : errors.Count + " error(s)"));
+            // Clearing the fault clears the message: a stale complaint about a
+            // file the user already fixed is the stale-error defect again.
+            File.Delete(Path.Combine(themeDir, "broken.json"));
+            themeType.GetMethod("Load", BindingFlags.Public | BindingFlags.Static)
+                .Invoke(null, new object[] { temp });
+            if (loadErrors != null)
+                Check("fixing the file clears the complaint on the next load",
+                    ((IList)loadErrors.GetValue(null)).Count == 0, "");
+
             // A Sounds folder next to the exe likewise wins the picker.
             string soundDir = Path.Combine(temp, "Sounds");
             Directory.CreateDirectory(soundDir);

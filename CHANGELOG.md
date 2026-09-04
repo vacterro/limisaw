@@ -1,3 +1,46 @@
+# LIMISAW 0.0.7 (2026-09-04)
+
+Housekeeping release: six filed defects closed, and the repository stops
+pretending a binary is source.
+
+## Added
+
+- **The tray number is pinnable from the window.** It was reachable only from the
+  tray context menu, which is what "every setting is in the window too" promised
+  and never delivered. A plain **click** on a Tray row pins that reading; clicking
+  the pinned row returns to `lowest`; **dragging** still reorders — the gestures
+  are the disambiguation. The pinned row is marked with a `▸` and carries its own
+  hover sentence.
+
+## Fixed
+
+- **Exiting mid-sweep no longer orphans the vendor CLI children.** The sweep ran
+  on a background thread, so an exit tore it down without any `finally`: nothing
+  ever killed `codex app-server --stdio`, `claude` or `agy`, and with a 3-minute
+  timer over a 66-second sweep roughly one exit in three left orphans behind. A
+  process-wide **kill-on-close Job** is armed before the first sweep; measured
+  with a detached test child — it survives the parent's hard exit without the job
+  and is killed by the kernel with it.
+- **A malformed palette file is named, not silently skipped.** `Theme.Load`
+  collects the reason for every file it drops, and the Settings theme row shows
+  it in red beside the grid; the good palettes still load, and fixing the file
+  clears the message on the next load.
+- **The running binary can be identified.** `build.ps1` stamps
+  `AssemblyVersion`/`FileVersion`/`Product` from `VERSION` — the one owner — and
+  the APP group shows `v0.0.7` from the exe's own metadata. A bug report can
+  finally name the build it came from.
+- **Dead code removed**: the `-`/`+` stepper handlers the drag sliders replaced,
+  never called from anywhere.
+
+## Changed — repository
+
+- **`LIMISAW.exe` is no longer tracked.** The .NET Framework 4.x compiler has no
+  `-deterministic`, so a tracked binary was byte-different on every build: `git
+  status` was dirty after every verification, and a real change could not be told
+  from build noise. The exe ships as a **release asset** from now on — download it
+  from Releases; the repo tracks sources only. `build.ps1` still produces it, and
+  the whole test suite still runs against a freshly built copy.
+
 # LIMISAW 0.0.6 (2026-09-04)
 
 Two things Codex had been reporting all along, and LIMISAW threw both away.

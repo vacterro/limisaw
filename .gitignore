@@ -22,3 +22,7 @@ $RECYCLE.BIN/
 
 # Personal shortcuts
 *.lnk
+
+# The built exe is a release asset, not source: csc (Framework 4.x) has no -deterministic,
+# so a tracked binary was byte-different on every build and git status was never clean.
+LIMISAW.exe
