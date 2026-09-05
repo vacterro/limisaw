@@ -90,20 +90,44 @@ if (-not $Tests) { return }
 # Each harness is a standalone console exe. The ones that reflect over
 # LIMISAW.exe must run from the repo root, which is where they are launched.
 $testRefs = @{
-    'limits'          = @('System.dll')
+    'antigravity_journal' = @('System.dll')
+    'apply_thread'    = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
     'carry_forward'   = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
+    'claude_cache'    = @('System.dll')
+    'codex_session'   = @('System.dll')
+    'gdi_paint'       = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
+    'limits'          = @('System.dll')
+    'ini_reload'      = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
+    'ini_long_values' = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
     'layout_fit'      = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
+    'low_channels'    = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll', 'System.Web.Extensions.dll')
     'notify_alerts'   = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll', 'System.Web.Extensions.dll')
     'notify_settings' = @('System.dll')
     'pixel_purity'    = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll', 'System.Web.Extensions.dll')
+    'refresh_coalesce'= @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
     'reset_lock'      = @('System.dll')
+    'save_partial'    = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
     'settings_ux'     = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll', 'System.Runtime.Serialization.dll')
+    'slider_commit'   = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
+    'sound_cache'     = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
     'standalone'      = @('System.dll', 'System.Drawing.dll')
     'tray_countdown'  = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll', 'System.Web.Extensions.dll')
     'tray_error'      = @('System.dll')
     'tray_items'      = @('System.dll')
     'tray_popup'      = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
     'tray_tip'        = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
+    'zcode_budget'    = @('System.dll')
+}
+
+# Harness -> its entry-point class, for the ones compiled together WITH the
+# engine sources instead of reflecting over LIMISAW.exe.
+$engineLinked = @{
+    'antigravity_journal' = 'AntigravityJournalTest'
+    'claude_cache'  = 'ClaudeCacheTest'
+    'codex_session' = 'CodexSessionTest'
+    'ini_long_values' = 'IniLongValuesTest'
+    'limits'        = 'LimitsTest'
+    'zcode_budget'  = 'ZcodeBudgetTest'
 }
 
 $outDir = Join-Path $root 'tests\bin'
@@ -118,12 +142,12 @@ foreach ($name in ($testRefs.Keys | Sort-Object)) {
     # arguments, and assigning it inside a script is a silent trap.
     $testArgs = @('-nologo', "-out:$testExe")
     $testArgs += $testRefs[$name] | ForEach-Object { "-r:$_" }
-    # limits.cs asserts the probe's own rules, so it links the engine sources
-    # rather than reflecting over the built exe. -main picks its entry point
-    # over LIMISAW.cs's own.
-    if ($name -eq 'limits') {
+    # These harnesses assert the engine's own internals, so they LINK the engine
+    # sources rather than reflecting over the built exe. -main picks the
+    # harness's entry point over LIMISAW.cs's own.
+    if ($engineLinked.ContainsKey($name)) {
         $testArgs += @('-r:System.Web.Extensions.dll', '-r:System.Drawing.dll', '-r:System.Windows.Forms.dll',
-                       '-main:LimitsTest')
+                       "-main:$($engineLinked[$name])")
         $testArgs += @((Join-Path $root 'Probe.cs'), (Join-Path $root 'ProbeClaude.cs'),
                        (Join-Path $root 'ProbeAntigravity.cs'), (Join-Path $root 'ProbeZcode.cs'),
                        (Join-Path $root 'Assets.cs'), (Join-Path $root 'ChildSweeper.cs'),

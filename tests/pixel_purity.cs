@@ -133,8 +133,8 @@ public static class PixelPurity
         Color col = available ? PctColor(p, rem) : p.MUTED;
         using (Font f = PixelFont(text.Length >= 3 ? 6 : 8))
         using (var br = new SolidBrush(col))
+        using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
         {
-            var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
             g.DrawString(text, f, br, new RectangleF(1, 1, 14, 14), fmt);
         }
     }
@@ -145,8 +145,8 @@ public static class PixelPurity
         Color col = available ? PctColor(p, rem) : p.MUTED;
         using (Font f = PixelFont(text.Length >= 3 ? 5 : 6))
         using (var br = new SolidBrush(col))
+        using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
         {
-            var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
             g.DrawString(text, f, br, new RectangleF(1, top, 14, 7), fmt);
         }
     }

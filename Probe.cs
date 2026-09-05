@@ -160,13 +160,21 @@ namespace Limisaw
         }
     }
 
-    class ProbeAccount
+class ProbeAccount
     {
         public string Provider = "", ProviderLabel = "", Name = "", Status = "", Plan, Error;
+        // Stable identity for persistence and irreversible action routing.
+        // Codex homes are discovery-based and can repeat a display name, so
+        // the display label is NEVER identity: `SourceId` is derived from the
+        // exact canonical home and `ResetHome` is that home's path, so a banked
+        // reset spends on the account the user actually selected, not on
+        // whichever duplicate "Codex" happens to sort first.
+        public string SourceId = "";
+        public string ResetHome = "";
         public bool Ok, Quiet;
         public List<ProbeWindow> Windows = new List<ProbeWindow>();
-        // Banked resets this account holds, or null. Not a window: no percentage,
-        // nothing to fill — a count, an expiry and the vendor's own title.
+        // Banked resets this account holds, or null. Not a window: a count,
+        // an expiry and the vendor's own title.
         public ResetCredits Credits;
     }
 
@@ -338,6 +346,7 @@ namespace Limisaw
             var ad = new AccountData
             {
                 Provider = acc.Provider, ProviderLabel = acc.ProviderLabel, Name = acc.Name,
+                SourceId = acc.SourceId, ResetHome = acc.ResetHome,
                 Status = acc.Status, Plan = acc.Plan, Error = acc.Error,
                 Ok = acc.Ok, Quiet = acc.Quiet,
             };
@@ -545,21 +554,84 @@ namespace Limisaw
     {
         public static List<ProbeAccount> Sweep(double deadline, double perAccount)
         {
+            // CORE-003: discovery is separated from probing. The full target
+            // set is established FIRST so the available time is shared across
+            // every discovered home instead of whoever sorts early eating the
+            // whole provider budget. A home that gets no probing time is still
+            // a SLOT (stale, unreadable), so CarryForward can keep its last
+            // good windows instead of the card disappearing for a sweep.
+            List<CodexHome> homes = Homes();
+            DisambiguateLabels(homes);
+            // PERF-001: a session belongs to an exact home. A home that is no
+            // longer discovered would keep its child process alive forever, so
+            // discovery is also the pool's eviction list.
+            var liveKeys = new List<string>();
+            foreach (CodexHome h in homes) liveKeys.Add(SessionPool.Key(h.Path));
+            Pool.RetainOnly(liveKeys);
+            double remaining = deadline - Stamp.Now;
+            double slice = Math.Min(perAccount, remaining / Math.Max(1, homes.Count));
             var accounts = new List<ProbeAccount>();
-            foreach (KeyValuePair<string, string> home in Homes())
+            foreach (CodexHome home in homes)
             {
-                double budget = Math.Min(perAccount, deadline - Stamp.Now);
-                if (budget <= 0.2) break;
-                accounts.Add(Probe(home.Key, home.Value, Stamp.Now + budget));
+                double start = Stamp.Now;
+                if (start >= deadline)
+                {
+                    accounts.Add(Unreadable(home, "deadline_exceeded", "sweep time ran out before this home could be probed"));
+                    continue;
+                }
+                accounts.Add(Probe(home.Path, home.Name, home.Id, start + Math.Min(slice, deadline - start)));
             }
             return accounts;
         }
 
+        // A discovered home that the budget never reached. Not an error card —
+        // it carries no reading, so CarryForward attaches the previous sweep's
+        // windows to it. An account that genuinely disappears still vanishes,
+        // because only a missing discoverable home is omitted.
+        static ProbeAccount Unreadable(CodexHome home, string code, string detail)
+        {
+            var acc = new ProbeAccount
+            {
+                Provider = "codex", ProviderLabel = "Codex", Name = home.Name,
+                SourceId = home.Id, ResetHome = home.Path,
+                Status = Model.STALE, Ok = false, Error = Trim(detail ?? code),
+            };
+            return acc;
+        }
+
+        // A discovered home with a stable id. `Path` is the exact canonical
+        // home, `Name` is display text only. Two distinct homes may share a name
+        // (CODEX_HOME -> "Codex" and the default .codex -> "Codex"); only `Id`
+        // distinguishes them.
+        public class CodexHome
+        {
+            public string Path, Name, Id;
+            public CodexHome(string path, string name, string id)
+            { Path = path; Name = name; Id = id; }
+        }
+
+        // Two "Codex" cards are unusable and look broken. The label is NOT the
+        // identity — this is display-only, applied uniformly to every duplicate
+        // so it never reads as "the first one is the real Codex".
+        static void DisambiguateLabels(List<CodexHome> homes)
+        {
+            for (int i = 0; i < homes.Count; i++)
+            {
+                int matches = 0;
+                for (int j = 0; j < homes.Count; j++)
+                    if (homes[j].Name == homes[i].Name) matches++;
+                if (matches < 2) continue;
+                string trailing = " · " + Path.GetFileName(homes[i].Path.TrimEnd('\\', '/'));
+                if (!homes[i].Name.EndsWith(trailing))
+                    homes[i].Name = homes[i].Name + trailing;
+            }
+        }
+
         // Only *lists* candidate homes: fast, no subprocess. A directory
         // without auth.json is not a Codex home.
-        public static List<KeyValuePair<string, string>> Homes()
+        public static List<CodexHome> Homes()
         {
-            var found = new List<KeyValuePair<string, string>>();
+            var found = new List<CodexHome>();
             var seen = new List<string>();
             string profile = Environment.GetEnvironmentVariable("USERPROFILE")
                 ?? Environment.GetEnvironmentVariable("HOME");
@@ -574,7 +646,7 @@ namespace Limisaw
                 if (seen.Contains(norm)) return;
                 if (!Directory.Exists(full) || !File.Exists(Path.Combine(full, "auth.json"))) return;
                 seen.Add(norm);
-                found.Add(new KeyValuePair<string, string>(full, name));
+                found.Add(new CodexHome(full, name, HomeId(full)));
             };
 
             add(Environment.GetEnvironmentVariable("CODEX_HOME"), "Codex");
@@ -589,6 +661,19 @@ namespace Limisaw
                 add(dir, label.Length > 0 ? TitleCase(label) : "Codex");
             }
             return found;
+        }
+
+        // A 64-bit digest of the canonical (case-insensitive, separator-trimmed)
+        // home path. Identical on every run; distinct for distinct homes; never
+        // derived from the display name.
+        static string HomeId(string full)
+        {
+            string norm = full.TrimEnd('\\', '/').ToLowerInvariant();
+            byte[] bytes = System.Security.Cryptography.SHA256.Create()
+                .ComputeHash(System.Text.Encoding.UTF8.GetBytes(norm));
+            var sb = new System.Text.StringBuilder(16);
+            for (int i = 0; i < 8; i++) sb.Append(bytes[i].ToString("x2"));
+            return sb.ToString();
         }
 
         // An account's display name is half of its tray-item id, so the casing
@@ -608,11 +693,12 @@ namespace Limisaw
             return sb.ToString();
         }
 
-        static ProbeAccount Fail(string name, string code, string detail)
+        static ProbeAccount Fail(string name, string id, string home, string code, string detail)
         {
             var acc = new ProbeAccount
             {
                 Provider = "codex", ProviderLabel = "Codex", Name = name,
+                SourceId = id, ResetHome = home,
                 Status = Model.ERROR, Ok = false, Error = Trim(detail ?? code),
             };
             acc.Windows.Add(ProbeWindow.Unavailable(Model.FIVE_HOUR));
@@ -626,29 +712,46 @@ namespace Limisaw
             return s.Length > 160 ? s.Substring(0, 160) : s;
         }
 
-        static ProbeAccount Probe(string home, string name, double deadline)
+        static ProbeAccount Probe(string home, string name, string id, double deadline)
         {
-            string exe = Cli.Resolve("codex");
-            if (exe.Length == 0) return Fail(name, "cli_not_installed", "Codex CLI not found on PATH");
-            RpcSession session = null;
+            string exe = ResolveExe("codex");
+            if (exe.Length == 0) return Fail(name, id, home, "cli_not_installed", "Codex CLI not found on PATH");
+            // PERF-001: the app-server of a stable home is REUSED across sweeps.
+            // Starting it costs a measured 14-19s cold start, so a sweep that
+            // starts a fresh child per home per run paid that tax every time.
+            // The pool hands back the live session for this exact canonical
+            // home (already initialized, so a warm sweep is one read), starts
+            // a replacement only when the child died, and is the seam the
+            // session harness drives without any real `codex` on the machine.
+            SessionPool.Entry entry = Pool.Checkout(home, exe);
+            if (entry == null) return Fail(name, id, home, "spawn_failed", "codex app-server did not start");
             try
             {
-                session = RpcSession.Start(exe, home);
-                if (session == null) return Fail(name, "spawn_failed", "codex app-server did not start");
-                // Each call may use whatever is LEFT of the deadline. The first
-                // app-server of a session pays a cold start (measured 14-19s),
-                // so a fixed per-call cap threw away time the caller had
-                // already granted and read as "this account is broken".
-                object init = session.Call("initialize", new Dictionary<string, object> {
-                    { "clientInfo", new Dictionary<string, object> { { "name", "limisaw" }, { "version", "1.0.0" } } },
-                    { "capabilities", null },
-                }, deadline);
-                if (init == null) return Fail(name, "timeout", "codex app-server did not answer initialize");
-                if (J.Get(init, "error") != null) return Fail(name, "initialize_error", J.Write(J.Get(init, "error")));
-                session.Notify("initialized", null);
-                object rl = session.Call("account/rateLimits/read", null, deadline);
-                if (rl == null) return Fail(name, "timeout", "codex app-server did not answer rateLimits");
-                if (J.Get(rl, "error") != null) return Fail(name, "rate_limits_error", J.Write(J.Get(rl, "error")));
+                if (!entry.InitDone)
+                {
+                    // Each call may use whatever is LEFT of the deadline. The
+                    // first app-server of a session pays a cold start (measured
+                    // 14-19s), so a fixed per-call cap threw away time the
+                    // caller had already granted and read as "this account is
+                    // broken".
+                    object init = entry.Link.Call("initialize", new Dictionary<string, object> {
+                        { "clientInfo", new Dictionary<string, object> { { "name", "limisaw" }, { "version", "1.0.0" } } },
+                        { "capabilities", null },
+                    }, deadline);
+                    if (init == null) { Pool.Drop(entry); return Fail(name, id, home, "timeout", "codex app-server did not answer initialize"); }
+                    if (J.Get(init, "error") != null) { Pool.Drop(entry); return Fail(name, id, home, "initialize_error", J.Write(J.Get(init, "error"))); }
+                    entry.Link.Notify("initialized", null);
+                    entry.InitDone = true;
+                }
+                object rl = entry.Link.Call("account/rateLimits/read", null, deadline);
+                if (rl == null) { Pool.Drop(entry); return Fail(name, id, home, "timeout", "codex app-server did not answer rateLimits"); }
+                if (J.Get(rl, "error") != null)
+                {
+                    // A structured error is a HEALTHY session answering for an
+                    // account in a state we do not like; the child stays warm.
+                    Pool.Checkin(entry);
+                    return Fail(name, id, home, "rate_limits_error", J.Write(J.Get(rl, "error")));
+                }
 
                 object result = J.Get(rl, "result") ?? new Dictionary<string, object>();
                 string plan;
@@ -656,6 +759,7 @@ namespace Limisaw
                 var acc = new ProbeAccount
                 {
                     Provider = "codex", ProviderLabel = "Codex", Name = name,
+                    SourceId = id, ResetHome = home,
                     Status = Model.OK, Ok = true, Plan = plan,
                     // The same payload that carries the windows carries the
                     // banked resets; reading one and dropping the other is how
@@ -668,10 +772,10 @@ namespace Limisaw
                     windows.Add(ProbeWindow.Unavailable(Model.WEEKLY));
                 }
                 acc.Windows = windows;
+                Pool.Checkin(entry);
                 return acc;
             }
-            catch (Exception ex) { return Fail(name, "probe_exception", ex.GetType().Name + ": " + ex.Message); }
-            finally { if (session != null) session.Dispose(); }
+            catch (Exception ex) { Pool.Drop(entry); return Fail(name, id, home, "probe_exception", ex.GetType().Name + ": " + ex.Message); }
         }
 
         // Codex varies the window set by plan: Plus reports 300 (5h) + 10080
@@ -828,38 +932,51 @@ namespace Limisaw
         // `alreadyRedeemed`; they are reported verbatim-ish rather than collapsed
         // into ok/failed, because "you had nothing to reset" and "you have no
         // credit" send the user to different places.
-        public static string ConsumeResetCredit(string accountName, double deadline)
+        public static string ConsumeResetCredit(string homePath, double deadline)
         {
+            // `homePath` is the exact canonical home the selected card carries
+            // (AccountData.ResetHome). It is re-verified against the CURRENT
+            // discovery list — a home can be removed since the sweep — but never
+            // re-resolved by display name: with two "Codex" homes, name-only
+            // routing would spend a one-off credit on whichever sorts first.
             string home = null;
-            foreach (KeyValuePair<string, string> h in Homes())
-                if (h.Value == accountName) { home = h.Key; break; }
-            if (home == null) return "account " + accountName + " is no longer listed";
-            string exe = Cli.Resolve("codex");
+            foreach (CodexHome h in Homes())
+                if (string.Equals(h.Path, homePath, StringComparison.OrdinalIgnoreCase))
+                { home = h.Path; break; }
+            if (home == null) return "account " + homePath + " is no longer listed";
+            string exe = ResolveExe("codex");
             if (exe.Length == 0) return "Codex CLI not found on PATH";
-            RpcSession session = null;
+            // The reset rides the SAME pooled session the sweep uses — starting
+            // a second child to spend the credit would pay the cold start just
+            // to answer faster than the vendor needs.
+            SessionPool.Entry entry = Pool.Checkout(home, exe);
+            if (entry == null) return "codex app-server did not start";
             try
             {
-                session = RpcSession.Start(exe, home);
-                if (session == null) return "codex app-server did not start";
-                object init = session.Call("initialize", new Dictionary<string, object> {
-                    { "clientInfo", new Dictionary<string, object> { { "name", "limisaw" }, { "version", "1.0.0" } } },
-                    { "capabilities", null },
-                }, deadline);
-                if (init == null) return "codex app-server did not answer initialize";
-                if (J.Get(init, "error") != null) return Trim(J.Write(J.Get(init, "error")));
-                session.Notify("initialized", null);
-                object res = session.Call("account/rateLimitResetCredit/consume", null, deadline);
-                if (res == null) return "the reset request timed out — check `codex` before trying again";
+                if (!entry.InitDone)
+                {
+                    object init = entry.Link.Call("initialize", new Dictionary<string, object> {
+                        { "clientInfo", new Dictionary<string, object> { { "name", "limisaw" }, { "version", "1.0.0" } } },
+                        { "capabilities", null },
+                    }, deadline);
+                    if (init == null) { Pool.Drop(entry); return "codex app-server did not answer initialize"; }
+                    if (J.Get(init, "error") != null) { Pool.Drop(entry); return Trim(J.Write(J.Get(init, "error"))); }
+                    entry.Link.Notify("initialized", null);
+                    entry.InitDone = true;
+                }
+                object res = entry.Link.Call("account/rateLimitResetCredit/consume", null, deadline);
+                if (res == null) { Pool.Drop(entry); return "the reset request timed out — check `codex` before trying again"; }
                 object err = J.Get(res, "error");
                 if (err != null)
                 {
                     string message = J.Str(J.Get(err, "message"));
+                    Pool.Checkin(entry);
                     return Trim(string.IsNullOrEmpty(message) ? J.Write(err) : message);
                 }
+                Pool.Checkin(entry);
                 return Outcome(J.Str(J.Get(J.Get(res, "result"), "outcome")));
             }
-            catch (Exception ex) { return ex.GetType().Name; }
-            finally { if (session != null) session.Dispose(); }
+            catch (Exception ex) { Pool.Drop(entry); return ex.GetType().Name; }
         }
 
         static string Outcome(string outcome)
@@ -875,13 +992,134 @@ namespace Limisaw
             return outcome;
         }
 
+        // PERF-001 seams. `ResolveExe` and `StartSession` exist so the session
+        // harness can run the whole pool without a real `codex` install: the
+        // production defaults are the only writers of real children, and no
+        // test path can reach them once the hooks are replaced.
+        internal static Func<string, string> ResolveExe = exe => Cli.Resolve(exe);
+        internal static Func<string, string, RpcLink> StartSession = null; // null = the real RpcSession below
+
+        internal static readonly SessionPool Pool = new SessionPool();
+
+        // The handle the pool stores: the same surface RpcSession exposes,
+        // expressed as delegates so a scripted fake can stand in for a child.
+        internal class RpcLink
+        {
+            public Func<string, object, double, object> Call;
+            public Action<string, object> Notify;
+            public Func<bool> Alive = () => true;
+            public Action Drop = () => { };
+        }
+
+        // One session per exact canonical home, for the life of the process.
+        // An entry that dies is replaced on next checkout; a home that leaves
+        // discovery is evicted by RetainOnly; the kill-on-close job from the
+        // startup sweep means a pooled child can never outlive LIMISAW.
+        internal class SessionPool
+        {
+            public class Entry
+            {
+                public string HomeKey;
+                public RpcLink Link;
+                public bool InitDone;
+                public bool Orphan; // dropped or evicted; never checked in again
+            }
+
+            readonly object Gate = new object();
+            readonly Dictionary<string, Entry> ByHome = new Dictionary<string, Entry>();
+
+            public static string Key(string home)
+            {
+                return (home ?? "").TrimEnd('\\', '/').ToLowerInvariant();
+            }
+
+            public Entry Checkout(string home, string exe)
+            {
+                string key = Key(home);
+                RpcLink dead = null;
+                try
+                {
+                    lock (Gate)
+                    {
+                        Entry entry;
+                        if (ByHome.TryGetValue(key, out entry) && entry.Link.Alive())
+                        {
+                            entry.Orphan = false;
+                            return entry;
+                        }
+                        if (entry != null) { ByHome.Remove(key); entry.Orphan = true; dead = entry.Link; }
+                        RpcLink link = StartSession != null ? StartSession(exe, home) : RealSession(exe, home);
+                        if (link == null) return null;
+                        var fresh = new Entry { HomeKey = key, Link = link };
+                        ByHome[key] = fresh;
+                        return fresh;
+                    }
+                }
+                finally { if (dead != null) dead.Drop(); } // outside the lock: may block on the child
+            }
+
+            public void Checkin(Entry entry)
+            {
+                if (entry == null) return;
+                lock (Gate) entry.Orphan = false;
+            }
+
+            public void Drop(Entry entry)
+            {
+                if (entry == null) return;
+                lock (Gate)
+                {
+                    if (!entry.Orphan) ByHome.Remove(entry.HomeKey);
+                    entry.Orphan = true;
+                }
+                entry.Link.Drop(); // outside the lock: may block on the child
+            }
+
+            public void RetainOnly(List<string> keys)
+            {
+                var gone = new List<Entry>();
+                lock (Gate)
+                {
+                    foreach (KeyValuePair<string, Entry> kv in ByHome)
+                        if (!keys.Contains(kv.Key)) gone.Add(kv.Value);
+                    foreach (Entry e in gone) { ByHome.Remove(e.HomeKey); e.Orphan = true; }
+                }
+                foreach (Entry e in gone) e.Link.Drop(); // outside the lock: may block on the child
+            }
+
+            public int Count { get { lock (Gate) return ByHome.Count; } }
+
+            public void Reset()
+            {
+                List<Entry> all;
+                lock (Gate)
+                {
+                    all = new List<Entry>(ByHome.Values);
+                    ByHome.Clear();
+                    foreach (Entry e in all) e.Orphan = true;
+                }
+                foreach (Entry e in all) e.Link.Drop();
+            }
+
+            RpcLink RealSession(string exe, string home)
+            {
+                RpcSession session = RpcSession.Start(exe, home);
+                return session == null ? null : session.Link();
+            }
+        }
+
         // Minimal JSON-RPC 2.0 client over the child's stdio. A reader thread
         // owns stdout so a noisy child can never block the pipe, and the
         // caller's absolute deadline is the only timeout that matters.
-        class RpcSession : IDisposable
+        internal class RpcSession : IDisposable
         {
             Process P;
             readonly Dictionary<int, object> Responses = new Dictionary<int, object>();
+            // PERF-001: a request whose caller gave up must never keep a slot.
+            // The reply can still land after the timeout; it is matched here
+            // and discarded, so a slow answer cannot sit in Responses forever
+            // or resurface as the answer to a later, different request.
+            readonly HashSet<int> Abandoned = new HashSet<int>();
             readonly object Gate = new object();
             int NextId = 1;
 
@@ -910,6 +1148,13 @@ namespace Limisaw
                 return session;
             }
 
+            public bool Alive
+            {
+                get { try { return !P.HasExited; } catch { return false; } }
+            }
+
+            internal int PendingResponses { get { lock (Gate) return Responses.Count; } }
+
             void ReadLoop()
             {
                 try
@@ -922,7 +1167,12 @@ namespace Limisaw
                         object msg = J.Parse(line);
                         double? id = J.Num(J.Get(msg, "id"));
                         if (!id.HasValue) continue;
-                        lock (Gate) Responses[(int)id.Value] = msg;
+                        lock (Gate)
+                        {
+                            int key = (int)id.Value;
+                            if (Abandoned.Remove(key)) continue; // late reply for a given-up call
+                            Responses[key] = msg;
+                        }
                     }
                 }
                 catch { }
@@ -958,6 +1208,15 @@ namespace Limisaw
                     }
                     Thread.Sleep(20);
                 }
+                lock (Gate)
+                {
+                    object found;
+                    // The reply may have landed between the last poll and this
+                    // abandon: it wins, a deadline is not allowed to eat a
+                    // finished answer.
+                    if (Responses.TryGetValue(id, out found)) { Responses.Remove(id); return found; }
+                    Responses.Remove(id); Abandoned.Add(id);
+                }
                 return null;
             }
 
@@ -977,6 +1236,17 @@ namespace Limisaw
                     return true;
                 }
                 catch { return false; }
+            }
+
+            public RpcLink Link()
+            {
+                return new RpcLink
+                {
+                    Call = (method, parameters, deadline) => Call(method, parameters, deadline),
+                    Notify = (method, parameters) => Notify(method, parameters),
+                    Alive = () => Alive,
+                    Drop = Dispose,
+                };
             }
 
             public void Dispose()

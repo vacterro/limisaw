@@ -57,15 +57,27 @@ namespace Limisaw
 
             // An explicit refusal in Claude Code's own transcript beats any
             // percentage: that window is spent until it resets. It is also the
-            // only directory-walking read here, so it is skipped when the sweep
-            // has no time left rather than blowing the deadline.
+            // only directory-walking read here, so the deadline is threaded all
+            // the way in (PERF-005) rather than only guarding the entry.
             var blocks = new Dictionary<string, Block>();
-            if (Stamp.Now < deadline) blocks = Transcripts.ActiveBlocks(Home(), now);
+            bool scanCut = false;
+            if (Stamp.Now < deadline)
+            {
+                blocks = Transcripts.ActiveBlocks(Home(), now, deadline);
+                scanCut = Transcripts.DeadlineHit;
+            }
+            else scanCut = true;
 
             if (readings.Count == 0 && blocks.Count == 0)
             {
                 acc.Status = Model.UNAVAILABLE;
-                acc.Error = Summary(cliError, bridgeError);
+                // PERF-005: a transcript scan the deadline cut short is not
+                // evidence of anything. Saying "Claude has not supplied rate
+                // limits yet" for a journal that was never read tells a blocked
+                // user they are merely idle.
+                acc.Error = scanCut && string.IsNullOrEmpty(cliError) && string.IsNullOrEmpty(bridgeError)
+                    ? "the Claude transcript scan ran out of sweep time"
+                    : Summary(cliError, bridgeError);
                 acc.Quiet = false;
                 acc.Windows.Add(ProbeWindow.Unavailable(Model.FIVE_HOUR));
                 acc.Windows.Add(ProbeWindow.Unavailable(Model.WEEKLY));
@@ -174,7 +186,7 @@ namespace Limisaw
             public string Source = "";
         }
 
-        class Block
+        internal class Block
         {
             public double ResetEpoch, ObservedAt;
             public string Source = "";
@@ -397,19 +409,60 @@ namespace Limisaw
 
         const long DesktopMaxBytes = 8 * 1024 * 1024;
 
+        // PERF-005: Desktop's sampler writes about every five minutes, and the
+        // refresh timer goes down to sixty seconds — so an 8 MiB history file was
+        // read and fully parsed several times between two producer updates. The
+        // parse is cached by canonical path + mtime + length; the mtime is ONLY
+        // an invalidation signal, never the quota timestamp. CapturedAt still
+        // comes from the sample's own `t`, and the staleness gate is re-applied
+        // against the caller's `now` on every call, cached or not.
+        class DesktopEntry
+        {
+            public string Path;
+            public double Mtime;
+            public long Length;
+            public Dictionary<string, Slot> Windows;
+            public double CapturedAt;
+        }
+        static DesktopEntry DesktopHit;
+        internal static long DesktopParses, DesktopBytesRead;
+        internal static void ResetDesktopCache()
+        {
+            DesktopHit = null; DesktopParses = 0; DesktopBytesRead = 0;
+        }
+
         static Reading DesktopSample(double now)
         {
             string path = DesktopHistoryPath();
             if (path.Length == 0 || !File.Exists(path)) return null;
-            try { if (new FileInfo(path).Length > DesktopMaxBytes) return null; }
+            double mtime;
+            long length;
+            try
+            {
+                var info = new FileInfo(path);
+                if (info.Length > DesktopMaxBytes) return null;
+                length = info.Length;
+                mtime = Stamp.Of(info.LastWriteTimeUtc);
+            }
             catch { return null; }
+
+            DesktopEntry hit = DesktopHit;
+            if (hit != null && hit.Path == path && hit.Mtime == mtime && hit.Length == length)
+                return DesktopReading(hit, now);
+
             object payload;
-            try { payload = J.Parse(File.ReadAllText(path)); }
+            try
+            {
+                string text = File.ReadAllText(path);
+                DesktopParses++;
+                DesktopBytesRead += text.Length;
+                payload = J.Parse(text);
+            }
             catch { return null; }
-            var samples = new List<object>();
-            foreach (object s in J.Arr(J.Get(payload, "samples"))) samples.Add(s);
             double bestAt = 0;
             var best = new Dictionary<string, Slot>();
+            var samples = new List<object>();
+            foreach (object s in J.Arr(J.Get(payload, "samples"))) samples.Add(s);
             // The tail is chronological in practice; a max scan over the last
             // few hundred samples costs nothing and trusts no ordering.
             for (int i = Math.Max(0, samples.Count - 512); i < samples.Count; i++)
@@ -430,12 +483,28 @@ namespace Limisaw
                 if (at.Value > bestAt) { bestAt = at.Value; best = windows; }
             }
             if (bestAt <= 0) return null;
-            // A stale sample is still returned — the caller marks the snapshot
-            // STALE — but a sampler that stopped hours ago is not current truth.
-            if (now - bestAt > DesktopStaleAfterS * 8) return null;
+            DesktopHit = new DesktopEntry
+            {
+                Path = path, Mtime = mtime, Length = length,
+                Windows = best, CapturedAt = bestAt,
+            };
+            return DesktopReading(DesktopHit, now);
+        }
+
+        // The time-dependent half, applied on every call so a cached parse can
+        // never freeze a verdict about staleness. A stale sample is still
+        // returned — the caller marks the snapshot STALE — but a sampler that
+        // stopped hours ago is not current truth.
+        static Reading DesktopReading(DesktopEntry entry, double now)
+        {
+            if (now - entry.CapturedAt > DesktopStaleAfterS * 8) return null;
+            // A fresh Slot per call: the merge in Probe writes into these.
+            var windows = new Dictionary<string, Slot>();
+            foreach (KeyValuePair<string, Slot> pair in entry.Windows)
+                windows[pair.Key] = new Slot { Used = pair.Value.Used };
             return new Reading
             {
-                Windows = best, CapturedAt = bestAt,
+                Windows = windows, CapturedAt = entry.CapturedAt,
                 Source = "claude-desktop-usage-history",
             };
         }
@@ -457,17 +526,37 @@ namespace Limisaw
         // That is the provider's own verdict: the window is spent until
         // `resetsAt`. Reading is bounded on purpose — newest transcripts only,
         // their tail only, lines mentioning the field only.
-        static class Transcripts
+        internal static class Transcripts
         {
             const int TailBytes = 256 * 1024;
             const int MaxFiles = 8;
             const double MaxAgeS = 7 * 24 * 3600;
 
-            public static Dictionary<string, Block> ActiveBlocks(string claudeDir, double now)
+            // PERF-005: the deadline used to be an ENTRY condition — checked once
+            // before the walk, then ignored while the walk stat'ed every *.jsonl
+            // under every project directory. A large accumulated tree therefore
+            // carried filesystem work past the provider's whole budget. It is now
+            // a bound on the scan itself, and a scan it cut short says so instead
+            // of returning the same empty dictionary a healthy account returns.
+            internal static bool DeadlineHit;
+            internal static long StatCalls, TailReads;
+            internal static void ResetCounters() { StatCalls = 0; TailReads = 0; DeadlineHit = false; }
+
+            // The walk asks its own clock so a test can prove the deadline binds
+            // INSIDE the walk and not merely at its entry — an entry-only check
+            // is exactly the defect PERF-005 reports, and it passes any test
+            // that hands it an already-expired budget.
+            internal static Func<double> Clock;
+            static double NowS() { Func<double> c = Clock; return c != null ? c() : Stamp.Now; }
+
+            internal static Dictionary<string, Block> ActiveBlocks(string claudeDir, double now, double deadline)
             {
+                DeadlineHit = false;
                 var blocks = new Dictionary<string, Block>();
                 if (string.IsNullOrEmpty(claudeDir)) return blocks;
-                foreach (string path in Recent(Path.Combine(claudeDir, "projects"), now))
+                foreach (string path in Recent(Path.Combine(claudeDir, "projects"), now, deadline))
+                {
+                    if (NowS() >= deadline) { DeadlineHit = true; break; }
                     foreach (string line in Tail(path))
                     {
                         if (line.IndexOf("quotaLimits", StringComparison.Ordinal) < 0) continue;
@@ -490,6 +579,7 @@ namespace Limisaw
                             Source = "claude-code-transcript",
                         };
                     }
+                }
                 return blocks;
             }
 
@@ -506,7 +596,11 @@ namespace Limisaw
                 return raw.Trim().ToLowerInvariant();
             }
 
-            static List<string> Recent(string root, double now)
+            // Discovery is metadata-only, but on a machine with hundreds of
+            // project directories the stat calls alone are the cost — so the
+            // deadline bounds this walk too, and a cut walk is reported rather
+            // than silently returning whatever it happened to reach.
+            static List<string> Recent(string root, double now, double deadline)
             {
                 var found = new List<KeyValuePair<double, string>>();
                 if (!Directory.Exists(root)) return new List<string>();
@@ -514,16 +608,19 @@ namespace Limisaw
                 try { slugs = Directory.GetDirectories(root); } catch { return new List<string>(); }
                 foreach (string slug in slugs)
                 {
+                    if (NowS() >= deadline) { DeadlineHit = true; break; }
                     string[] names;
                     try { names = Directory.GetFiles(slug, "*.jsonl"); } catch { continue; }
                     foreach (string path in names)
                     {
+                        if (NowS() >= deadline) { DeadlineHit = true; break; }
                         double age;
-                        try { age = now - Stamp.Of(File.GetLastWriteTimeUtc(path)); }
+                        try { StatCalls++; age = now - Stamp.Of(File.GetLastWriteTimeUtc(path)); }
                         catch { continue; }
                         if (age > MaxAgeS) continue;
                         found.Add(new KeyValuePair<double, string>(-age, path));
                     }
+                    if (DeadlineHit) break;
                 }
                 found.Sort((a, b) => b.Key.CompareTo(a.Key));
                 var paths = new List<string>();
@@ -540,6 +637,7 @@ namespace Limisaw
                 {
                     using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                     {
+                        TailReads++;
                         long size = fs.Length;
                         bool partial = size > TailBytes;
                         if (partial) fs.Seek(size - TailBytes, SeekOrigin.Begin);

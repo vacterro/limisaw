@@ -212,18 +212,35 @@ public static class NotifyAlertsTest
                         Tip() == replayFirst && fired.Count == 1,
                         "tip=\"" + Tip() + "\", tracked=" + fired.Count);
 
-                    // 6) the switch is honoured. The tracked set is cleared first,
-                    //    so the only thing that can keep this sweep silent is the
-                    //    switch itself and not a leftover record.
+                    // 6) the switches are honoured. The tracked set is cleared
+                    //    first, so the only thing that can keep this sweep silent
+                    //    is the switches themselves and not a leftover record.
+                    //
+                    //    CORE-005: the low alert has TWO switches now, and the
+                    //    EVENT is armed while either is on — a chime-only user
+                    //    still needs the once-per-cycle record. "Off" is therefore
+                    //    both channels off; tests\low_channels.cs owns the
+                    //    per-channel matrix.
                     settingsType.GetField("NotifyLow").SetValue(settings, false);
+                    settingsType.GetField("LowSound").SetValue(settings, false);
                     fired.Clear();
                     accounts.Clear();
                     accounts.Add(MakeAccount(asm, "one",
                         MakeWindow(asm, "five_hour", "5h", 1, soon)));
                     tray.BalloonTipText = "";
                     Sweep();
-                    Check("the low alert switch switches it off",
+                    Check("both low channels off switches the alert off entirely",
                         Tip().Length == 0 && fired.Count == 0,
+                        "tip=\"" + Tip() + "\", tracked=" + fired.Count);
+
+                    // ...while the balloon switch alone only silences the BALLOON:
+                    // the event still happens, so it is still recorded once.
+                    settingsType.GetField("LowSound").SetValue(settings, true);
+                    fired.Clear();
+                    tray.BalloonTipText = "";
+                    Sweep();
+                    Check("the balloon switch alone silences the balloon, not the event",
+                        Tip().Length == 0 && fired.Count == 1,
                         "tip=\"" + Tip() + "\", tracked=" + fired.Count);
 
                     Console.WriteLine("---");

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using System.Text.RegularExpressions;
 
 // Antigravity quota. The CLI states it exactly; the IDE's refusal journal
@@ -48,7 +49,7 @@ namespace Limisaw
                 acc.Status = Model.OK; acc.Ok = true; acc.Windows = windows;
                 return acc;
             }
-            return Journal(acc, cliError);
+            return Journal(acc, cliError, deadline);
         }
 
         static ProbeAccount Unavailable(ProbeAccount acc, string code, string summary)
@@ -230,12 +231,22 @@ namespace Limisaw
         // user to install what they already have is the worst answer available:
         // it hides an actionable failure (usually "not logged in") behind advice
         // they have already followed.
-        static ProbeAccount Journal(ProbeAccount acc, string cliError)
+        internal static ProbeAccount Journal(ProbeAccount acc, string cliError, double deadline)
         {
             double now = Stamp.Now;
-            Refusal refusal = LatestRefusal(DataDir(), now);
-            if (refusal == null)
+            JournalScan scan = LatestRefusal(DataDir(), now, deadline);
+            if (scan.Best == null)
+            {
+                // PERF-002: a scan the deadline cut short is NOT "no refusal
+                // recorded" — the journal was never fully read, and reporting
+                // the healthy resting state for an unread journal would tell
+                // a blocked user they are fine.
+                if (scan.DeadlineHit)
+                    return Unavailable(acc, "deadline_exceeded",
+                        "the Antigravity journal scan ran out of sweep time");
                 return Unavailable(acc, NoQuotaCode(cliError), NoQuotaSummary(cliError));
+            }
+            Refusal refusal = scan.Best;
             if (refusal.ResetEpoch <= now - ResetGraceS)
                 return Unavailable(acc,
                     string.IsNullOrEmpty(cliError) ? "quota_unknown" : "probe_failed",
@@ -271,7 +282,7 @@ namespace Limisaw
                 + "Antigravity only reports a limit when it refuses work";
         }
 
-        class Refusal
+        internal class Refusal
         {
             public double ObservedAt, ResetEpoch;
         }
@@ -306,15 +317,36 @@ namespace Limisaw
         // An ACTIVE block (reset still ahead) always wins over an elapsed one,
         // however recent the latter: an old expired block must never mask a
         // live one. Among equals the newest observation wins.
-        static Refusal LatestRefusal(string dataDir, double now)
+        internal class JournalScan
         {
-            if (string.IsNullOrEmpty(dataDir)) return null;
+            public Refusal Best;
+            public bool DeadlineHit;
+            public int OpenedFiles, CachedFiles;
+        }
+
+        // PERF-002 cache: a body is parsed only when its file changed. Keyed by
+        // path + mtime + length — three facts a stat already knows, so an
+        // unchanged conversation costs zero reads on every sweep after the
+        // first. The counters are what the harness asserts against: without
+        // the cache and the deadline, a full scan could open 16 dirs × 200
+        // files × 64KiB — the 200MiB bound the audit measured.
+        class CacheEntry { public double Mtime; public long Length; public List<Refusal> Events; }
+        static readonly Dictionary<string, CacheEntry> BodyCache = new Dictionary<string, CacheEntry>();
+        internal static long BodyReads, BytesRead;
+        internal static void ResetBodyCache()
+        {
+            BodyCache.Clear(); BodyReads = 0; BytesRead = 0;
+        }
+
+        internal static JournalScan LatestRefusal(string dataDir, double now, double deadline)
+        {
+            var scan = new JournalScan();
+            if (string.IsNullOrEmpty(dataDir)) return scan;
             string root = Path.Combine(dataDir, "brain");
-            if (!Directory.Exists(root)) return null;
+            if (!Directory.Exists(root)) return scan;
             var events = new List<Refusal>();
             foreach (string dir in RecentConversations(root, now))
-                events.AddRange(EventsFrom(dir, now));
-            if (events.Count == 0) return null;
+                events.AddRange(EventsFrom(dir, now, deadline, scan));
             Refusal best = null;
             foreach (Refusal ev in events)
             {
@@ -324,7 +356,8 @@ namespace Limisaw
                     || (activeNow == activeBest && ev.ObservedAt > best.ObservedAt))
                     best = ev;
             }
-            return best;
+            scan.Best = best;
+            return scan;
         }
 
         static List<string> RecentConversations(string root, double now)
@@ -351,33 +384,71 @@ namespace Limisaw
             return dirs;
         }
 
-        static List<Refusal> EventsFrom(string directory, double now)
+        static List<Refusal> EventsFrom(string directory, double now, double deadline, JournalScan scan)
         {
             var events = new List<Refusal>();
             string[] names;
             try { names = Directory.GetFiles(directory, "*.json"); } catch { return events; }
-            int opened = 0;
+            // PERF-002: newest FIRST, then the cap. The old code capped whatever
+            // order GetFiles answered with, so in a conversation with more
+            // messages than the cap the newest refusal — the only one that
+            // still matters — could sit outside the prefix and never be read.
+            // Stating every file is metadata; no body is read here.
+            var fresh = new List<KeyValuePair<double, string>>();
+            var lengths = new Dictionary<string, long>();
             foreach (string path in names)
             {
-                if (opened >= MaxFilesPerDir) break;
-                string text;
-                double mtime;
                 try
                 {
-                    mtime = Stamp.Of(File.GetLastWriteTimeUtc(path));
+                    double mtime = Stamp.Of(File.GetLastWriteTimeUtc(path));
                     if (now - mtime > MaxAgeS) continue;
-                    text = ReadCapped(path, 64 * 1024);
+                    fresh.Add(new KeyValuePair<double, string>(mtime, path));
+                    lengths[path] = new FileInfo(path).Length;
                 }
                 catch { continue; }
+            }
+            fresh.Sort((a, b) => b.Key.CompareTo(a.Key));
+            int opened = 0;
+            foreach (KeyValuePair<double, string> kv in fresh)
+            {
+                if (opened >= MaxFilesPerDir) break;
+                string path = kv.Value;
+                double mtime = kv.Key;
+                CacheEntry hit;
+                if (BodyCache.TryGetValue(path, out hit) && hit.Mtime == mtime && hit.Length == lengths[path])
+                {
+                    // A cached file is answered from the stat the caller already
+                    // paid for — it costs no body read, so it is served even
+                    // past the deadline. The deadline bounds BODY reads, not
+                    // metadata, and a warm cache must keep answering when the
+                    // sweep has no time left.
+                    scan.CachedFiles++;
+                    events.AddRange(hit.Events);
+                    continue;
+                }
+                if (Stamp.Now >= deadline) { scan.DeadlineHit = true; break; }
+                string text;
+                try { text = ReadCapped(path, 64 * 1024); } catch { continue; }
                 opened++;
-                if (text.IndexOf(Marker, StringComparison.Ordinal) < 0) continue;
-                object record = J.Parse(text);
-                string content = J.Str(J.Get(record, "content"));
-                if (content == null || content.IndexOf(Marker, StringComparison.Ordinal) < 0) continue;
-                double? delay = ResetDelay(content);
-                if (!delay.HasValue) continue;
-                double observed = Stamp.Epoch(J.Get(record, "timestamp")) ?? mtime;
-                events.Add(new Refusal { ObservedAt = observed, ResetEpoch = observed + delay.Value });
+                scan.OpenedFiles++;
+                BodyReads++; BytesRead += Encoding.UTF8.GetByteCount(text);
+                var parsed = new List<Refusal>();
+                if (text.IndexOf(Marker, StringComparison.Ordinal) >= 0)
+                {
+                    object record = J.Parse(text);
+                    string content = J.Str(J.Get(record, "content"));
+                    if (content != null && content.IndexOf(Marker, StringComparison.Ordinal) >= 0)
+                    {
+                        double? delay = ResetDelay(content);
+                        if (delay.HasValue)
+                        {
+                            double observed = Stamp.Epoch(J.Get(record, "timestamp")) ?? mtime;
+                            parsed.Add(new Refusal { ObservedAt = observed, ResetEpoch = observed + delay.Value });
+                        }
+                    }
+                }
+                BodyCache[path] = new CacheEntry { Mtime = mtime, Length = lengths[path], Events = parsed };
+                events.AddRange(parsed);
             }
             return events;
         }
@@ -422,38 +493,51 @@ namespace Limisaw
             var result = new ProbeResult();
             var accounts = new List<ProbeAccount>();
 
-            try { accounts.AddRange(CodexSource.Sweep(deadline, PerAccountBudgetS)); }
+            // CORE-003 fair shares: every provider that could have an account
+            // gets an equal slice of the sweep budget up front. A Codex machine
+            // with many homes can no longer starve Claude/Antigravity/Zcode out
+            // of the sweep — a slow Codex home eats its own share, never the
+            // providers scheduled behind it. Discovery of Codex homes happens
+            // inside Sweep before any probing, so the share divides across the
+            // whole target set, not whoever sorted first.
+            bool claudeOn = ClaudeSource.Installed();
+            bool agyOn = AntigravitySource.Installed();
+            bool zcodeOn = ZcodeSource.Installed();
+            int providers = 1 + (claudeOn ? 1 : 0) + (agyOn ? 1 : 0) + (zcodeOn ? 1 : 0);
+            double share = Math.Max(0.2, TotalBudgetS / providers);
+
+            try { accounts.AddRange(CodexSource.Sweep(now + share, share)); }
             catch (Exception ex) { accounts.Add(Broken("codex", "Codex", ex)); }
 
-            try
+            if (claudeOn)
             {
-                if (ClaudeSource.Installed())
+                double end = Math.Min(now + share, deadline);
+                if (end - Stamp.Now > 0.2)
                 {
-                    double budget = Math.Min(PerAccountBudgetS, deadline - Stamp.Now);
-                    if (budget > 0.2) accounts.Add(ClaudeSource.Probe(Stamp.Now + budget));
+                    try { accounts.Add(ClaudeSource.Probe(end)); }
+                    catch (Exception ex) { accounts.Add(Broken("claude", "Claude Code", ex)); }
                 }
             }
-            catch (Exception ex) { accounts.Add(Broken("claude", "Claude Code", ex)); }
 
-            try
+            if (agyOn)
             {
-                if (AntigravitySource.Installed())
+                double end = Math.Min(now + 2 * share, deadline);
+                if (end - Stamp.Now > 0.2)
                 {
-                    double budget = Math.Min(PerAccountBudgetS, deadline - Stamp.Now);
-                    if (budget > 0.2) accounts.Add(AntigravitySource.Probe(Stamp.Now + budget));
+                    try { accounts.Add(AntigravitySource.Probe(end)); }
+                    catch (Exception ex) { accounts.Add(Broken("antigravity", "Antigravity", ex)); }
                 }
             }
-            catch (Exception ex) { accounts.Add(Broken("antigravity", "Antigravity", ex)); }
 
-            try
+            if (zcodeOn)
             {
-                if (ZcodeSource.Installed())
+                double end = Math.Min(now + 3 * share, deadline);
+                if (end - Stamp.Now > 0.2)
                 {
-                    double budget = Math.Min(PerAccountBudgetS, deadline - Stamp.Now);
-                    if (budget > 0.2) accounts.Add(ZcodeSource.Probe(Stamp.Now + budget, zcodeReadConfig));
+                    try { accounts.Add(ZcodeSource.Probe(end, zcodeReadConfig)); }
+                    catch (Exception ex) { accounts.Add(Broken("zcode", "Zcode", ex)); }
                 }
             }
-            catch (Exception ex) { accounts.Add(Broken("zcode", "Zcode", ex)); }
 
             double at = Stamp.Now;
             foreach (ProbeAccount acc in accounts) result.Accounts.Add(Model.Flatten(acc, at));

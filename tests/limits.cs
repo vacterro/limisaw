@@ -76,6 +76,7 @@ public static class LimitsTest
             Resets();
             Codex();
             Banked();
+            Identity();
             Claude();
             Zcode();
             FreeToRead();
@@ -629,6 +630,51 @@ public static class LimitsTest
             !ClaudeSource.ParseReset("tomorrow-ish", now).HasValue, "");
     }
 
+    // CORE-001: the display name is never account identity. Two distinct
+    // "Codex" homes must have two distinct stable keys, a banked reset must
+    // route by the exact home, and legacy accounts without the id keep the old
+    // key shape so saved state and old fixtures survive.
+    static void Identity()
+    {
+        Console.WriteLine("== CORE-001: stable Codex identity, never a display name ==");
+
+        var one = new AccountData
+        {
+            Provider = "codex", ProviderLabel = "Codex", Name = "Codex",
+            SourceId = "aaaa1111", ResetHome = @"C:\x\.codex-a",
+            Ok = true, Status = Model.OK,
+        };
+        var two = new AccountData
+        {
+            Provider = "codex", ProviderLabel = "Codex", Name = "Codex",
+            SourceId = "bbbb2222", ResetHome = @"C:\x\.codex-b",
+            Ok = true, Status = Model.OK,
+        };
+        Check("two 'Codex' homes have two distinct keys",
+            one.Key != two.Key, one.Key + " vs " + two.Key);
+        Check("a Codex key carries its source id, not the label",
+            one.Key == "codex/aaaa1111", one.Key);
+        Check("keys do not collide for the same label",
+            (one.Key == "codex/Codex") == false && (two.Key == "codex/Codex") == false, "");
+
+        var legacy = new AccountData { Provider = "codex", Name = "Codex", Ok = true };
+        Check("a SourceId-less Codex account keeps the pre-CORE-001 key",
+            legacy.Key == "codex/Codex", legacy.Key);
+        Check("LegacyKey is provider/name for migration reads",
+            legacy.LegacyKey == "codex/Codex", legacy.LegacyKey);
+
+        var pa = new ProbeAccount
+        {
+            Provider = "codex", ProviderLabel = "Codex", Name = "Codex",
+            SourceId = "cccc3333", ResetHome = @"C:\x\.codex-c",
+            Status = Model.OK, Ok = true,
+        };
+        pa.Windows.Add(ProbeWindow.Unavailable(Model.FIVE_HOUR));
+        AccountData flat = Model.Flatten(pa, Stamp.Now);
+        Check("Flatten carries SourceId", flat.SourceId == "cccc3333", flat.SourceId);
+        Check("Flatten carries ResetHome", flat.ResetHome == @"C:\x\.codex-c", flat.ResetHome);
+    }
+
     static void Clis()
     {
         Console.WriteLine("== CLI descriptions are data, never actions ==");
@@ -774,6 +820,46 @@ public static class LimitsTest
         {
             Environment.SetEnvironmentVariable(ZcodeSource.EnvPrimary, saved);
             Environment.SetEnvironmentVariable(ZcodeSource.EnvAlternate, savedAlt);
+        }
+
+        // CORE-004 end-to-end discovery: the advertised env-only path must
+        // survive Probe.Run's Installed() gate. USERPROFILE is pointed at a
+        // scratch home so a real .zcode/v2/config.json cannot leak in.
+        string savedProfile = Environment.GetEnvironmentVariable("USERPROFILE");
+        string fakeProfile = Path.Combine(Path.GetTempPath(), "zcode_profile_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(fakeProfile);
+        string savedPrimary2 = Environment.GetEnvironmentVariable(ZcodeSource.EnvPrimary);
+        string savedAlternate2 = Environment.GetEnvironmentVariable(ZcodeSource.EnvAlternate);
+        try
+        {
+            Environment.SetEnvironmentVariable("USERPROFILE", fakeProfile);
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvPrimary, null);
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvAlternate, null);
+            Check("no config and no env: Zcode is not installed, no misleading card",
+                !ZcodeSource.Installed(), "");
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvPrimary, "env-key-a");
+            Check("no config + ZAI_API_KEY: Zcode IS installed (env-only dead path fixed)",
+                ZcodeSource.Installed(), "env-only");
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvPrimary, null);
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvAlternate, "env-key-b");
+            Check("no config + ZCODE_API_KEY: installed too",
+                ZcodeSource.Installed(), "alternate env");
+            string zdir = Path.Combine(fakeProfile, ".zcode", "v2");
+            Directory.CreateDirectory(zdir);
+            File.WriteAllText(Path.Combine(zdir, "config.json"), "{}");
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvAlternate, null);
+            Check("config exists + no env: the config-only path is unchanged",
+                ZcodeSource.Installed(), "config only");
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvPrimary, "env-key-c");
+            Check("config + env: installed through either path",
+                ZcodeSource.Installed(), "both paths");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("USERPROFILE", savedProfile);
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvPrimary, savedPrimary2);
+            Environment.SetEnvironmentVariable(ZcodeSource.EnvAlternate, savedAlternate2);
+            try { Directory.Delete(fakeProfile, true); } catch { }
         }
 
         // Exactly one field out of one file, and the Coding Plan providers are

@@ -231,6 +231,57 @@ public static class CarryForward
                 Check("a carried account raises no reset balloon",
                     ((IList)notified.GetValue(form)).Count == 0,
                     ((IList)notified.GetValue(form)).Count + " balloon key(s)");
+
+                // CORE-003: discovery is separate from probing. Two "Codex"
+                // homes share a display name but carry different SourceIds, so
+                // a deadline slot for one must not inherit the OTHER home's
+                // windows — a stale slot is keyed by its own identity.
+                FieldInfo srcId = accType.GetField("SourceId");
+                FieldInfo resetHome = accType.GetField("ResetHome");
+                IList prevTwo = Accounts();
+                object prevHomeA = Account("codex", "Codex", true, null, new object[] {
+                    Window("five_hour", "5h", 50, true, "2026-09-03T18:00:00") });
+                object prevHomeB = Account("codex", "Codex", true, null, new object[] {
+                    Window("five_hour", "5h", 10, true, "2026-09-03T19:00:00") });
+                srcId.SetValue(prevHomeA, "11111111");
+                srcId.SetValue(prevHomeB, "22222222");
+                resetHome.SetValue(prevHomeA, @"C:\x\.codex-a");
+                resetHome.SetValue(prevHomeB, @"C:\x\.codex-b");
+                prevTwo.Add(prevHomeA); prevTwo.Add(prevHomeB);
+
+                // Fresh sweep: home A probed fine, home B was a deadline slot.
+                IList freshTwo = Accounts();
+                object freshHomeA = Account("codex", "Codex", true, null, new object[] {
+                    Window("five_hour", "5h", 51, true, "2026-09-03T20:00:00") });
+                object slotB = Account("codex", "Codex", false, "sweep time ran out", new object[0]);
+                srcId.SetValue(freshHomeA, "11111111");
+                srcId.SetValue(slotB, "22222222");
+                resetHome.SetValue(freshHomeA, @"C:\x\.codex-a");
+                resetHome.SetValue(slotB, @"C:\x\.codex-b");
+                freshTwo.Add(freshHomeA); freshTwo.Add(slotB);
+
+                Carry(form, freshTwo, prevTwo);
+                Check("a deadline slot keyed by its own id carries ITS OWN windows",
+                    WindowCount(slotB) == 1 && (int)winType.GetField("Rem").GetValue(
+                        ((IList)accType.GetField("Windows").GetValue(slotB))[0]) == 10,
+                    WindowCount(slotB) + " windows, rem=" + (
+                        WindowCount(slotB) == 1
+                            ? ((int)winType.GetField("Rem").GetValue(((IList)accType.GetField("Windows").GetValue(slotB))[0])).ToString()
+                            : "n/a"));
+                Check("the probed home does not inherit the other home's numbers",
+                    (int)winType.GetField("Rem").GetValue(((IList)accType.GetField("Windows").GetValue(freshHomeA))[0]) == 51,
+                    "fresh home A rem=" + (int)winType.GetField("Rem").GetValue(((IList)accType.GetField("Windows").GetValue(freshHomeA))[0]));
+                Check("both keys stay distinct under one display name",
+                    ((string)accType.GetMethod("get_Key").Invoke(slotB, null))
+                        != (string)accType.GetMethod("get_Key").Invoke(freshHomeA, null), "");
+
+                // A home the sweep never saw again is GONE, not resurrected: a
+                // removed identity disappears, a slow one does not.
+                IList removed = Accounts(freshHomeA);
+                Carry(form, removed, freshTwo);
+                Check("a genuinely removed home is not resurrected by carry-forward",
+                    removed.Count == 1 && Flag(removed[0], "Carried") == false,
+                    removed.Count + " fresh account(s)");
             }
         }
         catch (Exception ex)

@@ -1,3 +1,107 @@
+# LIMISAW 0.0.8 (2026-09-05)
+
+An external audit of 0.0.7 filed 19 defects. Eighteen were real and every one is
+fixed here, each with a harness that fails against the old code: the suite grows
+from 14 harnesses to 27. The nineteenth claimed the alert sounds were missing
+from the repository; they were tracked all along, and the report had been written
+against an incomplete download.
+
+## Fixed — accounts and identity
+
+- **Two Codex accounts with the same display name were one account.** Identity
+  was the name, so a second `~/.codex` home with the same label collided with the
+  first: one card for two accounts, and a banked-reset redemption could be sent
+  to the wrong home. Identity is now a digest of the canonical home path — stable
+  across runs, distinct per home, never derived from the label — labels are
+  disambiguated for display only, and a reset is routed to the exact home that
+  owns the credit. Existing tray selections and saved metrics migrate.
+- **A slow first vendor no longer starves the rest of the sweep.** The sweep gave
+  each provider whatever was left of a single budget in discovery order, so a
+  Codex home that took 19 seconds could leave Claude and Antigravity with none.
+  Every provider gets a fair share of the sweep, discovery runs before the work
+  so the slice is known, and an account that could not be read keeps its last
+  good reading marked stale instead of vanishing from the window.
+- **Zcode with credentials only in the environment was unreachable.** The probe
+  asked whether a config file existed before it would run at all, while its own
+  credential resolver already accepted `Z_AI_API_KEY` — so an environment-only
+  setup was detected as "not installed" and never polled.
+- **Zcode's second host is tried even when the first one hangs.** The per-attempt
+  deadline was the whole account budget, so an unreachable `api.z.ai` consumed
+  everything and `open.bigmodel.cn` was never called. The remaining budget is now
+  split across the hosts still untried, a fast failure forfeits nothing, and the
+  configured provider id puts its own host first.
+
+## Fixed — refresh, settings and alerts
+
+- **Pressing Refresh after editing `LIMISAW.ini` now reloads it.** The tooltip
+  said to do exactly that, and the file was only ever read at startup, so a
+  hand-edited Zcode config needed a restart. Refresh re-reads the ini before the
+  sweep; an unreadable or locked file leaves the live settings standing rather
+  than resetting them to defaults.
+- **A refresh requested during a sweep is no longer dropped.** The single-flight
+  gate returned early, which silently discarded the mandatory re-read after a
+  banked reset — the window kept showing the pre-reset percentage. Requests
+  during a sweep now coalesce into exactly one follow-up.
+- **A partly written settings file no longer reports success.** `Save` checked
+  the return value of its first key only, so a failure on any later key was
+  invisible; Windows autostart could be enabled from a file that said it was off.
+  Every write is checked, one failing key fails the whole save, and the registry
+  autostart value is only applied when the save actually succeeded.
+- **Long settings values survive a round-trip.** Reads used a fixed 2048-character
+  buffer, so a large tray-item list or account order came back truncated —
+  typically mid-id, which quietly dropped every window after it. The buffer grows
+  until the value fits.
+- **The low-quota balloon and its chime are separate switches**, the same pair the
+  refill alert always had: a chime with no balloon and a balloon with no chime are
+  both reachable, the threshold stays live while either is on, and an existing
+  `LIMISAW.ini` with no `LowSound` key keeps behaving exactly as it did.
+- **Two WAVs with the same file name no longer share one cached copy.** The scaled
+  artifact was named from the basename alone, so your own `pop_cartoon_pop.wav`
+  and the shipped one resolved to the same cache file and whichever scaled first
+  won — audibly, and the freshness check could not detect it. The artifact name
+  now carries a digest of the source path.
+
+## Fixed — cost per sweep
+
+- **The Codex app-server is started once per home, not once per sweep.** Every
+  refresh paid the 14–19 second cold start of a new child process; a warm sweep is
+  now a single `rateLimits` read against a pooled session, with a dead child
+  replaced on its own and a vanished home evicted.
+- **The Antigravity journal scan is bounded.** It could read up to 200 MiB outside
+  the sweep deadline, and its 200-file cap was applied before the newest-first
+  sort, so a fresh refusal could sit just outside the prefix. Files are sorted
+  before the cap, bodies are cached by path, mtime and length, the deadline bounds
+  the reads, and a scan the deadline cut says so instead of reporting the healthy
+  "no refusal recorded".
+- **Claude's local history is parsed once per change, not once per sweep.** A
+  7 MiB `plan-usage-history.json` was re-parsed on every refresh, and the
+  transcript walk checked the deadline once on entry and then stat'ed every file
+  under every project. The parse is cached by path, mtime and length — with the
+  freshness of the reading still judged by the sample's own timestamp — and the
+  deadline now bounds the walk itself.
+- **A slider drag writes the settings file once.** Dragging the volume or the low
+  threshold saved on every mouse-move — around a hundred writes for one gesture,
+  and the low alert was re-armed just as often. The value updates live, the commit
+  happens at the end of the drag, and losing capture without a mouse-up still
+  commits exactly once.
+- **The sweep no longer mutates UI state from its own thread.** It ran on a
+  background thread and wrote the account list, the low-alert records and the tray
+  icon directly, racing a slider release over the same dictionary. Reading still
+  happens off-thread; the result is now the only thing that crosses the boundary
+  and every mutation runs on the UI thread. The shared sound player and its cache
+  are serialised.
+- **The paint paths release their text-format objects.** `DrawButton`, `DrawSingle`
+  and `DrawHalfNumber` each allocated a `StringFormat` per call and left it to
+  finalization: 120 000 renders hold 1.7 MB now against 17.9 MB for the same
+  content drawn undisposed.
+
+## Changed — repository
+
+- `KNOWLEDGE/build-and-test.md` no longer tells an agent to run
+  `git checkout -- LIMISAW.exe`. The exe has been untracked since 0.0.7, so that
+  command cannot work; a `-Tests` run leaves `git status` clean, which means a
+  dirty tree is a real source change.
+
 # LIMISAW 0.0.7 (2026-09-04)
 
 Housekeeping release: six filed defects closed, and the repository stops

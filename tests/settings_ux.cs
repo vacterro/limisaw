@@ -324,6 +324,7 @@ public static class SettingsUx
         Console.WriteLine("== a setting that cannot matter looks and acts dead ==");
         FieldInfo mode = st.GetField("TrayMode");
         FieldInfo notifyLow = st.GetField("NotifyLow");
+        FieldInfo lowSound = st.GetField("LowSound");
         FieldInfo resetSound = st.GetField("ResetSound");
 
         mode.SetValue(settings, "single");
@@ -348,22 +349,38 @@ public static class SettingsUx
         Check("...while the fill row is live again",
             HintZoneFor(f, "only bars and cells have a fill") == Rectangle.Empty, "");
 
-        // The volume belongs to the sounds. With both muted it controls nothing.
-        notifyLow.SetValue(settings, false);
+        // The volume belongs to the CHIMES. With both muted it controls nothing.
+        // CORE-005: the low alert's chime is its own switch now, so the low half
+        // of that pair is LowSound — NotifyLow is only the balloon.
+        lowSound.SetValue(settings, false);
         resetSound.SetValue(settings, false);
         f = Paint(formType, form, 560);
         Check("both chimes off: the volume says there is nothing to set it for",
             HintZoneFor(f, "nothing to set a volume for") != Rectangle.Empty, "");
-        Check("...and the low-alert sound row is gone entirely, not just greyed",
-            HintZoneFor(f, "the sound the low alert plays") == Rectangle.Empty, "");
-        int mutedHeight = f.Height;
+        int mutedHeight = f.Height, mutedButtons = f.Buttons.Count;
 
+        lowSound.SetValue(settings, true);
+        f = Paint(formType, form, 560);
+        Check("arming the low chime brings its WAV and Play buttons back",
+            f.Buttons.Count == mutedButtons + 2, mutedButtons + " -> " + f.Buttons.Count);
+        Check("...and the volume with them",
+            HintZoneFor(f, "alert volume") != Rectangle.Empty, "");
+        // The picker collapses INSIDE the alert's own row, so the panel keeps its
+        // height: a row that appears and disappears made the window jump, and at a
+        // small height the new row was the one that got clipped.
+        Check("...without the panel jumping, because the row was always there",
+            f.Height == mutedHeight, mutedHeight + " -> " + f.Height);
+
+        // Both low channels off is the only state with no threshold to set.
+        notifyLow.SetValue(settings, false);
+        lowSound.SetValue(settings, false);
+        f = Paint(formType, form, 560);
+        Check("both low channels off: the threshold says why it is dead",
+            HintZoneFor(f, "both low channels are off") != Rectangle.Empty, "");
         notifyLow.SetValue(settings, true);
         f = Paint(formType, form, 560);
-        Check("arming the low alert brings its sound row back",
-            HintZoneFor(f, "the sound the low alert plays") != Rectangle.Empty, "");
-        Check("...and the window grew to hold it, so nothing is clipped",
-            f.Height > mutedHeight, mutedHeight + " -> " + f.Height);
+        Check("...and the balloon alone brings the threshold back to life",
+            HintZoneFor(f, "the level the low alert fires at") != Rectangle.Empty, "");
 
         resetSound.SetValue(settings, true);
         f = Paint(formType, form, 560);

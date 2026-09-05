@@ -82,11 +82,10 @@ namespace Limisaw
         // constant here rather than anything read from a file: a config-supplied
         // URL would turn "read a key" into "send the key wherever this file
         // says", which is a different and much worse permission.
-        static readonly string[] Hosts =
-        {
-            "https://api.z.ai",
-            "https://open.bigmodel.cn",
-        };
+        public const string HostZai = "https://api.z.ai";
+        public const string HostBigModel = "https://open.bigmodel.cn";
+
+        static readonly string[] Hosts = { HostZai, HostBigModel };
 
         // Calendar units as the vendor numbers them, paired with `number`.
         const int UnitHour = 3;
@@ -100,14 +99,25 @@ namespace Limisaw
             return Path.Combine(profile, ".zcode", "v2", "config.json");
         }
 
-        // Zcode present at all? Its config existing is enough to offer the card;
-        // whether a key can be obtained is a separate question with its own
-        // message, because "not installed" and "installed but I may not read
-        // your key" are different situations for the user.
+        // Zcode present at all? A credential the user has supplied is enough to
+        // offer the card, with or without the desktop config: the documented
+        // env path (ZAI_API_KEY / ZCODE_API_KEY) reaches the same endpoint and
+        // Resolve() honors it, so gating Probe.Run behind the config file made
+        // the advertised env-only use case dead. "Installed but I may not read
+        // your key" stays a separate situation with its own message.
         public static bool Installed()
         {
+            if (HasEnvKey()) return true;
             string path = ConfigPath();
             return path.Length > 0 && File.Exists(path);
+        }
+
+        // True when either supported env credential is set and non-blank.
+        public static bool HasEnvKey()
+        {
+            foreach (string name in new[] { EnvPrimary, EnvAlternate })
+                if (((Environment.GetEnvironmentVariable(name) ?? "").Trim()).Length > 0) return true;
+            return false;
         }
 
         // ── credential ───────────────────────────────────────────────────────
@@ -116,6 +126,7 @@ namespace Limisaw
             public string Value = "";
             public string Origin = "";     // shown to the user, never the key
             public string Refusal;         // why there is no key, if there is none
+            public string Host;            // which host this credential belongs to, when known
         }
 
         public const string EnvPrimary = "ZAI_API_KEY";
@@ -141,10 +152,22 @@ namespace Limisaw
             string path = ConfigPath();
             if (path.Length == 0 || !File.Exists(path))
                 return new Key { Refusal = "Zcode config not found (" + EnvPrimary + " not set either)" };
-            string key = FromConfig(path);
+            string providerId;
+            string key = FromConfig(path, out providerId);
             if (key == null)
                 return new Key { Refusal = "no Coding Plan key in Zcode's config — sign in to Zcode, or set " + EnvPrimary };
-            return new Key { Value = key, Origin = "Zcode config" };
+            return new Key { Value = key, Origin = "Zcode config", Host = HostHint(providerId) };
+        }
+
+        // Which host a config provider belongs to. A HINT for order only: both
+        // hosts are still tried, so a wrong guess costs nothing but a reorder,
+        // while a right one spends the budget on the host that owns the key.
+        static string HostHint(string providerId)
+        {
+            if (providerId == null) return null;
+            if (providerId.IndexOf("bigmodel", StringComparison.OrdinalIgnoreCase) >= 0) return HostBigModel;
+            if (providerId.IndexOf("zai", StringComparison.OrdinalIgnoreCase) >= 0) return HostZai;
+            return null;
         }
 
         // Exactly one field out of one file: the Coding Plan provider's apiKey.
@@ -162,6 +185,15 @@ namespace Limisaw
 
         public static string FromConfig(string path)
         {
+            string providerId;
+            return FromConfig(path, out providerId);
+        }
+
+        // `providerId` reports WHICH provider entry the key came from, which is
+        // the only reliable hint about which of the two hosts owns it.
+        public static string FromConfig(string path, out string providerId)
+        {
+            providerId = null;
             object doc;
             try
             {
@@ -182,7 +214,11 @@ namespace Limisaw
                 if (entry == null) continue;
                 string key = J.Str(J.Get(J.Get(entry, "options"), "apiKey"));
                 if (string.IsNullOrEmpty(key)) key = J.Str(J.Get(entry, "apiKey"));
-                if (!string.IsNullOrEmpty(key) && key.Trim().Length > 0) return key.Trim();
+                if (!string.IsNullOrEmpty(key) && key.Trim().Length > 0)
+                {
+                    providerId = id;
+                    return key.Trim();
+                }
             }
             return null;
         }
@@ -196,6 +232,24 @@ namespace Limisaw
         }
 
         // ── probe ────────────────────────────────────────────────────────────
+        // The request seam. Production is `Get`, an HTTPS call to one of the two
+        // constant hosts; a test substitutes a transport so host fallback and the
+        // retry budget can be driven without a socket. This is NOT a way to point
+        // LIMISAW at another URL: the hosts stay constants above.
+        internal delegate string Fetcher(string url, string key, double deadline, out string error);
+
+        internal static Fetcher Transport = Get;
+
+        // The host that owns the key first, the other one still after it.
+        static string[] HostOrder(string first)
+        {
+            if (string.IsNullOrEmpty(first)) return Hosts;
+            var order = new List<string> { first };
+            foreach (string host in Hosts)
+                if (host != first) order.Add(host);
+            return order.ToArray();
+        }
+
         public static ProbeAccount Probe(double deadline, bool allowConfig)
         {
             var acc = new ProbeAccount
@@ -216,12 +270,22 @@ namespace Limisaw
                 return acc;
             }
 
+            string[] hosts = HostOrder(key.Host);
             string lastError = null;
-            foreach (string host in Hosts)
+            for (int i = 0; i < hosts.Length; i++)
             {
-                if (Stamp.Now >= deadline) break;
+                // W2-002: the account deadline is SHARED, so a host that hangs
+                // must not spend it all. What is left is divided by the hosts
+                // still untried — an unreachable api.z.ai leaves a real attempt
+                // for open.bigmodel.cn instead of timing out past the deadline
+                // and skipping the fallback the two-host design promises. A host
+                // that fails fast forfeits nothing: the next one inherits the
+                // whole remainder, and the last host gets all of it.
+                double remaining = deadline - Stamp.Now;
+                if (remaining <= 0.2) break;
+                double attempt = Stamp.Now + remaining / (hosts.Length - i);
                 string error;
-                string body = Get(host + QuotaPath, key.Value, deadline, out error);
+                string body = Transport(hosts[i] + QuotaPath, key.Value, attempt, out error);
                 if (body == null) { lastError = error; continue; }
                 string plan;
                 List<ProbeWindow> windows = ParseQuota(body, out plan, out error);

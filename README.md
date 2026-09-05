@@ -9,7 +9,7 @@ vendor's own read-only call, so **reading your quota never spends any of it**. I
 does not parse `auth.json`, does not send prompts, and installs nothing on its
 own.
 
-**Download `LIMISAW.exe` from [Releases](https://github.com/vacterro/limisaw/releases) — it is the whole install.** Every palette, both alert sounds and the icon are inside it. Drop it in an empty folder and run it.
+**Download `LIMISAW.exe` from [Releases](https://github.com/vacterro/limisaw/releases) — it is the whole install.** Latest: **v0.0.8**. Every palette, both alert sounds and the icon are inside it. Drop it in an empty folder and run it.
 
 ```
 LIMISAW.exe          <- from Releases, that's the whole install
@@ -120,11 +120,12 @@ and keeping the other is a real preference:
 
 - **On refill**: a balloon and/or a chime when a window resets (ships
   `success_powerup.wav`).
-- **Low alert at N%**: fires the **first** time a window drops to the threshold
-  (ships `pop_cartoon_pop.wav`). Once per window per reset cycle, so it cannot
-  nag: the first sweep after launch only records what is already low, a window
-  that stays low does not re-alert every refresh, and a *rolling* window whose
-  reset time drifts as you spend is not mistaken for a new cycle.
+- **Low alert at N%**: a balloon and/or a chime the **first** time a window drops
+  to the threshold (ships `pop_cartoon_pop.wav`). Once per window per reset cycle,
+  so it cannot nag: the first sweep after launch only records what is already low,
+  a window that stays low does not re-alert every refresh, and a *rolling* window
+  whose reset time drifts as you spend is not mistaken for a new cycle. The
+  threshold is the **event's**, so either channel keeps it live.
 - A **volume** for all of them (Windows has no per-sound volume, so the WAV's
   samples are scaled into a cached copy), a folder picker for your own WAV
   library, a `WAV` button per event and a `Play` button that previews at the
@@ -142,8 +143,9 @@ setting the tray menu has, in three labelled groups: `TRAY ICON`, `ALERTS`, `APP
   preview would hide the thing you are judging.
 - **A control that cannot matter is visibly dead.** Fill granularity greys out
   while the icon draws a bare number; the number readout greys out for bars and
-  cells; the volume greys out with both chimes off; the low-alert sound row does
-  not appear until the alert is armed. Each one says why.
+  cells; the volume greys out with both chimes off; an alert's WAV picker only
+  appears while its chime is on, and the low threshold greys out only when both
+  low channels are off. Each one says why.
 - **The preview is deliberately fake**, with its own quota slider: judge any
   layout at 5% and at 90% without waiting for the account to get there. It renders
   through the real tray path, so it cannot disagree with the icon.
@@ -184,11 +186,13 @@ pwsh .\build.ps1            # -> LIMISAW.exe
 pwsh .\build.ps1 -Tests     # build + run the whole suite
 ```
 
-`tests\` is 14 harnesses / ~5500 assertions: the quota rules and the
+`tests\` is 27 harnesses / ~5900 assertions: the quota rules and the
 costs-nothing-to-read contract (`limits.cs`), the settings panel's own rules
 (`settings_ux.cs`), the one-file claim (`standalone.cs`), tray rendering pixel
 purity, window layout, alert timing, carry-forward, gating, tooltips and the tray
-item picker.
+item picker, plus the per-source read budgets — the Codex app-server session pool,
+the Antigravity and Claude journal scans, the INI read/write paths, and the paint
+paths' native-resource lifetime (`gdi_paint.cs`).
 
 `tools\make_ico.cs` regenerates `heh.ico` with one point-sampled frame per size
 the shell asks for, when the artwork changes.

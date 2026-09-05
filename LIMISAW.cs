@@ -184,7 +184,13 @@ namespace Limisaw
         // a chime with no balloon are both things people actually want.
         public bool ResetSound = true;
         public string ResetSoundFile = "success_powerup.wav";
+        // CORE-005: NotifyLow is the BALLOON switch, LowSound is the chime — the
+        // same two as the refill alert. One combined flag meant the settings
+        // model's own rule two comments up did not hold for the low alert: a
+        // balloon with no chime was impossible, and a chime with no balloon was
+        // unreachable.
         public bool NotifyLow = true;
+        public bool LowSound = true;
         public int LowPct = 20;
         public string LowSoundFile = "pop_cartoon_pop.wav";
         public int SoundVolume = 5;
@@ -236,47 +242,114 @@ namespace Limisaw
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         static extern bool WritePrivateProfileString(string app, string key, string val, string file);
 
-        // 260 chars is not enough for an ordered list of every window three
-        // vendors can expose; the buffer must fit the value it reads back.
-        string Read(string key, string def) { var sb = new System.Text.StringBuilder(2048); GetPrivateProfileString("limisaw", key, def, sb, sb.Capacity, IniPath); return sb.ToString(); }
-        bool Write(string key, string val) { return WritePrivateProfileString("limisaw", key, val, IniPath); }
+        // W2-006: a fixed buffer silently truncates. GetPrivateProfileString
+        // copies what fits and reports nSize-1 when it ran out of room, with no
+        // error — so an ordered list long enough to fill it came back cut, often
+        // mid-id, and the order the user arranged was quietly wrong after a
+        // restart. Grow until the value fits: the read is the only place that
+        // knows how long the value actually is.
+        internal int ReadGrowths;
+        string Read(string key, string def)
+        {
+            int size = 2048;
+            while (true)
+            {
+                var sb = new System.Text.StringBuilder(size);
+                int n = GetPrivateProfileString("limisaw", key, def, sb, sb.Capacity, IniPath);
+                // n == size-1 is the API's only truncation signal; a value that
+                // happens to be exactly that long costs one extra read and
+                // returns identical text, which is why the test asserts the
+                // TEXT, not the growth count.
+                if (n < size - 1 || size >= MaxIniValueChars) return sb.ToString();
+                size *= 2;
+                ReadGrowths++;
+            }
+        }
+
+        // 256 Ki chars is half a megabyte of ids — orders of magnitude past any
+        // real ordering, and a hard stop so a pathological ini cannot spin the
+        // loop forever.
+        const int MaxIniValueChars = 256 * 1024;
+
+        // The write seam. Production is WritePrivateProfileString; a test
+        // substitutes a writer that fails on a CHOSEN key, because a disk that
+        // fails on the twentieth of twenty-four writes cannot be arranged on
+        // demand — and that is exactly the case W2-004 reported as success.
+        internal Func<string, string, string, bool> WriteHook = null;
+
+        bool Write(string key, string val)
+        {
+            if (WriteHook != null) return WriteHook(key, val, IniPath);
+            return WritePrivateProfileString("limisaw", key, val, IniPath);
+        }
+
+        // A number the file got wrong must not poison the settings object.
+        // TryParse writes 0 on failure, so an external `RefreshSeconds=abc` used
+        // to clamp a working 900 down to the floor; a value that does not parse
+        // now leaves the live one standing. A key that is ABSENT is different and
+        // still means the documented default — the file is the truth, so deleting
+        // a line resets that setting rather than freezing it.
+        int ReadInt(string key, string def, int current, int lo, int hi)
+        {
+            int parsed;
+            if (!int.TryParse(Read(key, def), out parsed)) return current;
+            return Math.Max(lo, Math.Min(hi, parsed));
+        }
 
         // Last write outcome, so a caller can tell the user WHY their settings
         // will not survive a restart. One bool, not a list of failures: the ini
-        // is one file, so if writing one key fails they all fail, and reporting
-        // 21 errors about one read-only file is noise. Set only by Save(); false
-        // again only after a Save() that succeeded.
+        // is one file, and reporting 24 errors about one read-only file is noise.
+        // Set only by Save(); false again only after a Save() where EVERY key
+        // landed.
         public bool LastSaveFailed;
 
+        // W2-004: the save used to check only the FIRST write and then report
+        // success, so a disk that filled up, a file locked halfway through, or any
+        // single failing key left a mixture of old and new settings while the app
+        // said everything was fine — and on restart resurrected values the user
+        // had already seen replaced. Every write is checked now, and one failure
+        // fails the whole save. That is what makes SaveApplied a usable gate for
+        // side effects like the autostart registry key.
         public void Save()
         {
-            // The first key doubles as the write probe: with a read-only ini all
-            // 21 writes fail, and one failing syscall already says everything —
-            // hammering the file 20 more times for identical failures is noise.
-            if (!Write("RefreshSeconds", RefreshSeconds.ToString()))
-            {
-                LastSaveFailed = true;
-                return;
-            }
-            LastSaveFailed = false;
-            Write("TrayMetric", TrayMetric); Write("TrayMode", TrayMode); Write("TrayShow", TrayShow);
-            Write("TrayFill", TrayFill.ToString()); Write("TrayMax", TrayMax.ToString());
-            Write("TrayItems", TrayItems); Write("TrayHidden", TrayHidden);
-            Write("Theme", ThemeSlug);
-            Write("NotifyOnReset", NotifyOnReset ? "1" : "0");
-            Write("ResetSound", ResetSound ? "1" : "0");
-            Write("ResetSoundFile", ResetSoundFile);
-            Write("NotifyLow", NotifyLow ? "1" : "0");
-            Write("LowPct", LowPct.ToString());
-            Write("LowSoundFile", LowSoundFile);
-            Write("SoundVolume", SoundVolume.ToString());
-            Write("SoundDir", SoundDir);
-            Write("AutoStart", AutoStart ? "1" : "0");
-            Write("ShowUsed", ShowUsed ? "1" : "0");
-            Write("ZcodeReadConfig", ZcodeReadConfig ? "1" : "0");
-            Write("AccountOrder", AccountOrder);
-            Write("PreviewPct", PreviewPct.ToString());
-            Write("WindowX", WindowX.ToString()); Write("WindowY", WindowY.ToString());
+            bool ok = true;
+            ok &= Write("RefreshSeconds", RefreshSeconds.ToString());
+            ok &= Write("TrayMetric", TrayMetric);
+            ok &= Write("TrayMode", TrayMode);
+            ok &= Write("TrayShow", TrayShow);
+            ok &= Write("TrayFill", TrayFill.ToString());
+            ok &= Write("TrayMax", TrayMax.ToString());
+            ok &= Write("TrayItems", TrayItems);
+            ok &= Write("TrayHidden", TrayHidden);
+            ok &= Write("Theme", ThemeSlug);
+            ok &= Write("NotifyOnReset", NotifyOnReset ? "1" : "0");
+            ok &= Write("ResetSound", ResetSound ? "1" : "0");
+            ok &= Write("ResetSoundFile", ResetSoundFile);
+            ok &= Write("NotifyLow", NotifyLow ? "1" : "0");
+            ok &= Write("LowSound", LowSound ? "1" : "0");
+            ok &= Write("LowPct", LowPct.ToString());
+            ok &= Write("LowSoundFile", LowSoundFile);
+            ok &= Write("SoundVolume", SoundVolume.ToString());
+            ok &= Write("SoundDir", SoundDir);
+            ok &= Write("AutoStart", AutoStart ? "1" : "0");
+            ok &= Write("ShowUsed", ShowUsed ? "1" : "0");
+            ok &= Write("ZcodeReadConfig", ZcodeReadConfig ? "1" : "0");
+            ok &= Write("AccountOrder", AccountOrder);
+            ok &= Write("PreviewPct", PreviewPct.ToString());
+            ok &= Write("WindowX", WindowX.ToString());
+            ok &= Write("WindowY", WindowY.ToString());
+            LastSaveFailed = !ok;
+        }
+
+        // Did the settings the caller just changed actually reach the disk? A
+        // side effect that outlives this process — the autostart registry value —
+        // must not be applied on the strength of a save that failed, or the two
+        // disagree until someone notices Windows starting an app the ini says is
+        // off.
+        public bool SaveApplied()
+        {
+            Save();
+            return !LastSaveFailed;
         }
 
         public static List<string> Split(string value)
@@ -296,18 +369,16 @@ namespace Limisaw
 
         public void Load()
         {
-            int.TryParse(Read("RefreshSeconds", "300"), out RefreshSeconds); if (RefreshSeconds < 60) RefreshSeconds = 60;
-            if (RefreshSeconds > 3600) RefreshSeconds = 3600;
+            RefreshSeconds = ReadInt("RefreshSeconds", "300", RefreshSeconds, 60, 3600);
             TrayMetric = Read("TrayMetric", "lowest");
             if (string.IsNullOrEmpty(TrayMetric)) TrayMetric = "lowest";
             TrayMode = Read("TrayMode", "single");
             if (Array.IndexOf(Modes, TrayMode) < 0) TrayMode = "single";
             TrayShow = Read("TrayShow", "pct");
             if (TrayShow != "off" && TrayShow != "pct" && TrayShow != "time") TrayShow = "pct";
-            int.TryParse(Read("TrayFill", "4"), out TrayFill);
+            TrayFill = ReadInt("TrayFill", "4", TrayFill, int.MinValue, int.MaxValue);
             if (Array.IndexOf(Fills, TrayFill) < 0) TrayFill = 4;
-            int.TryParse(Read("TrayMax", "4"), out TrayMax);
-            if (TrayMax < 1) TrayMax = 1; if (TrayMax > MaxTrayItems) TrayMax = MaxTrayItems;
+            TrayMax = ReadInt("TrayMax", "4", TrayMax, 1, MaxTrayItems);
             TrayItems = Read("TrayItems", "");
             TrayHidden = Read("TrayHidden", "");
             ThemeSlug = Read("Theme", "goldendefault");
@@ -316,20 +387,66 @@ namespace Limisaw
             ResetSound = Read("ResetSound", "1") == "1";
             ResetSoundFile = Read("ResetSoundFile", "success_powerup.wav");
             NotifyLow = Read("NotifyLow", "1") == "1";
-            int.TryParse(Read("LowPct", "20"), out LowPct);
-            if (LowPct < 5) LowPct = 5; if (LowPct > 95) LowPct = 95;
+            // CORE-005 migration: an ini written before the split has no
+            // LowSound key, and its single NotifyLow meant balloon AND chime.
+            // Defaulting the new key to the old one therefore preserves exactly
+            // what that installation already did — including the muted case,
+            // where NotifyLow=0 had silenced both halves.
+            LowSound = Read("LowSound", NotifyLow ? "1" : "0") == "1";
+            LowPct = ReadInt("LowPct", "20", LowPct, 5, 95);
             LowSoundFile = Read("LowSoundFile", "pop_cartoon_pop.wav");
-            int.TryParse(Read("SoundVolume", "5"), out SoundVolume);
-            if (SoundVolume < 0) SoundVolume = 0; if (SoundVolume > 100) SoundVolume = 100;
+            SoundVolume = ReadInt("SoundVolume", "5", SoundVolume, 0, 100);
             SoundDir = Read("SoundDir", "");
             AutoStart = Read("AutoStart", "0") == "1";
             ShowUsed = Read("ShowUsed", "0") == "1";
             ZcodeReadConfig = Read("ZcodeReadConfig", "0") == "1";
             AccountOrder = Read("AccountOrder", "");
-            int.TryParse(Read("PreviewPct", "65"), out PreviewPct);
-            if (PreviewPct < 0) PreviewPct = 0; if (PreviewPct > 100) PreviewPct = 100;
-            int.TryParse(Read("WindowX", int.MinValue.ToString()), out WindowX);
-            int.TryParse(Read("WindowY", int.MinValue.ToString()), out WindowY);
+            PreviewPct = ReadInt("PreviewPct", "65", PreviewPct, 0, 100);
+            WindowX = ReadInt("WindowX", int.MinValue.ToString(), WindowX, int.MinValue, int.MaxValue);
+            WindowY = ReadInt("WindowY", int.MinValue.ToString(), WindowY, int.MinValue, int.MaxValue);
+        }
+
+        // W2-003: editing LIMISAW.ini by hand is a documented configuration path
+        // (README, and the "press Refresh after editing" line OpenIni prints), but
+        // startup was the file's only reader, so those edits — including the
+        // deliberately manual `ZcodeReadConfig=1` — did nothing until a restart.
+        // Refresh now re-reads the file, and the caller re-applies whatever
+        // runtime state the new values imply.
+        //
+        // Two deliberate refusals: a save we KNOW failed is never overwritten by
+        // the stale bytes still on disk (the user's live choice outranks a file we
+        // could not write), and a value that does not parse leaves the live one
+        // standing instead of clamping it to a floor.
+        public bool Reload()
+        {
+            if (LastSaveFailed || !File.Exists(IniPath)) return false;
+            // GetPrivateProfileString cannot report "I could not read the file":
+            // against a locked ini it hands back the DEFAULT for every key, which
+            // Load would then accept as the user's new choices and silently reset
+            // the whole settings object. So the file is opened first, and a read
+            // we cannot perform is not a reload.
+            try { using (File.Open(IniPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) { } }
+            catch { return false; }
+            string before = Fingerprint();
+            Load();
+            return Fingerprint() != before;
+        }
+
+        // Every persisted field in one string, so "did anything change" is one
+        // comparison instead of twenty-four. Unit separator: no value may contain
+        // it, so two different snapshots cannot collide.
+        string Fingerprint()
+        {
+            return string.Join("\u001f", new[]
+            {
+                RefreshSeconds.ToString(), TrayMetric, TrayMode, TrayShow,
+                TrayFill.ToString(), TrayMax.ToString(), TrayItems, TrayHidden,
+                ThemeSlug, NotifyOnReset ? "1" : "0", ResetSound ? "1" : "0", ResetSoundFile,
+                NotifyLow ? "1" : "0", LowSound ? "1" : "0", LowPct.ToString(), LowSoundFile,
+                SoundVolume.ToString(), SoundDir, AutoStart ? "1" : "0", ShowUsed ? "1" : "0",
+                ZcodeReadConfig ? "1" : "0", AccountOrder, PreviewPct.ToString(),
+                WindowX.ToString(), WindowY.ToString(),
+            });
         }
     }
 
@@ -348,6 +465,14 @@ namespace Limisaw
     class AccountData
     {
         public string Provider = "", ProviderLabel = "", Name = "", Status = "", Plan, Error;
+        // Stable account identity (CORE-001). For Codex this is a digest of the
+        // exact canonical home, never the display name — two homes can both be
+        // called "Codex", and a label is not authority for carry-forward,
+        // notifications, tray persistence or an irreversible reset.
+        public string SourceId = "";
+        // The exact canonical Codex home this account probes. The reset action
+        // is routed by it so a banked credit is spent on the selected account.
+        public string ResetHome = "";
         public bool Ok, Quiet;
         // Set when this account had no usable reading THIS sweep and the
         // previous sweep's windows were carried forward, so the card shows the
@@ -360,7 +485,12 @@ namespace Limisaw
         public int ResetCredits;
         public string ResetCreditTitle, ResetCreditExpires, ResetCreditId;
         public List<WindowData> Windows = new List<WindowData>();
-        public string Key { get { return Provider + "/" + Name; } }
+        public string Key { get { return Provider + "/" + (Provider == "codex" && SourceId.Length > 0 ? SourceId : Name); } }
+
+        // Pre-CORE-001 identity, for backward-compatible reads of saved
+        // TrayItems/AccountOrder. Never written; only consulted so the tray and
+        // cards survive an upgrade from the old single-"Codex" layout.
+        public string LegacyKey { get { return Provider + "/" + Name; } }
 
         // "Did this sweep produce anything worth drawing?" A card with only
         // unavailable windows is just as blank as a card with none.
@@ -517,6 +647,19 @@ namespace Limisaw
         static readonly Dictionary<string, string> Built = new Dictionary<string, string>();
         static bool Pruned;
 
+        // PERF-004: Player, Built and Pruned are process-wide, and two cues can
+        // be asked for at once — the Settings preview button and a low-quota
+        // alert raised by a finishing sweep. A SoundPlayer driven from two
+        // threads and a Dictionary written from two threads are both corruption,
+        // so a cue is played to completion of its SETUP before the next one
+        // starts. Cutting a playing cue short is still the intended behaviour.
+        static readonly object Gate = new object();
+
+        // PERF-004 seam: the real player is a shared SoundPlayer, which cannot be
+        // asked whether two cues overlapped. tests\apply_thread.cs substitutes a
+        // recorder that can.
+        internal static Func<string, string> PlayBackend = null;
+
         // Where the picker looks. A folder the user pointed at wins, then a
         // Sounds folder next to the exe, then the WAVs embedded in the exe, and
         // the Windows media folder last so the list is never empty.
@@ -565,6 +708,11 @@ namespace Limisaw
             string path = Resolve(root, library, file);
             if (path == null) return "no such WAV: " + file;
             string name = Path.GetFileName(file);
+            // PERF-004: one cue at a time. The scaled-copy cache and the shared
+            // player are both process-wide mutable state, and the preview button
+            // (UI thread) can land on the same instant as a low-quota alert
+            // raised by a finishing sweep.
+            lock (Gate)
             try
             {
                 if (volume < 100)
@@ -596,6 +744,7 @@ namespace Limisaw
         {
             try
             {
+                if (PlayBackend != null) return PlayBackend(path);
                 if (Player == null) Player = new System.Media.SoundPlayer();
                 else Player.Stop();
                 Player.SoundLocation = path;
@@ -624,14 +773,37 @@ namespace Limisaw
                 string dir = CacheDir();
                 Directory.CreateDirectory(dir);
                 if (!Pruned) { Pruned = true; PruneOld(dir); }
+                // W2-007: the artifact name carries a digest of the SOURCE PATH,
+                // not just its basename. Two different files both called
+                // alert.wav — one in the user's folder, one shipped beside the
+                // exe — used to derive the same `alert_v50.wav`, so whichever
+                // played first won and the other silently played the wrong
+                // sound. The mtime guard could not save it either: the cached
+                // copy was newer than both sources, so neither rebuilt.
                 string outPath = Path.Combine(dir,
-                    Path.GetFileNameWithoutExtension(src) + "_v" + q + ".wav");
+                    Path.GetFileNameWithoutExtension(src) + "_" + Tag(src) + "_v" + q + ".wav");
                 if (!File.Exists(outPath) || File.GetLastWriteTimeUtc(outPath) < File.GetLastWriteTimeUtc(src))
                     File.WriteAllBytes(outPath, Scale(File.ReadAllBytes(src), q / 100.0));
                 Built[key] = outPath;
                 return outPath;
             }
             catch { return null; }
+        }
+
+        // A short digest of the canonical source path: distinct files get
+        // distinct artifacts, the same file gets the same one on every run, and
+        // the human-readable basename stays in the name so the cache folder is
+        // still readable. Same rule as Probe.HomeId, for the same reason.
+        static string Tag(string src)
+        {
+            string norm;
+            try { norm = Path.GetFullPath(src).ToLowerInvariant(); }
+            catch { norm = (src ?? "").ToLowerInvariant(); }
+            byte[] bytes = System.Security.Cryptography.SHA256.Create()
+                .ComputeHash(System.Text.Encoding.UTF8.GetBytes(norm));
+            var sb = new System.Text.StringBuilder(8);
+            for (int i = 0; i < 4; i++) sb.Append(bytes[i].ToString("x2"));
+            return sb.ToString();
         }
 
         static void PruneOld(string dir)
@@ -864,6 +1036,18 @@ namespace Limisaw
         Dictionary<string, string> NotifiedLow = new Dictionary<string, string>();
         bool LowBaseline;
         string LastFetch = ""; string LastError = ""; string TrayError = ""; bool Stale = false; bool Refreshing = false;
+        // W2-001: a refresh requested while one is in flight (the only
+        // state-changing vendor action, a banked reset, always asks for one) is
+        // COALESCED, never dropped: the gate remembers it and the sweep that
+        // finishes next runs it, so the post-mutation re-read always happens.
+        bool PendingRefresh = false;
+        // The sweep body itself. Production reads the vendors; tests\refresh_coalesce.cs
+        // substitutes a delegate so one sweep can be HELD open while a reset asks
+        // for its mandatory re-read — the exact ordering the dropped-refresh
+        // defect hid, and one that real vendor CLIs cannot be made to produce.
+        // The argument is the Zcode credential permission the sweep is running
+        // under, so a test can prove W2-003's reloaded value reaches the probe.
+        Func<bool, ProbeResult> SweepSource = null;
         int Tab = TabAccounts; string Note = "";
         Timer RefreshTimer; NotifyIcon Tray;
         List<Rectangle> Buttons = new List<Rectangle>(); List<Action> ButtonActions = new List<Action>();
@@ -962,6 +1146,14 @@ namespace Limisaw
             RefreshTimer = new Timer { Interval = Settings.RefreshSeconds * 1000 };
             RefreshTimer.Tick += (o, e) => RefreshData();
             FitWindow();
+            // PERF-004: a sweep publishes its result by marshalling it to the UI
+            // thread, and BeginInvoke needs a window handle to marshal to. The
+            // handle is therefore created BEFORE the first sweep can start —
+            // otherwise the start-up sweep would be the one publication that
+            // still mutated the account list, NotifiedLow and the tray icon from
+            // its own thread, while this constructor's caller is still wiring the
+            // tray up on ours.
+            try { IntPtr unused = Handle; } catch { }
             RefreshTimer.Start(); RefreshData();
         }
 
@@ -1015,11 +1207,14 @@ namespace Limisaw
             int themeRows = (Themes.Count + cols - 1) / cols;
             // Counted from what PaintSettingsPanel actually draws, in its order:
             // three section headings (18 each), the icon group's four rows plus
-            // the 52px preview, the alerts group's three or four rows, and the
-            // app group's two rows plus the theme grid's own header.
+            // the 52px preview, the alerts group's four rows, and the app group's
+            // two rows plus the theme grid's own header.
+            //
+            // CORE-005: the low alert is an AlertRow now, so the alerts group is
+            // four fixed rows (volume, refill, low, threshold) — the sound half
+            // collapses inside its own row instead of adding one.
             int rows = 4                                  // layout, shows, fill, readings
-                + 3                                       // volume, refill, low alert
-                + (Settings.NotifyLow ? 1 : 0)             // low sound, only while armed
+                + 4                                       // volume, refill, low, low threshold
                 + 2;                                      // numbers, refresh
             return 18 * 3 + rows * SetRowH + 52 + 20 + themeRows * ThemeRowH + Gap * 2;
         }
@@ -1048,9 +1243,48 @@ namespace Limisaw
             Hide();
         }
 
+        // W2-003: re-read LIMISAW.ini and re-apply whatever runtime state the new
+        // values imply — the refresh interval, the theme, the tray. Exactly once
+        // per actual change: a file that says what the running app already
+        // believes costs one read and nothing else, so the periodic sweep does not
+        // repaint the window every five minutes for no reason.
+        void ReloadSettings()
+        {
+            int lowBefore = Settings.LowPct;
+            bool changed;
+            // A locked or vanished ini is not worth losing a sweep over: the
+            // in-memory settings stay authoritative and the refresh continues.
+            try { changed = Settings.Reload(); }
+            catch { return; }
+            if (!changed) return;
+            bool lowMoved = Settings.LowPct != lowBefore;
+            Action apply = () =>
+            {
+                ApplyTheme(Settings.ThemeSlug);
+                RefreshTimer.Interval = Math.Max(1, Settings.RefreshSeconds) * 1000;
+                // The alert that already fired was for the old threshold, same
+                // reasoning as the slider: a window now above the new one may
+                // alert again.
+                if (lowMoved) NotifiedLow.Clear();
+                Note = "Reloaded LIMISAW.ini";
+                FitWindow(); Refresh(); UpdateTray();
+            };
+            try { if (InvokeRequired) BeginInvoke(apply); else apply(); }
+            catch { }
+        }
+
         public void RefreshData()
         {
-            if (Refreshing) return; Refreshing = true;
+            // W2-003: the documented workflow is "edit LIMISAW.ini, press
+            // Refresh", so Refresh is where the file is re-read. Done before the
+            // sweep starts, because ZcodeReadConfig decides what this very sweep
+            // is allowed to ask for.
+            ReloadSettings();
+            // W2-001: coalesce, never drop. The reset action relies on this
+            // call happening after it completes; a silent return here would
+            // publish a pre-reset snapshot as final.
+            if (Refreshing) { PendingRefresh = true; return; }
+            Refreshing = true;
             LastError = ""; Refresh();
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
             {
@@ -1061,7 +1295,7 @@ namespace Limisaw
                     // script folder, no child of our own to time out. Each vendor
                     // CLI still gets a hard deadline of its own, and Probe.Run's
                     // total budget is what bounds the sweep.
-                    Apply(Probe.Run(Settings.ZcodeReadConfig));
+                    Apply(SweepSource != null ? SweepSource(Settings.ZcodeReadConfig) : Probe.Run(Settings.ZcodeReadConfig));
                 }
                 catch (Exception ex) { SetError(ex.Message); }
             });
@@ -1069,12 +1303,47 @@ namespace Limisaw
 
         void SetError(string msg)
         {
-            Stale = true; LastError = msg; Refreshing = false;
-            try { BeginInvoke((Action)(() => { Refresh(); UpdateTray(); })); } catch { }
+            // PERF-004: raised from the sweep's own thread, so the state it
+            // publishes crosses to the UI thread with the repaint it needs.
+            Action fail = () =>
+            {
+                Stale = true; LastError = msg; Refreshing = false;
+                if (IsHandleCreated) { Refresh(); UpdateTray(); }
+            };
+            if (IsHandleCreated && InvokeRequired) { try { BeginInvoke(fail); return; } catch { } }
+            fail();
         }
 
+        // PERF-004: the sweep runs on a ThreadPool thread, but everything it
+        // PUBLISHES is UI-owned state — the account list the paint walks, the
+        // NotifiedLow suppression dictionary, the tray icon, the balloon. Those
+        // were mutated straight from the worker while the UI thread could be
+        // clearing the same dictionary from a slider release, which is a torn
+        // Dictionary (an enumeration in RearmLowAlerts throwing
+        // InvalidOperationException at best, a lost entry at worst). The result
+        // is the ONLY thing that crosses the thread boundary now.
         void Apply(ProbeResult snapshot)
         {
+            if (IsHandleCreated && InvokeRequired)
+            {
+                try { BeginInvoke((Action)(() => Publish(snapshot))); return; }
+                // No handle, or one destroyed between the two calls: publishing
+                // inline is still better than losing the sweep, and it is what
+                // this app did for every sweep before PERF-004.
+                catch { }
+            }
+            Publish(snapshot);
+        }
+
+        // Which thread the last publication actually ran on. Set here rather than
+        // asserted in a comment: tests\apply_thread.cs compares it with the UI
+        // thread, because a regression to the old worker-thread mutation is
+        // invisible until a Dictionary tears in front of a user.
+        int PublishThread;
+
+        void Publish(ProbeResult snapshot)
+        {
+            PublishThread = System.Threading.Thread.CurrentThread.ManagedThreadId;
             try
             {
                 if (snapshot.Clis.Count > 0) Clis = snapshot.Clis;
@@ -1088,7 +1357,16 @@ namespace Limisaw
             finally
             {
                 Refreshing = false;
-                try { BeginInvoke((Action)(() => { FitWindow(); Refresh(); UpdateTray(); })); } catch { }
+                // W2-001: the coalesced request runs here, after this sweep's
+                // state is fully published. Multiple requests during one sweep
+                // collapse into ONE follow-up, never a queue.
+                bool runAgain = PendingRefresh;
+                PendingRefresh = false;
+                // Only with a window handle: FitWindow assigns ClientSize, which
+                // would CREATE the handle, and a handle created on a sweep thread
+                // is a window whose message loop is somewhere else.
+                if (IsHandleCreated) { try { FitWindow(); Refresh(); UpdateTray(); } catch { } }
+                if (runAgain) RefreshData();
             }
         }
 
@@ -1235,10 +1513,15 @@ namespace Limisaw
         string SoundNote = "";
 
         // "You are down to the last few percent" is a different alert from a
-        // reset: it fires once per quota window per cycle, not once per refill.
+        // reset: it fires once per quota window per cycle, not once per refresh.
+        //
+        // CORE-005: the EVENT is armed when either channel is on, because the
+        // suppression record is per event and not per channel — deciding here
+        // that a chime-only user has no low alert is what made the two switches
+        // one switch.
         void DetectLow()
         {
-            if (!Settings.NotifyLow) return;
+            if (!Settings.NotifyLow && !Settings.LowSound) return;
             // The first sweep only records what is already spent. Without this
             // every low window the user already has would fire a balloon the
             // moment the app starts, which is noise, not an alert.
@@ -1306,10 +1589,11 @@ namespace Limisaw
                     }
                     catch { }
                 };
-                // DetectLow already owns the on/off switch, so the alert that
-                // gets this far always shows both halves.
-                if (InvokeRequired) BeginInvoke(show); else show();
-                Play(Settings.LowSoundFile);
+                // CORE-005: each half asks its own switch, the same way the
+                // refill alert does. A balloon with the chime muted and a chime
+                // with no balloon are both reachable.
+                if (Settings.NotifyLow) { if (InvokeRequired) BeginInvoke(show); else show(); }
+                if (Settings.LowSound) Play(Settings.LowSoundFile);
             }
             catch { }
         }
@@ -1404,6 +1688,31 @@ namespace Limisaw
             return picked;
         }
 
+        // CORE-001 backward compatibility: a saved id from the old
+        // single-"Codex" layout ("codex/Codex/…") is read as the new stable key
+        // when exactly one Codex account exists. Two Codex homes make the old
+        // name ambiguous — those stale saved ids are dropped and the readings
+        // rediscover at the bottom, which is the honest fallback (a label was
+        // never identity).
+        string MigrateMetricId(string id)
+        {
+            const string legacy = "codex/Codex";
+            if (!id.StartsWith(legacy + "/")) return id;
+            List<AccountData> codex = new List<AccountData>();
+            foreach (AccountData a in Accounts) if (a.Provider == "codex") codex.Add(a);
+            if (codex.Count != 1) return id;
+            return codex[0].Key + id.Substring(legacy.Length);
+        }
+
+        string MigrateCardKey(string key)
+        {
+            if (key != "codex/Codex") return key;
+            List<AccountData> codex = new List<AccountData>();
+            foreach (AccountData a in Accounts) if (a.Provider == "codex") codex.Add(a);
+            if (codex.Count != 1) return key;
+            return codex[0].Key;
+        }
+
         List<Metric> SelectedMetrics()
         {
             List<Metric> all = AllMetrics();
@@ -1412,8 +1721,9 @@ namespace Limisaw
             foreach (string id in Settings.ItemOrder())
             {
                 if (hidden.Contains(id)) continue;
+                string want = MigrateMetricId(id);
                 foreach (Metric m in all)
-                    if (m.Id == id && !picked.Contains(m)) { picked.Add(m); break; }
+                    if (m.Id == want && !picked.Contains(m)) { picked.Add(m); break; }
             }
             // A reading the user has never seen is shown by default: silently
             // hiding a brand-new account would look like the vendor broke.
@@ -1432,7 +1742,7 @@ namespace Limisaw
                 // list: hiding a reading from a bars/grid picture must not
                 // silently retarget the single number somewhere else.
                 foreach (Metric m in AllMetrics())
-                    if (m.Id == Settings.TrayMetric) { value = m.Value; available = m.Available; label = m.Label; reset = m.Reset; return; }
+                    if (m.Id == MigrateMetricId(Settings.TrayMetric)) { value = m.Value; available = m.Available; label = m.Label; reset = m.Reset; return; }
                 // The pinned metric can still vanish (account logged out,
                 // vendor uninstalled). Falling back to "lowest" beats showing
                 // "--" forever with no hint why.
@@ -1503,7 +1813,7 @@ namespace Limisaw
             List<Metric> all = AllMetrics();
             foreach (string id in Settings.ItemOrder())
                 foreach (Metric m in all)
-                    if (m.Id == id && !order.Contains(id)) { order.Add(id); break; }
+                    if (m.Id == MigrateMetricId(id) && !order.Contains(m.Id)) { order.Add(m.Id); break; }
             foreach (Metric m in all) if (!order.Contains(m.Id)) order.Add(m.Id);
             return order;
         }
@@ -1516,7 +1826,7 @@ namespace Limisaw
             var order = new List<string>();
             foreach (string key in Settings.CardOrder())
                 foreach (AccountData a in Accounts)
-                    if (a.Key == key && !order.Contains(key)) { order.Add(key); break; }
+                    if (a.Key == MigrateCardKey(key) && !order.Contains(a.Key)) { order.Add(a.Key); break; }
             foreach (AccountData a in Accounts) if (!order.Contains(a.Key)) order.Add(a.Key);
             return order;
         }
@@ -2162,7 +2472,10 @@ namespace Limisaw
             // ── group 2: alerts ─────────────────────────────────────────────
             cursor = Section(g, "ALERTS", cursor, right);
 
-            bool anySound = Settings.ResetSound || Settings.NotifyLow;
+            // CORE-005: the volume belongs to the CHIMES, so it is the two chime
+            // switches that decide whether it can matter — NotifyLow is a
+            // balloon switch and was never evidence that a sound would play.
+            bool anySound = Settings.ResetSound || Settings.LowSound;
             HintRow(14, cursor, right - 14, anySound
                 ? "one volume for every alert — Windows has no per-sound volume, so the WAV itself is scaled"
                 : "both alert sounds are off, so there is nothing to set a volume for");
@@ -2209,45 +2522,47 @@ namespace Limisaw
                         Settings.ResetSoundFile = picked; Settings.Save(); Note = "Refill sound: " + picked; Refresh(); },
                 () => Preview(Settings.ResetSoundFile));
 
-            // The threshold owns its own row, directly above the alert it arms:
-            // a slider three rows away from the switch it feeds is a guess.
-            HintRow(14, cursor, right - 14, "the level the low alert fires at, once per window per reset cycle");
-            DrawText(g, "Low alert", 14, cursor + 5, Palette.TEXT2, 10);
+            // CORE-005: the low alert is now the SAME two-switch row as the
+            // refill one — one row builder, one shape, both channels reachable.
+            cursor = AlertRow(g, cursor, right, optX,
+                "Low alert", "a window drops to the threshold below",
+                Settings.NotifyLow, () =>
+                {
+                    Settings.NotifyLow = !Settings.NotifyLow; Settings.Save();
+                    Note = "Low balloon " + (Settings.NotifyLow ? "on" : "off"); Refresh();
+                },
+                "balloon: a Windows notification when a window drops to the threshold below",
+                Settings.LowSound, () =>
+                {
+                    Settings.LowSound = !Settings.LowSound; Settings.Save();
+                    Note = "Low chime " + (Settings.LowSound ? "on" : "off"); FitWindow(); Refresh();
+                },
+                "chime: play a sound when a window drops to the threshold below",
+                Settings.LowSoundFile,
+                () => { string picked = PickSound(Settings.LowSoundFile); if (picked == null) return;
+                        Settings.LowSoundFile = picked; Settings.Save(); Note = "Low sound: " + picked; Refresh(); },
+                () => Preview(Settings.LowSoundFile));
+
+            // The threshold owns its own row, directly under the alert it arms:
+            // a slider three rows away from the switch it feeds is a guess. It is
+            // the EVENT's level, so either channel keeps it live.
+            bool lowArmed = Settings.NotifyLow || Settings.LowSound;
+            HintRow(14, cursor, right - 14, lowArmed
+                ? "the level the low alert fires at, once per window per reset cycle"
+                : "both low channels are off, so there is no level to fire at");
+            DrawText(g, "Low at", 14, cursor + 5, lowArmed ? Palette.TEXT2 : Palette.MUTED, 10);
             x = optX;
-            string lowLabel = Settings.NotifyLow ? "on" : "off";
-            int lowW = Math.Max(ButtonWidth(g, "on"), ButtonWidth(g, "off"));
-            var lowBtn = new Rectangle(x, cursor, lowW, 22);
-            Buttons.Add(lowBtn); ButtonActions.Add(() =>
-            {
-                Settings.NotifyLow = !Settings.NotifyLow; Settings.Save();
-                Note = "Low alert " + (Settings.NotifyLow ? "on" : "off"); FitWindow(); Refresh();
-            });
-            Hint(lowBtn, "warn me when a window drops to the threshold on the right");
-            DrawButton(g, lowBtn, lowLabel, Settings.NotifyLow);
-            x += lowW + Gap;
             string pctText = "at " + Settings.LowPct + "%";
             int pctNumW = TextWidth(g, pctText, 11);
             int lowSliderW = Math.Max(60, Math.Min(160, right - x - pctNumW - Gap * 3));
-            PaintVolSlider(g, x, cursor, lowSliderW, 5, 95, Settings.LowPct, "lowpct", Settings.NotifyLow);
-            if (Settings.NotifyLow)
+            PaintVolSlider(g, x, cursor, lowSliderW, 5, 95, Settings.LowPct, "lowpct", lowArmed);
+            if (lowArmed)
                 Hint(new Rectangle(x, cursor, lowSliderW, 22), "fire the low alert when a window drops to this much left");
             x += lowSliderW + Gap;
             DrawText(g, pctText, x, cursor + 4,
-                Settings.NotifyLow ? Palette.LINK : Palette.MUTED, 11, true);
+                lowArmed ? Palette.LINK : Palette.MUTED, 11, true);
             Marks.Add(new Rectangle(x, cursor + 4, pctNumW, 15));
             cursor += SetRowH;
-
-            // Its sound row only exists while the alert does.
-            if (Settings.NotifyLow)
-            {
-                HintRow(14, cursor, right - 14, "the sound the low alert plays");
-                DrawText(g, "Low sound", 14, cursor + 5, Palette.TEXT2, 10);
-                PaintSoundTail(g, optX, cursor, right, Settings.LowSoundFile,
-                    () => { string picked = PickSound(Settings.LowSoundFile); if (picked == null) return;
-                            Settings.LowSoundFile = picked; Settings.Save(); Note = "Low sound: " + picked; Refresh(); },
-                    () => Preview(Settings.LowSoundFile));
-                cursor += SetRowH;
-            }
 
             // ── group 3: the rest ───────────────────────────────────────────
             cursor = Section(g, "APP", cursor, right);
@@ -2479,12 +2794,19 @@ namespace Limisaw
             Marks.Add(knob);
         }
 
+        // PERF-003: the drag is one gesture. The pointer gets live values on
+        // every move, but the INI commit happens ONCE, when the gesture ends —
+        // a drag across the rail used to persist per MouseMove, writing the
+        // settings file dozens of times for one user action.
+        bool VolDragDirty;
+
         void SetVolumeFromX(int px)
         {
             int next = Math.Max(0, Math.Min(100,
                 (int)Math.Round((double)(px - VolRail.X) / Math.Max(1, VolRail.Width) * 100)));
             if (next == Settings.SoundVolume) return;
-            Settings.SoundVolume = next; Settings.Save();
+            Settings.SoundVolume = next;
+            VolDragDirty = true;
             Note = "Volume " + next + "%";
             Refresh();
         }
@@ -2494,10 +2816,8 @@ namespace Limisaw
             int next = 5 + (int)Math.Round((double)(px - VolRail.X) / Math.Max(1, VolRail.Width) * 90);
             next = Math.Max(5, Math.Min(95, next));
             if (next == Settings.LowPct) return;
-            Settings.LowPct = next; Settings.Save();
-            // The alert that already fired was for the old threshold, so let a
-            // window that is now above the new one alert again.
-            NotifiedLow.Clear();
+            Settings.LowPct = next;
+            VolDragDirty = true;
             Note = "Low alert at " + next + "% left";
             Refresh();
         }
@@ -2510,16 +2830,37 @@ namespace Limisaw
             int next = (int)Math.Round((double)(px - VolRail.X) / Math.Max(1, VolRail.Width) * 100);
             next = Math.Max(0, Math.Min(100, next));
             if (next == Settings.PreviewPct) return;
-            Settings.PreviewPct = next; Settings.Save();
+            Settings.PreviewPct = next;
+            VolDragDirty = true;
             Note = "Preview at " + next + "% left";
             Refresh();
         }
 
+        // The gesture's single durable commit: one Save when the drag ends,
+        // and the low-alert re-arm (NotifiedLow.Clear) happens HERE — once per
+        // gesture — not once per pointer move. A press that never moved
+        // anything commits nothing.
         void EndVolDrag()
         {
             if (VolDrag == null) return;
+            string id = VolDrag;
             VolDrag = null; Capture = false;
+            if (VolDragDirty)
+            {
+                VolDragDirty = false;
+                Settings.Save();
+                if (id == "lowpct") NotifiedLow.Clear();
+            }
             Refresh(); UpdateTray();
+        }
+
+        protected override void OnMouseCaptureChanged(EventArgs e)
+        {
+            base.OnMouseCaptureChanged(e);
+            // Capture can be lost without a MouseUp (a popup, an alt-tab): the
+            // gesture must still end, with its one commit, instead of leaving
+            // the slider stuck armed and the value unpersisted.
+            if (VolDrag != null && !Capture) EndVolDrag();
         }
 
         // The tail of an alert row: the sound that is set, then the two buttons
@@ -2609,9 +2950,21 @@ namespace Limisaw
 
         void ToggleAutostart()
         {
-            Settings.AutoStart = !Settings.AutoStart; Settings.Save();
-            if (AutostartApplier != null) AutostartApplier();
-            Note = "Autostart " + (Settings.AutoStart ? "on" : "off");
+            Settings.AutoStart = !Settings.AutoStart;
+            // W2-004: the registry value outlives this process, so it is applied
+            // only if the ini really recorded the choice. Otherwise the two
+            // disagree after a restart — Windows launching an app whose settings
+            // say autostart is off, with nothing on screen to explain it.
+            if (Settings.SaveApplied())
+            {
+                if (AutostartApplier != null) AutostartApplier();
+                Note = "Autostart " + (Settings.AutoStart ? "on" : "off");
+            }
+            else
+            {
+                Settings.AutoStart = !Settings.AutoStart;
+                Note = "Autostart unchanged — LIMISAW.ini is not writable";
+            }
             Refresh();
         }
 
@@ -2668,6 +3021,11 @@ namespace Limisaw
                 Refresh();
                 return;
             }
+            // An irreversible action is routed by the EXACT canonical home, never
+            // by display name — two "Codex" cards must not make the credit land
+            // on whichever sorts first. Missing exact identity refuses early.
+            if (string.IsNullOrEmpty(a.ResetHome))
+            { Note = "No exact Codex home for this account — refresh and try again"; Refresh(); return; }
             Redeeming = true;
             Note = "Using the banked reset...";
             Refresh();
@@ -2675,25 +3033,30 @@ namespace Limisaw
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
             {
                 string outcome;
-                try { outcome = CodexSource.ConsumeResetCredit(target.Name, Stamp.Now + 30); }
+                try { outcome = CodexSource.ConsumeResetCredit(target.ResetHome, Stamp.Now + 30); }
                 catch (Exception ex) { outcome = ex.GetType().Name; }
                 try
                 {
-                    Action done = () =>
-                    {
-                        Redeeming = false;
-                        Note = "Reset: " + outcome;
-                        Refresh();
-                        // Whatever the outcome, the windows on screen are now
-                        // wrong: a redeemed credit refills them and a refused one
-                        // means the count was stale. Re-reading is the only way to
-                        // show the truth.
-                        RefreshData();
-                    };
+                    Action done = () => ResetCompleted(outcome);
                     if (InvokeRequired) BeginInvoke(done); else done();
                 }
                 catch { Redeeming = false; }
             });
+        }
+
+        // What happens once the vendor has answered, kept whole and separate so
+        // the ordering it depends on can be driven without a modal dialog or a
+        // real credit. Whatever the outcome, the windows on screen are now wrong:
+        // a redeemed credit refills them and a refused one means the count was
+        // stale. Re-reading is the only way to show the truth — and W2-001's gate
+        // is what keeps that re-read from being dropped when a scheduled sweep
+        // happens to be in flight.
+        void ResetCompleted(string outcome)
+        {
+            Redeeming = false;
+            Note = "Reset: " + outcome;
+            Refresh();
+            RefreshData();
         }
 
         // One redemption at a time. Double-clicking the button would otherwise
@@ -2824,7 +3187,7 @@ namespace Limisaw
                 Cropped.Add(label);
                 text = Elide(g, label, inner, pt);
             }
-            var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
             using (var br = new SolidBrush(enabled ? Palette.TEXT : Palette.MUTED))
                 g.DrawString(text, Cached(pt), br, new RectangleF(r.X + 2, r.Y + 2, r.Width - 4, r.Height - 4), fmt);
         }
@@ -3245,8 +3608,8 @@ namespace Limisaw
             Color col = Stale ? Palette.MUTED : (available ? PctColor(value) : Palette.MUTED);
             int size = text.Length >= 3 ? 6 : 8;
             using (var br = new SolidBrush(col))
+            using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
             {
-                var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
                 g.DrawString(text, Pix.Get(size), br, new RectangleF(1, 1, 14, 14), fmt);
             }
         }
@@ -3273,8 +3636,8 @@ namespace Limisaw
             string text = available ? (Settings.ShowUsed ? 100 - rem : rem).ToString() : "--";
             Color col = Stale ? Palette.MUTED : (available ? PctColor(rem) : Palette.MUTED);
             using (var br = new SolidBrush(col))
+            using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
             {
-                var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
                 g.DrawString(text, Pix.Get(text.Length >= 3 ? 5 : 6), br, new RectangleF(1, top, 14, 7), fmt);
             }
         }
@@ -3595,11 +3958,25 @@ namespace Limisaw
             var chimeItem = new ToolStripMenuItem("Chime on reset") { Checked = s.ResetSound };
             chimeItem.Click += (o, e) => { chimeItem.Checked = !chimeItem.Checked; s.ResetSound = chimeItem.Checked; s.Save(); };
             m.Items.Add(chimeItem);
-            var lowItem = new ToolStripMenuItem("Alert when quota is low") { Checked = s.NotifyLow };
+            var lowItem = new ToolStripMenuItem("Balloon when quota is low") { Checked = s.NotifyLow };
             lowItem.Click += (o, e) => { lowItem.Checked = !lowItem.Checked; s.NotifyLow = lowItem.Checked; s.Save(); };
             m.Items.Add(lowItem);
+            // CORE-005: the low alert has the same two channels here as the
+            // refill one, or the menu could only ever mute both at once.
+            var lowChime = new ToolStripMenuItem("Chime when quota is low") { Checked = s.LowSound };
+            lowChime.Click += (o, e) => { lowChime.Checked = !lowChime.Checked; s.LowSound = lowChime.Checked; s.Save(); };
+            m.Items.Add(lowChime);
             var autoItem = new ToolStripMenuItem("Start with Windows") { Checked = s.AutoStart };
-            autoItem.Click += (o, e) => { autoItem.Checked = !autoItem.Checked; s.AutoStart = autoItem.Checked; s.Save(); ApplyAutostart(s); };
+            // W2-004: same rule as the Settings button — the registry value is
+            // applied only if the ini recorded the choice, and the tick reverts
+            // when it did not.
+            autoItem.Click += (o, e) =>
+            {
+                bool want = !autoItem.Checked;
+                s.AutoStart = want;
+                if (s.SaveApplied()) { autoItem.Checked = want; ApplyAutostart(s); }
+                else { s.AutoStart = !want; autoItem.Checked = !want; }
+            };
             m.Items.Add(autoItem);
             m.Items.Add(new ToolStripSeparator());
             m.Items.Add("Exit", null, (o, e) => { var f = getForm(); f.Close(); try { tray.Visible = false; } catch { } Application.Exit(); });
