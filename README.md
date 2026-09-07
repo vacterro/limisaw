@@ -1,3 +1,4 @@
+<img width="1600" height="560" alt="LIMISAW_HEADER1" src="https://github.com/user-attachments/assets/ff5571e3-f4d1-44e5-a017-5a3430e67360" />
 # LIMISAW
 
 **One file. No runtime. Every AI agent limit in your tray.**
