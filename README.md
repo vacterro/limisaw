@@ -242,6 +242,13 @@ A file next to the exe **wins** over the embedded copy:
   reading stays a narrow centred column instead of owning all 14 interior
   columns, and every reading keeps its own distinct slot at any count 1..9.
 
+<img width="802" height="366" alt="2026-09-19_161819" src="https://github.com/user-attachments/assets/a2b746a8-16fa-42c7-a4bb-1be96434a6f4" />
+<img width="438" height="617" alt="2026-09-19_162125" src="https://github.com/user-attachments/assets/8709f356-35da-453f-811a-f151953fe72a" />
+<img width="438" height="617" alt="2026-09-19_162131" src="https://github.com/user-attachments/assets/6674c470-079e-4ed1-80b7-775dc8b6867e" />
+<img width="438" height="728" alt="2026-09-19_162138" src="https://github.com/user-attachments/assets/2dbe8da9-dcde-4f89-b41a-e838a1bac934" />
+<img width="438" height="728" alt="2026-09-19_162141" src="https://github.com/user-attachments/assets/5d76d9f6-2293-4fa0-9298-030f4eda0e8e" />
+
+
 ## The files
 
 | File | What it is |
