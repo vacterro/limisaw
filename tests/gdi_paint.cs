@@ -161,8 +161,11 @@ public static class GdiPaintTest
             string ui = File.ReadAllText(Path.Combine(root, "LIMISAW.cs"));
 
             Console.WriteLine("== every paint-path StringFormat is owned by a using ==");
-            Check("all three sites are wrapped",
-                Count(ui, "using (var fmt = new StringFormat {") == 3,
+            // The tray's DrawSingle/DrawHalfNumber no longer build a format at
+            // all — the bitmap glyph alphabet replaced GDI text there — so
+            // DrawButton is the one remaining per-call StringFormat site.
+            Check("the one remaining per-call site is wrapped",
+                Count(ui, "using (var fmt = new StringFormat {") == 1,
                 Count(ui, "using (var fmt = new StringFormat {") + " wrapped of "
                     + Count(ui, "new StringFormat {") + " total");
             Check("no bare per-call format survives",
@@ -174,13 +177,12 @@ public static class GdiPaintTest
             Check("and no shared mutable static format was introduced instead",
                 ui.IndexOf("static StringFormat", StringComparison.Ordinal) < 0
                 && ui.IndexOf("static readonly StringFormat", StringComparison.Ordinal) < 0, "");
-            // The replica in pixel_purity mirrors these two methods verbatim; if
-            // it keeps the old shape it stops being a mirror.
+            // The replica in pixel_purity mirrors the engine: its paint paths use
+            // the bitmap glyph alphabet too, so it must carry no format at all.
             string purity = File.ReadAllText(Path.Combine(root, "tests", "pixel_purity.cs"));
             Check("the pixel_purity replica mirrors the same discipline",
-                Count(purity, "using (var fmt = new StringFormat {") == 2
-                && Count(purity, "var fmt = new StringFormat {") == 2,
-                Count(purity, "using (var fmt = new StringFormat {") + " wrapped");
+                Count(purity, "new StringFormat {") == 0,
+                Count(purity, "new StringFormat {") + " formats in the replica");
 
             Console.WriteLine();
             Console.WriteLine("== the probe can actually see the defect (red control) ==");

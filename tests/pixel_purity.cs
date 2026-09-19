@@ -127,28 +127,91 @@ public static class PixelPurity
             }
     }
 
+    // ── verbatim TrayGlyphs from LIMISAW.cs — the tray's bitmap alphabet ──
+    static readonly Dictionary<char, string[]> Glyphs = new Dictionary<char, string[]>
+    {
+        { '0', new[] { "111", "101", "101", "101", "111" } },
+        { '1', new[] { "010", "110", "010", "010", "111" } },
+        { '2', new[] { "111", "001", "111", "100", "111" } },
+        { '3', new[] { "111", "001", "111", "001", "111" } },
+        { '4', new[] { "101", "101", "111", "001", "001" } },
+        { '5', new[] { "111", "100", "111", "001", "111" } },
+        { '6', new[] { "111", "100", "111", "101", "111" } },
+        { '7', new[] { "111", "001", "010", "010", "010" } },
+        { '8', new[] { "111", "101", "111", "101", "111" } },
+        { '9', new[] { "111", "101", "111", "001", "111" } },
+        { '-', new[] { "000", "000", "111", "000", "000" } },
+        { '<', new[] { "001", "010", "100", "010", "001" } },
+        { 'm', new[] { "101", "111", "101", "101", "101" } },
+        { 'h', new[] { "100", "100", "111", "101", "101" } },
+        { 'd', new[] { "001", "001", "111", "101", "111" } },
+    };
+    const int GlyphW = 3, GlyphH = 5, Spacing = 1;
+
+    static bool Supported(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        foreach (char ch in text) if (!Glyphs.ContainsKey(ch)) return false;
+        return true;
+    }
+
+    static int GlyphWidth(string text, int scale)
+    {
+        if (string.IsNullOrEmpty(text)) return 0;
+        return (text.Length * GlyphW + (text.Length - 1) * Spacing) * scale;
+    }
+
+    static int FitScale(string text, int boxW, int boxH)
+    {
+        if (!Supported(text)) return 0;
+        for (int s = 4; s >= 1; s--)
+            if (GlyphH * s <= boxH && GlyphWidth(text, s) <= boxW) return s;
+        return 0;
+    }
+
+    static void TrayGlyphs(Graphics g, string text, Rectangle box, Color color)
+    {
+        int scale = FitScale(text, box.Width, box.Height);
+        if (scale <= 0) return;
+        int w = GlyphWidth(text, scale), h = GlyphH * scale;
+        int x0 = box.X + (box.Width - w) / 2;
+        int y0 = box.Y + (box.Height - h) / 2;
+        using (var br = new SolidBrush(color))
+        {
+            int x = x0;
+            foreach (char ch in text)
+            {
+                string[] rows;
+                if (Glyphs.TryGetValue(ch, out rows))
+                    for (int r = 0; r < GlyphH; r++)
+                        for (int c = 0; c < GlyphW; c++)
+                            if (rows[r][c] == '1')
+                                g.FillRectangle(br, x + c * scale, y0 + r * scale, scale, scale);
+                x += (GlyphW + Spacing) * scale;
+            }
+        }
+    }
+
     static void DrawSingle(Graphics g, Pal p, int rem, bool available, bool showUsed)
     {
         string text = available ? Shown(rem, showUsed).ToString() : "--";
         Color col = available ? PctColor(p, rem) : p.MUTED;
-        using (Font f = PixelFont(text.Length >= 3 ? 6 : 8))
-        using (var br = new SolidBrush(col))
-        using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-        {
-            g.DrawString(text, f, br, new RectangleF(1, 1, 14, 14), fmt);
-        }
+        TrayGlyphs(g, text, new Rectangle(1, 1, 14, 14), col);
     }
 
     static void DrawHalfNumber(Graphics g, Pal p, int top, int rem, bool available, bool showUsed)
     {
         string text = available ? Shown(rem, showUsed).ToString() : "--";
         Color col = available ? PctColor(p, rem) : p.MUTED;
-        using (Font f = PixelFont(text.Length >= 3 ? 5 : 6))
-        using (var br = new SolidBrush(col))
-        using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-        {
-            g.DrawString(text, f, br, new RectangleF(1, top, 14, 7), fmt);
-        }
+        TrayGlyphs(g, text, new Rectangle(1, top, 14, 7), col);
+    }
+
+    // One muted centre pixel for a reading that exists but cannot answer:
+    // distinct from a genuine 0% (empty track) and from a missing slot.
+    static void MarkUnavailable(Graphics g, Pal p, Rectangle cell)
+    {
+        using (var br = new SolidBrush(p.MUTED))
+            g.FillRectangle(br, cell.X + cell.Width / 2, cell.Y + cell.Height / 2, 1, 1);
     }
 
     static void DrawGrid(Graphics g, Pal p, int[] rem, int steps, bool showUsed)
@@ -159,21 +222,50 @@ public static class PixelPurity
         int cw = 14 / cols, ch = 14 / rows;
         for (int i = 0; i < n; i++)
         {
+            bool have = i < rem.Length;
             var cell = new Rectangle(1 + (i % cols) * cw, 1 + (i / cols) * ch, cw, ch);
             FillArea(g, p, cell, rem[i] < 0 ? 100 : rem[i], rem[i] >= 0, false, steps, showUsed);
+            if (have && rem[i] < 0) MarkUnavailable(g, p, cell);
             using (var pen = new Pen(p.BEVEL)) g.DrawRectangle(pen, cell.X, cell.Y, cell.Width - 1, cell.Height - 1);
         }
     }
 
     static void DrawBars(Graphics g, Pal p, int[] rem, int steps, bool showUsed)
     {
-        int n = Math.Max(1, Math.Min(7, rem.Length));
-        int bw = Math.Max(1, 14 / n);
+        int n = Math.Max(1, Math.Min(9, rem.Length));
+        int unit = 14 / n, extra = 14 % n;
+        int x = 1;
         for (int i = 0; i < n; i++)
         {
-            var bar = new Rectangle(1 + i * bw, 1, bw, 14);
-            FillArea(g, p, bar, rem[i] < 0 ? 100 : rem[i], rem[i] >= 0, true, steps, showUsed);
-            using (var pen = new Pen(p.BEVEL)) g.DrawRectangle(pen, bar.X, bar.Y, bar.Width - 1, bar.Height - 1);
+            int bw = unit + (i < extra ? 1 : 0);
+            bool have = i < rem.Length;
+            var bar = new Rectangle(x, 1, bw, 14);
+            if (bw >= 2)
+            {
+                FillArea(g, p, bar, rem[i] < 0 ? 100 : rem[i], rem[i] >= 0, true, steps, showUsed);
+                if (have && rem[i] < 0) MarkUnavailable(g, p, bar);
+                using (var pen = new Pen(p.BEVEL)) g.DrawRectangle(pen, bar.X, bar.Y, bar.Width - 1, bar.Height - 1);
+            }
+            else
+            {
+                // One-pixel bar: the border colour IS the track; no rectangle
+                // with a zero-interior border.
+                using (var track = new SolidBrush(p.BEVEL)) g.FillRectangle(track, x, 1, 1, 14);
+                if (!(have && rem[i] >= 0))
+                {
+                    if (have) MarkUnavailable(g, p, bar);
+                }
+                else
+                {
+                    int shown = Shown(rem[i], showUsed);
+                    int fillRows = steps >= 100 ? 14 * Math.Min(100, shown) / 100
+                                                : 14 * Math.Min(steps, Math.Max(0, shown * steps / 100)) / steps;
+                    using (var b = new SolidBrush(FillColor(p, rem[i])))
+                        for (int r = 0; r < fillRows; r++)
+                            g.FillRectangle(b, x, 14 - r, 1, 1);
+                }
+            }
+            x += bw;
         }
     }
 

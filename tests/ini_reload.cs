@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -8,8 +8,8 @@ using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
-// W2-003: LIMISAW.ini is a documented configuration path — README says so, and
-// the app itself prints "Opened LIMISAW.ini — press Refresh after editing" — but
+// W2-003: LIMISAW.ini is a documented configuration path вЂ” README says so, and
+// the app itself prints "Opened LIMISAW.ini вЂ” press Refresh after editing" вЂ” but
 // startup used to be the file's ONLY reader. So every hand edit, including the
 // deliberately manual `ZcodeReadConfig=1` that grants the Zcode credential
 // permission, did nothing until the process was restarted. The instruction on
@@ -18,8 +18,8 @@ using System.Windows.Forms;
 // Refresh now re-reads the file and re-applies the runtime state the new values
 // imply. This harness drives the real LimisawForm through the documented
 // workflow: write the ini from outside the process, press Refresh, and assert
-// the new value reached the thing it configures — the probe's credential
-// permission, the refresh timer, the theme — with no restart.
+// the new value reached the thing it configures вЂ” the probe's credential
+// permission, the refresh timer, the theme вЂ” with no restart.
 //
 // It also pins the three refusals that keep a live reload from being worse than
 // no reload at all:
@@ -279,7 +279,7 @@ public static class IniReload
             (string)settingsType.GetField("TrayMode").GetValue(settings) == "single",
             (string)settingsType.GetField("TrayMode").GetValue(settings));
         Check("...and a nonsense step count too",
-            (int)settingsType.GetField("TrayFill").GetValue(settings) == 4,
+            (int)settingsType.GetField("TrayFill").GetValue(settings) == 8,
             settingsType.GetField("TrayFill").GetValue(settings).ToString());
 
         // An ABSENT key is not a malformed one: the file is the truth, so
@@ -292,21 +292,200 @@ public static class IniReload
         Check("a deleted key returns to the documented default",
             (int)lowPct.GetValue(settings) == 20, lowPct.GetValue(settings).ToString());
 
-        // A save that failed means the file does NOT hold the user's choice.
-        // Reading it back would silently undo what they just asked for.
-        keys["RefreshSeconds"] = "1200";
-        WriteIni(ini, keys);
-        saveFailed.SetValue(settings, true);
-        Check("after a FAILED save the stale file is not read back",
-            !(bool)reload.Invoke(settings, null), "");
-        Check("...and the user's live choice survives",
-            (int)refreshSeconds.GetValue(settings) == 900,
-            refreshSeconds.GetValue(settings).ToString());
-        saveFailed.SetValue(settings, false);
-        Check("once saving works again the file is authoritative",
-            (bool)reload.Invoke(settings, null)
+        // W2-006/R020, replacing the old sticky-veto contract: a save that
+        // failed leaves the user's choice live and the object DIRTY against
+        // the durable baseline. The unchanged stale file is not read back over
+        // that choice вЂ” but the refusal is no longer a veto that only an
+        // unrelated successful save can clear: the SAME Refresh accepts a file
+        // that actually changed, which is the documented "edit the ini, press
+        // Refresh" recovery.
+        HookWriter(settings, "RefreshSeconds");
+        refreshSeconds.SetValue(settings, 1200);
+        settingsType.GetMethod("Save").Invoke(settings, null);
+        FieldInfo hookField = settingsType.GetField("WriteHook",
+            BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
+        hookField.SetValue(settings, null);
+        PropertyInfo dirtyProp = settingsType.GetProperty("Dirty");
+        Check("a failed save leaves the choice live and the object dirty",
+            (int)refreshSeconds.GetValue(settings) == 1200
+            && (bool)dirtyProp.GetValue(settings, null)
+            && (bool)saveFailed.GetValue(settings),
+            "RefreshSeconds=" + refreshSeconds.GetValue(settings)
+            + ", Dirty=" + dirtyProp.GetValue(settings, null));
+        Check("...and the unchanged stale file is not read back over the choice",
+            !(bool)reload.Invoke(settings, null)
             && (int)refreshSeconds.GetValue(settings) == 1200,
             refreshSeconds.GetValue(settings).ToString());
+        keys["RefreshSeconds"] = "1500";
+        WriteIni(ini, keys);
+        Check("...but an externally edited file IS accepted after the failed save",
+            (bool)reload.Invoke(settings, null)
+            && (int)refreshSeconds.GetValue(settings) == 1500
+            && !(bool)dirtyProp.GetValue(settings, null)
+            && !(bool)saveFailed.GetValue(settings),
+            "RefreshSeconds=" + refreshSeconds.GetValue(settings)
+            + ", Dirty=" + dirtyProp.GetValue(settings, null));
+        Check("...and a later successful save lands and stays clean",
+            (bool)InvokeSaveResult(settings, "Saved")
+            && !(bool)dirtyProp.GetValue(settings, null)
+            && (int)refreshSeconds.GetValue(settings) == 1500, "");
+
+        // в”Ђв”Ђ CORE-007: booleans get the same typed boundary integers have в”Ђв”Ђ
+        FieldInfo notifyOnReset = settingsType.GetField("NotifyOnReset");
+        FieldInfo autoStart = settingsType.GetField("AutoStart");
+        FieldInfo zcodeRead = settingsType.GetField("ZcodeReadConfig");
+        // Live choices the malformed lines must not clobber.
+        keys["NotifyOnReset"] = "0";
+        keys["AutoStart"] = "0";
+        keys["ZcodeReadConfig"] = "0";
+        keys["RefreshSeconds"] = "900";
+        WriteIni(ini, keys);
+        reload.Invoke(settings, null);
+        notifyOnReset.SetValue(settings, true);
+        autoStart.SetValue(settings, true);
+        zcodeRead.SetValue(settings, true);
+        keys["NotifyOnReset"] = "yes";       // malformed
+        keys["AutoStart"] = "on";            // malformed
+        keys["ZcodeReadConfig"] = "maybe";   // malformed
+        WriteIni(ini, keys);
+        // A change report of false is CORRECT here: the live values survive, so
+        // the fingerprint did not move. The assertion is the values themselves.
+        reload.Invoke(settings, null);
+        Check("a malformed boolean leaves the LIVE value standing, not false",
+            (bool)notifyOnReset.GetValue(settings) && (bool)autoStart.GetValue(settings)
+            && (bool)zcodeRead.GetValue(settings),
+            "NotifyOnReset=" + notifyOnReset.GetValue(settings) + ", AutoStart=" + autoStart.GetValue(settings)
+            + ", ZcodeReadConfig=" + zcodeRead.GetValue(settings));
+
+        keys["NotifyOnReset"] = "1";
+        keys["AutoStart"] = "0";
+        keys["ZcodeReadConfig"] = "1";
+        WriteIni(ini, keys);
+        reload.Invoke(settings, null);
+        Check("0 and 1 are the two valid boolean shapes",
+            (bool)notifyOnReset.GetValue(settings)
+            && !(bool)autoStart.GetValue(settings)
+            && (bool)zcodeRead.GetValue(settings),
+            "NotifyOnReset=" + notifyOnReset.GetValue(settings) + ", AutoStart=" + autoStart.GetValue(settings));
+
+        // And an ABSENT boolean returns to its documented default (the file is
+        // the truth), the same rule the integer read already has.
+        keys = Baseline();
+        keys["RefreshSeconds"] = "900";
+        keys.Remove("NotifyOnReset");
+        WriteIni(ini, keys);
+        reload.Invoke(settings, null);
+        Check("a deleted boolean returns to its default",
+            (bool)notifyOnReset.GetValue(settings), "NotifyOnReset=" + notifyOnReset.GetValue(settings));
+
+        // ── CORE-004 (audit/6): malformed typed values + restart parity ──────
+        // ReloadEx built its candidate by Clone(), so a malformed owned typed
+        // value INHERITED the live value while another valid change made the
+        // candidate worth accepting. The accepted "durable" snapshot then
+        // disagreed with what a restart from the same bytes produces.
+        Console.WriteLine();
+        Console.WriteLine("== CORE-004: a malformed external reload is never accepted as durable ==");
+        MethodInfo reloadEx = settingsType.GetMethod("ReloadEx");
+        FieldInfo invalidField = reloadEx.ReturnType.GetField("Invalid");
+        FieldInfo changedField = reloadEx.ReturnType.GetField("Changed");
+        FieldInfo acceptedField = reloadEx.ReturnType.GetField("Accepted");
+        PropertyInfo dirtyAfter = settingsType.GetProperty("Dirty");
+
+        // The running state: NotifyOnReset=false (a real live choice).
+        keys = Baseline();
+        keys["NotifyOnReset"] = "0";
+        keys["Theme"] = "nord";
+        WriteIni(ini, keys);
+        reload.Invoke(settings, null);
+        Check("the CORE-004 fixture starts at NotifyOnReset=false",
+            !(bool)notifyOnReset.GetValue(settings)
+            && !(bool)dirtyAfter.GetValue(settings, null),
+            "NotifyOnReset=" + notifyOnReset.GetValue(settings));
+
+        // Externally: NotifyOnReset=maybe (malformed) + a VALID Theme change.
+        keys["NotifyOnReset"] = "maybe";
+        keys["Theme"] = "dracula";
+        WriteIni(ini, keys);
+        object malformed = reloadEx.Invoke(settings, null);
+        bool malInvalid = (bool)invalidField.GetValue(malformed);
+        bool malAccepted = (bool)acceptedField.GetValue(malformed);
+        bool malChanged = (bool)changedField.GetValue(malformed);
+        Check("an external reload with a malformed owned value is refused", malInvalid,
+            "Invalid=" + malInvalid + " Accepted=" + malAccepted);
+        Check("...and is not reported as a clean accepted reload",
+            !malAccepted && !malChanged, "Accepted=" + malAccepted + " Changed=" + malChanged);
+        Check("...and the live state is unchanged (false stays false)",
+            !(bool)notifyOnReset.GetValue(settings), notifyOnReset.GetValue(settings).ToString());
+        Check("...and the valid Theme change was NOT adopted either (no partial merge)",
+            (string)settingsType.GetField("ThemeSlug").GetValue(settings) == "nord",
+            (string)settingsType.GetField("ThemeSlug").GetValue(settings));
+
+        // Restart parity: a FRESH object over the same bytes must not contradict
+        // anything the runtime claimed was durable — and nothing was claimed.
+        string unitDir = Path.GetDirectoryName(ini);
+        object fresh = Activator.CreateInstance(settingsType, new object[] { unitDir });
+        settingsType.GetMethod("Load").Invoke(fresh, null);
+        Check("a fresh Load of the same file keeps the class default (true) — no contradiction",
+            (bool)notifyOnReset.GetValue(fresh), notifyOnReset.GetValue(fresh).ToString());
+
+        // The same rule for a malformed INTEGER, with another valid external
+        // change in the same file.
+        keys = Baseline();
+        keys["RefreshSeconds"] = "900";
+        keys["LowPct"] = "20";
+        keys["Theme"] = "nord";
+        WriteIni(ini, keys);
+        reload.Invoke(settings, null);
+        keys["RefreshSeconds"] = "often";       // malformed integer
+        keys["Theme"] = "dracula";              // valid change
+        WriteIni(ini, keys);
+        object malInt = reloadEx.Invoke(settings, null);
+        Check("a malformed integer reload is refused too",
+            (bool)invalidField.GetValue(malInt) && !(bool)acceptedField.GetValue(malInt), "");
+        Check("...and the live integer stands (900, never clamped to a floor)",
+            (int)refreshSeconds.GetValue(settings) == 900, refreshSeconds.GetValue(settings).ToString());
+
+        // Malformed geometry integers are the same class.
+        keys = Baseline();
+        keys["WindowX"] = "40";
+        WriteIni(ini, keys);
+        reload.Invoke(settings, null);
+        keys["WindowX"] = "left";
+        keys["Theme"] = "dracula";
+        WriteIni(ini, keys);
+        object malGeo = reloadEx.Invoke(settings, null);
+        Check("a malformed geometry integer is refused as well",
+            (bool)invalidField.GetValue(malGeo) && !(bool)acceptedField.GetValue(malGeo), "");
+        Check("...and the live geometry stands",
+            (int)settingsType.GetField("WindowX").GetValue(settings) == 40,
+            settingsType.GetField("WindowX").GetValue(settings).ToString());
+
+        // ABSENT is still ABSENT: deleting a line remains the documented
+        // default, never a refusal.
+        keys = Baseline();
+        keys.Remove("LowPct");
+        keys["Theme"] = "dracula";
+        WriteIni(ini, keys);
+        object absentOk = reloadEx.Invoke(settings, null);
+        Check("an absent key is still the documented default, not invalid — and the reload lands",
+            !(bool)invalidField.GetValue(absentOk)
+            && (bool)acceptedField.GetValue(absentOk)
+            && (int)lowPct.GetValue(settings) == 20
+            && (string)settingsType.GetField("ThemeSlug").GetValue(settings) == "dracula",
+            "Invalid=" + invalidField.GetValue(absentOk) + " LowPct=" + lowPct.GetValue(settings));
+
+        // A stable VALID external file still reloads normally (no regression).
+        keys = Baseline();
+        keys["Theme"] = "solarized";
+        keys["LowPct"] = "42";
+        WriteIni(ini, keys);
+        object validReload = reloadEx.Invoke(settings, null);
+        Check("a stable valid external file still reloads normally",
+            (bool)acceptedField.GetValue(validReload)
+            && (bool)changedField.GetValue(validReload)
+            && !(bool)invalidField.GetValue(validReload)
+            && (string)settingsType.GetField("ThemeSlug").GetValue(settings) == "solarized",
+            "Accepted=" + acceptedField.GetValue(validReload));
 
         // The file may be gone entirely; that is not a reason to throw inside a
         // refresh.
@@ -385,7 +564,7 @@ public static class IniReload
             notified.Count == 0, notified.Count + " remembered");
 
         // A locked file is a refresh that still has to work. GetPrivateProfileString
-        // cannot say "unreadable" — it answers with the DEFAULT for every key —
+        // cannot say "unreadable" вЂ” it answers with the DEFAULT for every key вЂ”
         // so a reload that trusted it would silently reset every setting.
         keys["RefreshSeconds"] = "600";
         keys["LowPct"] = "45";
@@ -431,4 +610,30 @@ public static class IniReload
         }
         return start;
     }
+
+    // The W2-006/R020 save seam, for forcing a REAL failed save (the old
+    // LastSaveFailed bool was assignable by hand; the structured dirty state is
+    // not, so the harness must fail an actual write).
+    class FailWriter
+    {
+        readonly string Fail;
+        public FailWriter(string failKey) { Fail = failKey; }
+        public bool Write(string key, string val, string file) { return key != Fail; }
+    }
+
+    static void HookWriter(object settings, string failKey)
+    {
+        FieldInfo hook = settingsType.GetField("WriteHook",
+            BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
+        var w = new FailWriter(failKey);
+        hook.SetValue(settings, Delegate.CreateDelegate(hook.FieldType, w,
+            typeof(FailWriter).GetMethod("Write")));
+    }
+
+    static bool InvokeSaveResult(object settings, string field)
+    {
+        object r = settingsType.GetMethod("SaveSettings").Invoke(settings, null);
+        return (bool)r.GetType().GetField(field).GetValue(r);
+    }
 }
+

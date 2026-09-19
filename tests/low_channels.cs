@@ -104,7 +104,23 @@ public static class LowChannels
     }
 
     // One sweep's worth of alert processing, exactly the order Publish uses.
-    static void Sweep() { Call("RearmLowAlerts"); Call("DetectLow"); }
+    static void Sweep()
+    {
+        Call("RearmLowAlerts"); Call("DetectLow");
+        // T-40/R022: the alert no longer plays on the caller's thread — the cue
+        // is SUBMITTED to the serialized audio owner. Drain it before reading
+        // the count, exactly as the real UI drains before the next sweep.
+        DrainAudio();
+    }
+
+    // The audio owner's test seam: bounded wait until nothing is running or
+    // pending, so the assertions observe settled state instead of racing the
+    // worker.
+    static void DrainAudio()
+    {
+        var m = cueType.GetMethod("WaitIdle", NS);
+        if (m != null) m.Invoke(null, new object[] { 8000 });
+    }
 
     static string Tip() { return Tray.BalloonTipText ?? ""; }
 

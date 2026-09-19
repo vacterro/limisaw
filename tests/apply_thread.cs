@@ -306,7 +306,14 @@ public static class ApplyThread
     static void Cues(Assembly asm, string temp)
     {
         Console.WriteLine();
-        Console.WriteLine("== the preview button and an alert never overlap in the player ==");
+        Console.WriteLine("== concurrent producers, one serialized audio owner ==");
+        // T-40/R022: the architecture moved from a caller-side lock to ONE
+        // serialized owner thread. Producers (the preview button, the sweep's
+        // alerts) no longer call the player from their own thread — they SUBMIT
+        // an immutable request and return. The old harness drove SoundCue.Play
+        // from four threads directly, which encoded the OLD caller-locked
+        // architecture; the product contract is now "many producers, one
+        // owner", so the driver submits the way the real UI does.
         Type cue = asm.GetType("Limisaw.SoundCue");
         FieldInfo backend = cue.GetField("PlayBackend", NS);
         Check("the player has a seam a test can observe", backend != null, "");
@@ -314,37 +321,77 @@ public static class ApplyThread
 
         string wav = Path.Combine(temp, "cue.wav");
         File.WriteAllBytes(wav, Tone(8000));
-        MethodInfo play = cue.GetMethod("Play", PS);
+        MethodInfo submit = cue.GetMethod("Submit", PS);
+        MethodInfo idle = cue.GetMethod("WaitIdle", NS);
+        MethodInfo shutdown = cue.GetMethod("Shutdown", PS);
         backend.SetValue(null, Delegate.CreateDelegate(backend.FieldType,
             typeof(ApplyThread).GetMethod("Backend", NS)));
         try
         {
             var threads = new List<Thread>();
             var faults = new List<string>();
+            var timeouts = new[] { 0, 0, 0, 0 };
             for (int t = 0; t < 4; t++)
             {
+                int who = t;
                 var th = new Thread(() =>
                 {
-                    for (int i = 0; i < 5; i++)
+                    try
                     {
-                        object why = play.Invoke(null, new object[] { temp, "", wav, 50 });
-                        if (why != null) lock (faults) faults.Add((string)why);
+                        // Four producers run concurrently against ONE owner.
+                        // Every producer hands its own cue over and waits for a
+                        // completion, but overlapping producers legitimately
+                        // supersede each other's PENDING cue (latest wins — the
+                        // product's cut-older-audio philosophy), so a completion
+                        // may time out for a superseded request. The invariants
+                        // asserted below are the contract: peak concurrency 1,
+                        // no unbounded backlog, no failure in any executed cue.
+                        var done = new AutoResetEvent(false);
+                        for (int i = 0; i < 5; i++)
+                        {
+                            submit.Invoke(null, new object[] { temp, "", wav, 50, "cue",
+                                (Action<string>)(why => { try { done.Set(); } catch { } }) });
+                            if (!done.WaitOne(5000)) timeouts[who]++;
+                        }
                     }
+                    catch (Exception ex) { lock (faults) faults.Add(ex.InnerException != null ? ex.InnerException.Message : ex.Message); }
                 });
                 th.IsBackground = true;
                 threads.Add(th);
             }
             foreach (Thread th in threads) th.Start();
-            foreach (Thread th in threads) th.Join(30000);
+            foreach (Thread th in threads) th.Join(120000);
+            // The owner drains serially: wait for the last cue, then judge.
+            idle.Invoke(null, new object[] { 60000 });
 
-            Check("every cue was actually handed to the player",
-                plays == 20, plays + " of 20 cues played");
-            Check("...one at a time, whichever thread asked",
+            Check("the four concurrent producers were served by ONE owner",
                 peak == 1, "peak concurrency " + peak);
-            Check("...and none of them reported a failure",
+            Check("...the backlog stayed bounded and every executed cue played",
+                plays > 0 && plays <= 20, plays + " of 20 submitted executed (latest-wins supersession allowed)");
+            Check("...no executed cue reported a failure",
                 faults.Count == 0, faults.Count == 0 ? "" : faults[0]);
+            Check("...timeouts are supersession, never a lost owner",
+                timeouts[0] + timeouts[1] + timeouts[2] + timeouts[3] <= 20 && plays + timeouts[0] + timeouts[1] + timeouts[2] + timeouts[3] <= 20,
+                "superseded=" + timeouts[0] + timeouts[1] + timeouts[2] + timeouts[3] + ", played=" + plays);
+
+            // The exact-count guarantee lives where the contract has no
+            // competing producer: one producer, five paced cues, five plays.
+            plays = 0; peak = 0;
+            var solo = new AutoResetEvent(false);
+            for (int i = 0; i < 5; i++)
+            {
+                submit.Invoke(null, new object[] { temp, "", wav, 50, "cue",
+                    (Action<string>)(why => { try { solo.Set(); } catch { } }) });
+                if (!solo.WaitOne(30000)) faults.Add("solo cue timed out");
+            }
+            Check("one producer, one owner: every cue plays exactly once",
+                plays == 5 && peak == 1, plays + " of 5, peak " + peak);
         }
-        finally { backend.SetValue(null, null); }
+        finally
+        {
+            backend.SetValue(null, null);
+            shutdown.Invoke(null, null);
+        }
     }
 
     // A tiny 16-bit mono WAV, so the volume-scaling path has real samples to
@@ -386,7 +433,7 @@ public static class ApplyThread
         string ui = File.ReadAllText(Path.Combine(dir ?? root, "LIMISAW.cs"));
 
         Check("Apply only marshals; Publish owns the mutation",
-            ui.IndexOf("try { BeginInvoke((Action)(() => Publish(snapshot))); return; }", StringComparison.Ordinal) >= 0
+            ui.IndexOf("if (!RunOnUiThread(() => Publish(snapshot))) AbandonSweep();", StringComparison.Ordinal) >= 0
             && ui.IndexOf("void Publish(ProbeResult snapshot)", StringComparison.Ordinal) >= 0, "");
         Check("the old worker-thread publication is gone",
             ui.IndexOf("try { BeginInvoke((Action)(() => { FitWindow(); Refresh(); UpdateTray(); if (runAgain) RefreshData(); })); }",
@@ -395,8 +442,13 @@ public static class ApplyThread
             ui.IndexOf("try { IntPtr unused = Handle; } catch { }", StringComparison.Ordinal) >= 0
             && ui.IndexOf("try { IntPtr unused = Handle; } catch { }", StringComparison.Ordinal)
                < ui.IndexOf("RefreshTimer.Start(); RefreshData();", StringComparison.Ordinal), "");
-        Check("the cue path serialises the shared player and its cache",
-            ui.IndexOf("lock (Gate)", StringComparison.Ordinal) >= 0
-            && ui.IndexOf("static readonly object Gate = new object();", StringComparison.Ordinal) >= 0, "");
+        // T-40/R022: the architecture changed from a caller-side Gate lock to
+        // ONE serialized owner thread — the lock no longer exists because the
+        // player and the cache have exactly one caller. The owner contract is
+        // what the guard pins now.
+        Check("the cue path has exactly one serialized owner, not a caller lock",
+            ui.IndexOf("static void OwnerLoop()", StringComparison.Ordinal) >= 0
+            && ui.IndexOf("static readonly object Gate = new object();", StringComparison.Ordinal) < 0
+            && ui.IndexOf("long LatestPreviewSeq", StringComparison.Ordinal) >= 0, "");
     }
 }

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using Limisaw;
 
 // The quota engine's rules, where a wrong answer is invisible but wrong on
@@ -78,6 +79,7 @@ public static class LimitsTest
             Banked();
             Identity();
             Claude();
+            Core013();
             Zcode();
             FreeToRead();
             Clis();
@@ -726,6 +728,170 @@ public static class LimitsTest
 
     // Zcode is the only vendor with no CLI, so it is the only one that needs a
     // credential — which makes the gate as load-bearing as the parse.
+    // CORE-013: the reset's absolute instant is the authority from vendor to
+    // UI. ProbeWindow.ResetEpoch rides Flatten numerically; cycle checks and
+    // countdowns key on it (via the invariant token), never on a reparse of
+    // the offset-less local rendering; Claude's yearless stamps resolve to the
+    // nearest plausible occurrence instead of assuming the reference year,
+    // which around New Year built an elapsed reset and a false 100% refill.
+    static void Core013()
+    {
+        Console.WriteLine("== CORE-013: reset authority stays an absolute instant ==");
+        // now instants are built with the same local->UTC conversion the parser
+        // uses, pinned to far-future years, so the assertions hold in any
+        // timezone and under any DST rule the runner may have.
+        Func<int, int, int, int, int, double> LocalEpoch = (y, mo, d, h, mi) =>
+            Stamp.Of(new DateTime(y, mo, d, h, mi, 0, DateTimeKind.Local).ToUniversalTime());
+
+        // 1. the primary red control: Dec 31 -> Jan 1 yearless
+        double now = LocalEpoch(2126, 12, 31, 23, 30);
+        double? jan = ClaudeSource.ParseReset("Jan 1, 12:30am", now);
+        Check("a yearless Jan 1 read on Dec 31 is FUTURE, not the ending year",
+            jan.HasValue && jan.Value > now,
+            jan.HasValue ? "epoch=" + jan.Value + " now=" + now : "null");
+        Check("...and it belongs to next calendar year",
+            jan.HasValue && Stamp.Local(jan.Value).Year == 2127,
+            jan.HasValue ? Stamp.Local(jan.Value).ToString("yyyy-MM-dd") : "null");
+        var soon = new List<ProbeWindow> {
+            Make("five_hour", "", 30.0, jan, 300) };
+        ProbeWindow r = Win(Model.Resolve(soon, now), "five_hour");
+        Check("Model.Resolve does NOT mark the upcoming reset AssumedFull",
+            r.Remaining == 30.0 && !r.AssumedFull,
+            "remaining=" + r.Remaining + " assumed=" + r.AssumedFull);
+        Check("...so the quota is not replaced with 100%", r.Remaining != 100.0,
+            "remaining=" + r.Remaining);
+
+        // 2. Jan 1 -> Dec 31 yearless: the recent occurrence, not +1 year
+        double now2 = LocalEpoch(2127, 1, 1, 0, 30);
+        double? dec = ClaudeSource.ParseReset("Dec 31, 11:30pm", now2);
+        Check("a yearless Dec 31 read just after midnight is the RECENT one",
+            dec.HasValue && dec.Value < now2 && Stamp.Local(dec.Value).Year == 2126,
+            dec.HasValue ? Stamp.Local(dec.Value).ToString("yyyy-MM-dd") : "null");
+        // regression guard: a genuinely elapsed reset keeps its AssumedFull rule
+        var past = new List<ProbeWindow> { Make("five_hour", "", 12.0, dec, 300) };
+        ProbeWindow r2 = Win(Model.Resolve(past, now2), "five_hour");
+        Check("...and a genuinely elapsed reset still refills by the clock",
+            r2.Remaining == 100.0 && r2.AssumedFull,
+            "remaining=" + r2.Remaining + " assumed=" + r2.AssumedFull);
+
+        // 3. ordinary same-year input away from the boundary
+        double now3 = LocalEpoch(2126, 9, 6, 10, 0);
+        double? sep = ClaudeSource.ParseReset("Sep 8, 4:59pm", now3);
+        Check("an ordinary nearby month/day stays same-year",
+            sep.HasValue && sep.Value > now3 && Stamp.Local(sep.Value).Year == 2126,
+            sep.HasValue ? Stamp.Local(sep.Value).ToString("yyyy-MM-dd") : "null");
+
+        // 4. explicit years always win over nearest-year inference
+        Check("an explicit year at the boundary is honoured exactly",
+            ClaudeSource.ParseReset("Jan 1, 2127, 12:30am", now) == LocalEpoch(2127, 1, 1, 0, 30),
+            Stamp.Iso(ClaudeSource.ParseReset("Jan 1, 2127, 12:30am", now)) ?? "null");
+        Check("an explicit PAST year is never corrected forward",
+            ClaudeSource.ParseReset("Jan 1, 2125, 12:30am", now) == LocalEpoch(2125, 1, 1, 0, 30),
+            "");
+
+        // 5. invalid calendar candidates are refused, not guessed
+        double febNow = LocalEpoch(2126, 3, 1, 12, 0);
+        Check("Feb 29 with no plausible leap year among candidates is null",
+            !ClaudeSource.ParseReset("Feb 29, 3pm", febNow).HasValue, "");
+        Check("an impossible day is null", !ClaudeSource.ParseReset("Feb 30, 3pm", febNow).HasValue, "");
+
+        // 6. Flatten authority: the epoch survives numerically
+        var acc = new ProbeAccount
+        { Provider = "claude", ProviderLabel = "Claude Code", Name = "C", Status = Model.OK, Ok = true };
+        acc.Windows.Add(Make("five_hour", "", 30.0, jan, 300));
+        acc.Windows.Add(new ProbeWindow { Key = Model.WEEKLY, Group = "", Available = true,
+            Remaining = 50.0, ResetEpoch = null, DurationMinutes = 10080 });
+        AccountData flat = Model.Flatten(acc, now);
+        Check("Flatten carries the reset epoch numerically unchanged",
+            Flat(flat, "five_hour").ResetEpoch == jan.Value,
+            (Flat(flat, "five_hour").ResetEpoch ?? 0) + " vs " + jan.Value);
+        Check("a missing epoch flattens unknown, no timestamp invented",
+            Flat(flat, Model.WEEKLY).ResetEpoch == null && Flat(flat, Model.WEEKLY).Reset == null,
+            Flat(flat, Model.WEEKLY).Reset ?? "null");
+
+        // 7. presentation is not authority
+        WindowData wa = Flat(flat, "five_hour");
+        string displayToken = Stamp.Token(wa.ResetEpoch) ?? "";
+        Check("the token is not the local rendering",
+            displayToken != wa.Reset && displayToken.Length > 0,
+            "token=" + displayToken + " reset=" + (wa.Reset ?? "null"));
+        Check("the token parses back to the exact instant",
+            Stamp.FromToken(displayToken) == wa.ResetEpoch, "");
+        WindowData wb = new WindowData
+        { Key = Model.FIVE_HOUR, Base = Model.FIVE_HOUR, Label = "5h", Available = true,
+          Rem = 30, ResetEpoch = wa.ResetEpoch, Reset = null, DurationMinutes = 300 };
+        Check("same instant, lost display string, same identity token",
+            Stamp.Token(wb.ResetEpoch) == Stamp.Token(wa.ResetEpoch), "");
+        // NewCycle must not read the display string: garbage in, same verdict
+        double holdEpoch = wa.ResetEpoch ?? 0;
+        bool withDisplay = holdEpoch > 0
+            && NewCycle(wb, Stamp.Token(holdEpoch), Stamp.Token(holdEpoch + 9000));
+        wb.Reset = "nonsense";
+        bool withGarbage = holdEpoch > 0
+            && NewCycle(wb, Stamp.Token(holdEpoch), Stamp.Token(holdEpoch + 9000));
+        Check("NewCycle's verdict is identical when the display string is garbage",
+            withDisplay && withGarbage, withDisplay + "/" + withGarbage);
+        MethodInfo cd = typeof(LimisawForm).GetMethod("CountdownText",
+            BindingFlags.NonPublic | BindingFlags.Static, null, new Type[] { typeof(string) }, null);
+        string viaToken = holdEpoch > 0
+            ? (string)cd.Invoke(null, new object[] { Stamp.Token(holdEpoch) }) : "--";
+        Check("countdown reads the token, not the presentation",
+            holdEpoch > 0 && viaToken != "--"
+            && viaToken == (string)cd.Invoke(null, new object[] { Stamp.Token(wb.ResetEpoch ?? 0) }),
+            viaToken);
+        Check("an unreadable countdown stamp is still --", (string)cd.Invoke(null,
+            new object[] { "whenever" }) == "--", "");
+
+        // 8. DST: the repeated local wall clock stays two instants. The pair is
+        // built with FIXED offsets (US Eastern's fall-back hour), so it is a
+        // real repeated hour on paper while the runner's own zone is untouched.
+        var edt = new DateTimeOffset(2126, 11, 1, 1, 30, 0, TimeSpan.FromHours(-4));
+        var est = new DateTimeOffset(2126, 11, 1, 1, 30, 0, TimeSpan.FromHours(-5));
+        double eEdt = Stamp.Of(edt.UtcDateTime), eEst = Stamp.Of(est.UtcDateTime);
+        Check("the repeated wall clock is two distinct instants one hour apart",
+            eEdt != eEst && Math.Abs(eEst - eEdt - 3600.0) < 0.5, "gap=" + (eEst - eEdt));
+        Check("their tokens stay distinct even where a rendering would collide",
+            Stamp.Token(eEdt) != Stamp.Token(eEst), "");
+        var accD = new ProbeAccount
+        { Provider = "codex", ProviderLabel = "Codex", Name = "D", Status = Model.OK, Ok = true };
+        accD.Windows.Add(Make("five_hour", "", 20.0, eEdt, 300));
+        accD.Windows.Add(Make("weekly", "", 80.0, eEst, 10080));
+        AccountData flatD = Model.Flatten(accD, eEdt - 1);   // before BOTH: neither reset is elapsed
+        Check("Flatten keeps both instants numerically distinct through the model",
+            Flat(flatD, "five_hour").ResetEpoch == eEdt && Flat(flatD, Model.WEEKLY).ResetEpoch == eEst,
+            (Flat(flatD, "five_hour").ResetEpoch ?? 0) + "/" + (Flat(flatD, Model.WEEKLY).ResetEpoch ?? 0));
+
+        // 9. NewCycle: epoch difference, half-duration threshold preserved
+        var cw = new WindowData
+        { DurationMinutes = 300, ResetEpoch = 4.5e9, Reset = Stamp.Iso(4.5e9) };
+        string t0 = Stamp.Token(4.5e9);
+        Check("an identical token is never a new cycle", !NewCycle(cw, t0, t0), "");
+        Check("consumption drift below half a window stays quiet",
+            !NewCycle(cw, t0, Stamp.Token(4.5e9 + 89 * 60)), "5h, +89m");
+        Check("a jump of half the window IS a rollover",
+            NewCycle(cw, t0, Stamp.Token(4.5e9 + 150 * 60)), "5h, +150m");
+        Check("a reset that moved backwards is not a rollover",
+            !NewCycle(cw, t0, Stamp.Token(4.5e9 - 300 * 60)), "");
+        Check("a missing epoch is unknown and re-arms on recovery alone",
+            !NewCycle(cw, "", t0), "");
+        Check("the DST hour the wall clock cannot show is measured anyway",
+            NewCycle(new WindowData { DurationMinutes = 60 }, Stamp.Token(eEdt), Stamp.Token(eEst)),
+            "60m window, +60m");
+        Check("...and it stays drift on a 5h window",
+            !NewCycle(new WindowData { DurationMinutes = 300 }, Stamp.Token(eEdt), Stamp.Token(eEst)),
+            "5h, +60m");
+    }
+
+    // LimitsTest is engine-linked, so the form's private statics are reachable
+    // by reflection against THIS assembly's own type.
+    static bool NewCycle(WindowData w, string before, string after)
+    {
+        MethodInfo nc = typeof(LimisawForm).GetMethod("NewCycle",
+            BindingFlags.NonPublic | BindingFlags.Static, null,
+            new Type[] { typeof(WindowData), typeof(string), typeof(string) }, null);
+        return (bool)nc.Invoke(null, new object[] { w, before, after });
+    }
+
     static void Zcode()
     {
         Console.WriteLine("== Zcode: two windows from one endpoint, key behind a gate ==");
@@ -793,12 +959,16 @@ public static class LimitsTest
             Environment.SetEnvironmentVariable(ZcodeSource.EnvPrimary, null);
             Environment.SetEnvironmentVariable(ZcodeSource.EnvAlternate, null);
             ZcodeSource.Key denied = ZcodeSource.Resolve(false);
+            // State-agnostic on purpose: whether the machine running the suite
+            // has a real Zcode config decides only detected vs not-detected;
+            // both are "the permission is off and nothing was read".
             Check("with no env key and the switch off, NOTHING is read",
                 denied.Value.Length == 0 && denied.Refusal != null
-                && denied.Refusal.IndexOf("ZcodeReadConfig", StringComparison.Ordinal) >= 0,
-                denied.Refusal ?? "(no refusal)");
-            Check("...and the refusal names the env var too, so there are two ways in",
-                denied.Refusal.IndexOf(ZcodeSource.EnvPrimary, StringComparison.Ordinal) >= 0,
+                && (denied.State == "config-denied" || denied.State == "not-detected"),
+                (denied.State ?? "(no state)") + " / " + (denied.Refusal ?? "(no refusal)"));
+            Check("...and the refusal names the env var and the Settings toggle, so there are two ways in",
+                denied.Refusal.IndexOf(ZcodeSource.EnvPrimary, StringComparison.Ordinal) >= 0
+                && denied.Refusal.IndexOf("Settings", StringComparison.Ordinal) >= 0,
                 denied.Refusal);
 
             Environment.SetEnvironmentVariable(ZcodeSource.EnvPrimary, "env-key-1");

@@ -181,6 +181,60 @@ public static class AntigravityJournalTest
             accWarm.Ok && accWarm.Windows.Count > 0 && accWarm.Windows[0].Available, "");
 
         Console.WriteLine();
+        Console.WriteLine("== W2-003: an elapsed refusal is an event, not a fresh full quota ==");
+        // "Resets in 5h" observed 5h10m ago: the reset passed TEN MINUTES ago,
+        // inside the 1h grace. The old code passed that through as
+        // Available + Remaining=0 with a PAST reset epoch, and
+        // Model.ApplyElapsedResets inflated it to 100% AssumedFull — a fresh
+        // full quota nothing measured. The quota since the reset is UNKNOWN:
+        // the user may have spent it again, and no CLI reported a number.
+        NewProfile();
+        string convElapsed = MessagesDir("conv-elapsed");
+        Write(convElapsed, "refusal.json", Refusal(5, Iso(5 * 3600 + 600)), 5 * 3600 + 600);
+        TouchDir(convElapsed, 600);
+        var accElapsed = new ProbeAccount { Provider = "antigravity", ProviderLabel = "Antigravity", Name = "Antigravity" };
+        AntigravitySource.ResetBodyCache();
+        accElapsed = AntigravitySource.Journal(accElapsed, null, Stamp.Now + 30);
+        Check("the account still reports the refusal (not an error card)",
+            accElapsed.Ok && accElapsed.Status == Model.OK && accElapsed.UnverifiedReset,
+            "ok=" + accElapsed.Ok + " unverified=" + accElapsed.UnverifiedReset);
+        Check("...its window is UNREADABLE, carrying the reset stamp",
+            accElapsed.Windows.Count == 1 && !accElapsed.Windows[0].Available
+            && !accElapsed.Windows[0].Remaining.HasValue
+            && accElapsed.Windows[0].ResetEpoch.HasValue
+            && accElapsed.Windows[0].ResetEpoch.Value <= Stamp.Now,
+            accElapsed.Windows.Count == 0 ? "no window" : "available=" + accElapsed.Windows[0].Available
+                + " remaining=" + (accElapsed.Windows[0].Remaining.HasValue ? accElapsed.Windows[0].Remaining.Value.ToString() : "null"));
+
+        // Flatten is what the card draws: the same account must NOT reach it
+        // as a refilled 100%. AssumedFull is the fabrication's fingerprint.
+        AccountData card = Model.Flatten(accElapsed, Stamp.Now);
+        Check("the card shows no invented 100% — unreadable with the reset kept",
+            card.Windows.Count == 1 && !card.Windows[0].Available && card.Windows[0].Rem == 0
+            && !card.Windows[0].AssumedFull && card.Windows[0].Reset != null,
+            "available=" + card.Windows[0].Available + " rem=" + card.Windows[0].Rem
+            + " assumed_full=" + card.Windows[0].AssumedFull + " reset=" + card.Windows[0].Reset);
+        Check("...and the snapshot opts out of carry-forward (the event is the news)",
+            card.ResetUnverified, "reset_unverified=" + card.ResetUnverified);
+
+        // The ACTIVE refusal right beside it is untouched: a real 0 with a
+        // future reset, exactly as before.
+        NewProfile();
+        string convActive = MessagesDir("conv-active");
+        Write(convActive, "refusal.json", Refusal(5, Iso(60)), 60);
+        TouchDir(convActive, 60);
+        var accActive = new ProbeAccount { Provider = "antigravity", ProviderLabel = "Antigravity", Name = "Antigravity" };
+        accActive = AntigravitySource.Journal(accActive, null, Stamp.Now + 30);
+        Check("an ACTIVE refusal still reads 0% with a future reset",
+            accActive.Ok && !accActive.UnverifiedReset && accActive.Windows[0].Available
+            && accActive.Windows[0].Remaining == 0.0
+            && accActive.Windows[0].ResetEpoch.Value > Stamp.Now, "");
+        AccountData activeCard = Model.Flatten(accActive, Stamp.Now);
+        Check("...and the card draws the blocked 0% exactly as before",
+            activeCard.Windows[0].Available && activeCard.Windows[0].Rem == 0
+            && !activeCard.Windows[0].AssumedFull, "");
+
+        Console.WriteLine();
         Console.WriteLine(fails == 0
             ? "PASS (" + checks + " checks, 0 failures)"
             : "FAILED (" + fails + " of " + checks + " checks)");

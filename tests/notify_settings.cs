@@ -60,11 +60,14 @@ public static class NotifySettingsTest
         return ms.ToArray();
     }
 
+    // T-40/R029: Scale(byte[], gain) became ScaleInPlace(byte[], gain), which
+    // returns a ScaleResult carrying Supported/Bytes instead of a bare array.
     static int FirstSample(Assembly asm, byte[] wav)
     {
         Type cue = asm.GetType("Limisaw.SoundCue");
-        MethodInfo scale = cue.GetMethod("Scale", BindingFlags.NonPublic | BindingFlags.Static);
-        byte[] half = (byte[])scale.Invoke(null, new object[] { wav, 0.5 });
+        MethodInfo scale = cue.GetMethod("ScaleInPlace", BindingFlags.NonPublic | BindingFlags.Static);
+        object result = scale.Invoke(null, new object[] { wav, 0.5 });
+        byte[] half = (byte[])result.GetType().GetField("Bytes").GetValue(result);
         // data starts after the 44-byte canonical header built above
         return BitConverter.ToInt16(half, 44);
     }
@@ -138,16 +141,28 @@ public static class NotifySettingsTest
             Check("an absolute stored path resolves as-is", rAbs == abs, rAbs ?? "null");
 
             // --- Scale: halves the amplitude, leaves the RIFF header intact ---
+            // (T-40/R029: the scaler is ScaleInPlace now, returning ScaleResult
+            // with Supported/Bytes — unsupported input is refused, never
+            // silently copied.)
+            MethodInfo scaleIn = cue.GetMethod("ScaleInPlace", BindingFlags.NonPublic | BindingFlags.Static);
+            Func<byte[], double, byte[]> Scale = (b, g) =>
+            {
+                object r = scaleIn.Invoke(null, new object[] { b, g });
+                return (byte[])r.GetType().GetField("Bytes").GetValue(r);
+            };
             byte[] tone = Tone(10000);
-            int half = FirstSample(asm, tone);
+            // T-40/R029: scaling is IN PLACE on the owned buffer — each scale
+            // call gets its own copy, exactly like the production path (one
+            // File.ReadAllBytes buffer per cache build).
+            int half = FirstSample(asm, (byte[])tone.Clone());
             Check("volume 0.5 halves the 16-bit samples", half == 5000, "sample=" + half);
-            byte[] halfWav = (byte[])cue.GetMethod("Scale", BindingFlags.NonPublic | BindingFlags.Static)
-                .Invoke(null, new object[] { tone, 0.5 });
+            byte[] halfWav = Scale((byte[])tone.Clone(), 0.5);
             Check("scaling leaves the RIFF/WAVE header bytes untouched",
                 System.Text.Encoding.ASCII.GetString(halfWav, 0, 4) == "RIFF"
                 && System.Text.Encoding.ASCII.GetString(halfWav, 8, 4) == "WAVE", "");
-            byte[] passthru = (byte[])cue.GetMethod("Scale", BindingFlags.NonPublic | BindingFlags.Static)
-                .Invoke(null, new object[] { tone, 1.0 });
+            // T-40/R029: full volume is NOT a transform — the owned buffer comes
+            // back as-is (numerically unchanged).
+            byte[] passthru = Scale((byte[])tone.Clone(), 1.0);
             Check("volume 1.0 returns the bytes unchanged",
                 passthru.Length == tone.Length && BitConverter.ToInt16(passthru, 44) == 10000, "");
 

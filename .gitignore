@@ -1,8 +1,11 @@
 # Runtime config, generated on first launch; carries window position and machine paths
 LIMISAW.ini
 
-# SAIPEN project memory — private working state, not for the public repo
-.saipen/
+# SAIPEN project memory — private working state, not for the public repo,
+# EXCEPT the portable lineage carrier the SAIPEN conformance gate requires
+# tracked so a fresh clone keeps its identity.
+.saipen/*
+!.saipen/IDENTITY.md
 
 # Caches and build artifacts
 *.bak
@@ -26,3 +29,18 @@ $RECYCLE.BIN/
 # The built exe is a release asset, not source: csc (Framework 4.x) has no -deterministic,
 # so a tracked binary was byte-different on every build and git status was never clean.
 LIMISAW.exe
+
+# The other binaries: the test copy of the exe, the compiled icon generator, and
+# the icon it produces (build.ps1 regenerates LIMISAW.ico from the tracked brand
+# PNG whenever it is missing, so the ico is a build output, not source).
+LIMISAW_test.exe
+tools/make_ico.exe
+LIMISAW.ico
+
+# Local build logs and captured proof runs — machine-local evidence, not source.
+src007-build.log
+src007-build-current.log
+evidence/
+
+# FreeBuff's per-machine project id, generated on first run.
+.freebuff/

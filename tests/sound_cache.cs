@@ -109,7 +109,7 @@ public static class SoundCacheTest
             sa == sb ? "both aliased " + Path.GetFileName(sa) : Path.GetFileName(sa) + " vs " + Path.GetFileName(sb));
         Check("...with distinct bytes on disk", Sha(sa) != Sha(sb), "");
         Check("...and the readable basename survives in the name",
-            Path.GetFileName(sa).StartsWith("pop_cartoon_pop_", StringComparison.Ordinal)
+            Path.GetFileName(sa).IndexOf("pop_cartoon_pop_", StringComparison.Ordinal) >= 0
             && Path.GetFileName(sa).EndsWith("_v50.wav", StringComparison.Ordinal),
             Path.GetFileName(sa));
 

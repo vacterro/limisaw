@@ -17,17 +17,31 @@ using System.Web.Script.Serialization;
 // is one file with no runtime to install.
 namespace Limisaw
 {
-    // ── JSON access ──────────────────────────────────────────────────────────
+    // в”Ђв”Ђ JSON access в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     // JavaScriptSerializer.DeserializeObject hands back Dictionary/object[]/
     // boxed numbers. Every read goes through these so a vendor changing a field
     // type is a null, never an exception in the middle of a sweep.
     static class J
     {
+        // PERF-007/R030: every external/vendor JSON payload is BOUNDED. The old
+        // code set MaxJsonLength = int.MaxValue and let any payload grow without
+        // a ceiling; now the boundaries are narrow and documented: a Desktop
+        // history file may be 8 MiB and no other local JSON is legitimately
+        // anywhere near that, so a single hard ceiling at 8 MiB + generous slack
+        // keeps the real fixtures green while rejecting pathological payloads.
+        // J.Parse is the LAST guard — every caller that knows its input SHOULD
+        // stat it before ReadAllText — but any oversized JSON beyond the ceiling
+        // is refused here BEFORE the serializer sees it, so a valid prefix with
+        // an oversized tail is never parsed as partial truth. Oversized never
+        // means "parse the prefix we saw".
+        public const int MaxJsonChars = 9 * 1024 * 1024;
+
         public static object Parse(string text)
         {
             if (string.IsNullOrEmpty(text)) return null;
+            if (text.Length > MaxJsonChars) return null;
             var ser = new JavaScriptSerializer();
-            ser.MaxJsonLength = int.MaxValue;
+            ser.MaxJsonLength = MaxJsonChars;
             ser.RecursionLimit = 200;
             try { return ser.DeserializeObject(text); } catch { return null; }
         }
@@ -35,7 +49,7 @@ namespace Limisaw
         public static string Write(object value)
         {
             var ser = new JavaScriptSerializer();
-            ser.MaxJsonLength = int.MaxValue;
+            ser.MaxJsonLength = Math.Min(int.MaxValue, MaxJsonChars);
             return ser.Serialize(value);
         }
 
@@ -77,7 +91,46 @@ namespace Limisaw
         }
     }
 
-    // ── timestamps ───────────────────────────────────────────────────────────
+    // W2-005: a local-file read that bounds what is RETAINED, not what was
+    // observed at one instant. These files are caches/config/history written by
+    // other live tools, so they are opened with FileShare.ReadWrite and can grow
+    // between any pre-stat and the read. The opened handle is the authority:
+    // at most cap+1 bytes are read; if that +1 byte exists the WHOLE snapshot is
+    // refused and no prefix is ever parsed. Metadata stays useful as an early
+    // fast refusal, but it is never the only bound.
+    static class BoundedFile
+    {
+        // Returns the decoded text, or null with `error` set to "too large" or
+        // "unreadable". `bytesRead` is the number of bytes actually retained
+        // (the cache identity length), never the pre-read FileInfo.Length.
+        public static string ReadAllText(string path, long maxBytes, out long bytesRead, out string error)
+        {
+            bytesRead = 0;
+            error = null;
+            long cap = maxBytes < 0 ? 0 : maxBytes;
+            int limit = cap >= int.MaxValue - 1 ? int.MaxValue - 1 : (int)cap + 1;
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    var buffer = new byte[limit];
+                    int total = 0;
+                    while (total < limit)
+                    {
+                        int n = fs.Read(buffer, total, limit - total);
+                        if (n <= 0) break;
+                        total += n;
+                    }
+                    bytesRead = total;
+                    if (total > cap) { error = "too large"; return null; }
+                    return Encoding.UTF8.GetString(buffer, 0, total);
+                }
+            }
+            catch { error = "unreadable"; return null; }
+        }
+    }
+
+    // в”Ђв”Ђ timestamps в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     static class Stamp
     {
         static readonly DateTime Epoch1970 = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -127,9 +180,31 @@ namespace Limisaw
             try { return Local(epoch.Value).ToString("yyyy-MM-ddTHH:mm:ss"); }
             catch { return null; }
         }
+
+        // CORE-013: the invariant identity of a reset instant. Iso is
+        // PRESENTATION — local, offset-less, exactly what DateTime.TryParse
+        // reads back — and a DST fall-back renders two distinct instants to the
+        // same wall clock, so a string rebuilt from it can collapse them. The
+        // token is culture-invariant decimal UTC seconds, which two windows can
+        // compare byte-for-byte and parse back losslessly; quota logic keys on
+        // this, never on the rendering.
+        public static string Token(double? epoch)
+        {
+            if (!epoch.HasValue || epoch.Value <= 0) return null;
+            return epoch.Value.ToString("R", CultureInfo.InvariantCulture);
+        }
+
+        public static double? FromToken(string token)
+        {
+            if (string.IsNullOrEmpty(token)) return null;
+            double v;
+            return double.TryParse(token, NumberStyles.Float,
+                CultureInfo.InvariantCulture, out v) && v > 1e9 && v < 1e11
+                ? v : (double?)null;
+        }
     }
 
-    // ── domain ───────────────────────────────────────────────────────────────
+    // в”Ђв”Ђ domain в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     // One quota window as a provider reported it, before display resolution.
     class ProbeWindow
     {
@@ -143,6 +218,8 @@ namespace Limisaw
         public double? ResetEpoch;
         public int? DurationMinutes;
         public string GatedBy;           // key of the longer window in this pool that is spent
+        public bool IsExpiry;            // true if expiresAt, false if recurring resetsAt
+        public bool Allocated = true;    // whether an active quota allocation exists
 
         public ProbeWindow Copy()
         {
@@ -151,6 +228,7 @@ namespace Limisaw
                 Key = Key, Group = Group, GroupLabel = GroupLabel, Source = Source,
                 Available = Available, AssumedFull = AssumedFull, Remaining = Remaining,
                 ResetEpoch = ResetEpoch, DurationMinutes = DurationMinutes, GatedBy = GatedBy,
+                IsExpiry = IsExpiry, Allocated = Allocated,
             };
         }
 
@@ -171,11 +249,87 @@ class ProbeAccount
         // whichever duplicate "Codex" happens to sort first.
         public string SourceId = "";
         public string ResetHome = "";
+        // Opaque digest of vendor-reported accountId. Never a home-routing key.
+        public string RemoteAccountIdentity = "";
+        public bool RemoteIdentityChecked;
         public bool Ok, Quiet;
         public List<ProbeWindow> Windows = new List<ProbeWindow>();
+        // Normalized collection of explicitly identified reserve pools
+        public List<ReservePool> Reserves = new List<ReservePool>();
+        public AccountAvailability Availability;
+        // W2-003: a refusal whose reset passed inside the grace is an EVENT,
+        // not a reading — the window stays unreadable and this flag tells
+        // Flatten the quota is unverified rather than carried-forward stale.
+        public bool UnverifiedReset;
         // Banked resets this account holds, or null. Not a window: a count,
         // an expiry and the vendor's own title.
         public ResetCredits Credits;
+        // Absolute balances this account reports (FreeBucks), or empty. NOT
+        // windows: an absolute amount with no denominator, so it never enters
+        // Windows and never feeds percentage logic (see BalanceData).
+        public List<BalanceData> Balances = new List<BalanceData>();
+    }
+
+    // A normalized reserve pool representing a dedicated reserve bucket (e.g. Luna reserve, generic GPT reserve).
+    class ReservePool
+    {
+        public string Id = "";                  // unique group key, e.g. "luna_reserve" or "base_model_inference"
+        public string RawLimitId = "";          // upstream limitId, e.g. "base_model_inference"
+        public string RawLimitName = "";        // upstream limitName, e.g. "gpt-reserve"
+        public string Family = "";              // "luna", "generic_gpt", "unknown"
+        public string Label = "";               // display label, e.g. "luna-reserve", "gpt-reserve"
+        public string ModelSlug = "";           // upstream normalModelSlug, e.g. "gpt-5.6-luna"
+        public List<string> EligibleModels = new List<string>();
+        public double? Remaining;              // percent remaining (0.0 .. 100.0)
+        public double? ResetEpoch;             // epoch seconds
+        public bool IsExpiry;                  // true if expiresAt (fixed expiry), false if recurring cycle
+        public int? DurationMinutes;           // e.g. 10080
+        public bool Available;                 // whether readable
+        public bool Allocated = true;          // whether active allocation exists vs eligible without allocation
+        public string GatedBy;
+        public string EvidenceQuality = "app-server-ratelimits";
+
+        public bool IsUsable
+        {
+            get { return Available && Allocated && Remaining.HasValue && Remaining.Value > Model.ZeroRemaining && GatedBy == null; }
+        }
+
+        public bool SupportsModel(string model)
+        {
+            if (string.IsNullOrEmpty(model)) return false;
+            if (Family != "luna" && Family != "generic_gpt") return false;
+            string m = model.Trim();
+            if (EligibleModels != null)
+                foreach (string em in EligibleModels)
+                    if (em.Equals(m, StringComparison.OrdinalIgnoreCase)) return true;
+            return !string.IsNullOrEmpty(ModelSlug) && ModelSlug.Equals(m, StringComparison.OrdinalIgnoreCase);
+        }
+
+        public ReservePool Copy()
+        {
+            var p = new ReservePool
+            {
+                Id = Id, RawLimitId = RawLimitId, RawLimitName = RawLimitName,
+                Family = Family, Label = Label, ModelSlug = ModelSlug,
+                Remaining = Remaining, ResetEpoch = ResetEpoch, IsExpiry = IsExpiry,
+                DurationMinutes = DurationMinutes, Available = Available, Allocated = Allocated,
+                GatedBy = GatedBy, EvidenceQuality = EvidenceQuality
+            };
+            if (EligibleModels != null) p.EligibleModels.AddRange(EligibleModels);
+            return p;
+        }
+    }
+
+    // Effective account-level availability taking both normal quota and reserve pools into account.
+    class AccountAvailability
+    {
+        public bool RegularAvailable;           // normal quota usable
+        public bool GenericReserveAvailable;    // generic gpt reserve usable
+        public bool LunaReserveAvailable;       // luna reserve usable
+        public bool EffectiveLunaAvailable;     // RegularAvailable || LunaReserveAvailable
+        public bool EffectiveGptAvailable;      // RegularAvailable || GenericReserveAvailable
+        public string LunaStatusReason = "";
+        public List<string> Diagnostics = new List<string>();
     }
 
     // A one-off credit that refills a spent window on demand. `Id` is the
@@ -189,10 +343,30 @@ class ProbeAccount
         public string Id;
     }
 
+    // An ABSOLUTE balance, not a percentage. Some vendors meter in credits
+    // ("FreeBucks 123.4"), and a credit count has no denominator: turning it
+    // into a percent would be an invented number. It rides on the account
+    // beside the windows, never INSIDE WindowData (whose Rem is always a
+    // percent), so the tray's percentage modes and the low-quota alert cannot
+    // mistake it for quota.
+    class BalanceData
+    {
+        public string Id = "";              // stable key, e.g. "freebucks"
+        public string Label = "";           // display label, e.g. "FreeBucks"
+        public double? Value;               // absolute amount, vendor units
+        public string Unit = "";            // display unit, e.g. "credits"
+        public double? ResetEpoch;          // next cycle reset, when the vendor states one
+        // Optional breakdown as the vendor actually sent it (free/paid/ad/...).
+        // Null when the response carried none; never fabricated.
+        public List<KeyValuePair<string, double>> Breakdown;
+    }
+
     class ProbeResult
     {
         public List<AccountData> Accounts = new List<AccountData>();
         public List<CliInfo> Clis = new List<CliInfo>();
+        public List<string> DuplicateCodexHomes = new List<string>();
+        public List<string> UnverifiedCodexHomes = new List<string>();
     }
 
     static class Model
@@ -270,7 +444,8 @@ class ProbeAccount
 
         // A window whose own reset time already passed is full: no probe is
         // needed to know that, and waiting for the next sweep showed a number
-        // the clock had already disproved.
+        // the clock had already disproved. A fixed expiry (IsExpiry == true)
+        // depletes instead of refilling.
         public static List<ProbeWindow> ApplyElapsedResets(List<ProbeWindow> windows, double now)
         {
             var outList = new List<ProbeWindow>();
@@ -280,10 +455,20 @@ class ProbeAccount
                     || w.ResetEpoch.Value <= 0 || w.ResetEpoch.Value > now)
                 { outList.Add(w); continue; }
                 ProbeWindow full = w.Copy();
-                full.Remaining = 100.0;
-                full.ResetEpoch = null;     // "resets in -4m" is not a thing
-                full.GatedBy = null;
-                full.AssumedFull = true;
+                if (w.IsExpiry)
+                {
+                    full.Remaining = 0.0;
+                    full.ResetEpoch = null;
+                    full.GatedBy = "expired";
+                    full.AssumedFull = false;
+                }
+                else
+                {
+                    full.Remaining = 100.0;
+                    full.ResetEpoch = null;     // "resets in -4m" is not a thing
+                    full.GatedBy = null;
+                    full.AssumedFull = true;
+                }
                 outList.Add(full);
             }
             return outList;
@@ -340,6 +525,111 @@ class ProbeAccount
             return GateWindows(ApplyElapsedResets(windows, now));
         }
 
+        public static AccountAvailability ComputeAvailability(List<WindowData> windows, List<ReservePool> reserves)
+        {
+            var av = new AccountAvailability();
+            if (windows != null)
+            {
+                bool foundRegular = false;
+                av.RegularAvailable = true;
+                foreach (WindowData w in windows)
+                {
+                    if (w.Group.Length != 0) continue;
+                    foundRegular = true;
+                    if (!w.Available || w.Rem <= 0 || w.GatedBy != null) av.RegularAvailable = false;
+                }
+                av.RegularAvailable = foundRegular && av.RegularAvailable;
+            }
+            if (reserves != null)
+            {
+                foreach (ReservePool r in reserves)
+                {
+                    if (r.Family == "generic_gpt" && r.IsUsable) av.GenericReserveAvailable = true;
+                    if (r.Family == "luna" && r.IsUsable) av.LunaReserveAvailable = true;
+                }
+            }
+            if (windows != null)
+            {
+                foreach (WindowData w in windows)
+                {
+                    if (w.GroupLabel == "gpt-reserve" && w.Available && w.Rem > 0 && w.GatedBy == null)
+                        av.GenericReserveAvailable = true;
+                    if (w.GroupLabel == "luna-reserve" && w.Available && w.Rem > 0 && w.GatedBy == null)
+                        av.LunaReserveAvailable = true;
+                }
+            }
+            av.EffectiveLunaAvailable = av.RegularAvailable || av.LunaReserveAvailable;
+            av.EffectiveGptAvailable = av.RegularAvailable || av.GenericReserveAvailable;
+
+            if (av.RegularAvailable) av.LunaStatusReason = "normal quota";
+            else if (av.LunaReserveAvailable) av.LunaStatusReason = "reserve-backed (luna-reserve)";
+            else
+            {
+                bool hasExhaustedLuna = false;
+                if (reserves != null)
+                    foreach (ReservePool r in reserves)
+                        if (r.Family == "luna") { hasExhaustedLuna = true; break; }
+                if (!hasExhaustedLuna && windows != null)
+                    foreach (WindowData w in windows)
+                        if (w.GroupLabel == "luna-reserve") { hasExhaustedLuna = true; break; }
+                av.LunaStatusReason = hasExhaustedLuna ? "luna-reserve exhausted" : "exhausted";
+            }
+            return av;
+        }
+
+        public static AccountAvailability ComputeAvailability(List<ProbeWindow> windows, List<ReservePool> reserves)
+        {
+            var av = new AccountAvailability();
+            if (windows != null)
+            {
+                bool foundRegular = false;
+                av.RegularAvailable = true;
+                foreach (ProbeWindow w in Resolve(windows, Stamp.Now))
+                {
+                    if (w.Group.Length != 0) continue;
+                    foundRegular = true;
+                    if (!w.Available || !w.Remaining.HasValue || w.Remaining.Value <= ZeroRemaining || w.GatedBy != null)
+                        av.RegularAvailable = false;
+                }
+                av.RegularAvailable = foundRegular && av.RegularAvailable;
+            }
+            if (reserves != null)
+            {
+                foreach (ReservePool r in reserves)
+                {
+                    if (r.Family == "generic_gpt" && r.IsUsable) av.GenericReserveAvailable = true;
+                    if (r.Family == "luna" && r.IsUsable) av.LunaReserveAvailable = true;
+                }
+            }
+            if (windows != null)
+            {
+                foreach (ProbeWindow w in windows)
+                {
+                    if (w.GroupLabel == "gpt-reserve" && w.Available && w.Remaining.HasValue && w.Remaining.Value > ZeroRemaining && w.GatedBy == null)
+                        av.GenericReserveAvailable = true;
+                    if (w.GroupLabel == "luna-reserve" && w.Available && w.Remaining.HasValue && w.Remaining.Value > ZeroRemaining && w.GatedBy == null)
+                        av.LunaReserveAvailable = true;
+                }
+            }
+            av.EffectiveLunaAvailable = av.RegularAvailable || av.LunaReserveAvailable;
+            av.EffectiveGptAvailable = av.RegularAvailable || av.GenericReserveAvailable;
+
+            if (av.RegularAvailable) av.LunaStatusReason = "normal quota";
+            else if (av.LunaReserveAvailable) av.LunaStatusReason = "reserve-backed (luna-reserve)";
+            else
+            {
+                bool hasExhaustedLuna = false;
+                if (reserves != null)
+                    foreach (ReservePool r in reserves)
+                        if (r.Family == "luna") { hasExhaustedLuna = true; break; }
+                if (!hasExhaustedLuna && windows != null)
+                    foreach (ProbeWindow w in windows)
+                        if (w.GroupLabel == "luna-reserve") { hasExhaustedLuna = true; break; }
+                av.LunaStatusReason = hasExhaustedLuna ? "luna-reserve exhausted" : "exhausted";
+            }
+            return av;
+        }
+
         // Flatten to what the window/tray draw with. `Rem` is ALWAYS remaining.
         public static AccountData Flatten(ProbeAccount acc, double now)
         {
@@ -347,6 +637,8 @@ class ProbeAccount
             {
                 Provider = acc.Provider, ProviderLabel = acc.ProviderLabel, Name = acc.Name,
                 SourceId = acc.SourceId, ResetHome = acc.ResetHome,
+                RemoteAccountIdentity = acc.RemoteAccountIdentity,
+                RemoteIdentityChecked = acc.RemoteIdentityChecked,
                 Status = acc.Status, Plan = acc.Plan, Error = acc.Error,
                 Ok = acc.Ok, Quiet = acc.Quiet,
             };
@@ -357,11 +649,29 @@ class ProbeAccount
                 ad.ResetCreditExpires = Stamp.Iso(acc.Credits.ExpiresEpoch);
                 ad.ResetCreditId = acc.Credits.Id;
             }
+            // Absolute balances ride the account untouched: an amount with no
+            // denominator is copied as fact, never converted to a percent.
+            if (acc.Balances != null)
+                foreach (BalanceData b in acc.Balances)
+                    ad.Balances.Add(b);
+            // W2-003: an unverified reset (journal refusal inside the grace)
+            // must not be carried forward as the stale blocked card — the
+            // reset EVENT lives on this very snapshot.
+            ad.ResetUnverified = acc.UnverifiedReset;
             foreach (ProbeWindow w in Resolve(acc.Windows, now))
             {
-                int rem = 0;
-                if (w.Remaining.HasValue)
-                    rem = (int)Math.Round(Math.Max(0.0, Math.Min(100.0, w.Remaining.Value)));
+                // CORE-002: a window that cannot state a number is NOT a window
+                // at 0%. `Rem` is an int with no "unknown", so `Available` is
+                // what carries the difference — the same shape
+                // ProbeWindow.Unavailable already has. A vendor that answers
+                // with a window but no percentage (Codex omitting usedPercent,
+                // Zcode omitting both remaining and percentage) would otherwise
+                // read as fully spent: drawn as 0%, counted as a reading so the
+                // last good numbers are NOT carried forward, and low enough to
+                // arm a low-quota alert on a number no vendor ever sent.
+                bool readable = w.Remaining.HasValue;
+                int rem = readable
+                    ? (int)Math.Round(Math.Max(0.0, Math.Min(100.0, w.Remaining.Value))) : 0;
                 ad.Windows.Add(new WindowData
                 {
                     Key = w.Key,
@@ -369,24 +679,104 @@ class ProbeAccount
                     Label = Label(w.Key),
                     Group = w.Group ?? "",
                     GroupLabel = w.GroupLabel ?? "",
-                    Available = w.Available,
+                    Available = w.Available && readable,
                     Rem = rem,
+                    // CORE-013: the absolute instant IS the authority and rides
+                    // through Flatten untouched; the local string is display
+                    // only. Cycle checks, countdowns and notification keys read
+                    // the epoch, never a reparse of this rendering.
+                    ResetEpoch = w.ResetEpoch,
                     Reset = Stamp.Iso(w.ResetEpoch),
                     GatedBy = w.GatedBy,
                     AssumedFull = w.AssumedFull,
                     DurationMinutes = w.DurationMinutes.HasValue ? w.DurationMinutes.Value : 0,
                 });
             }
+            if (acc.Reserves != null)
+            {
+                foreach (var r in acc.Reserves)
+                {
+                    var rc = r.Copy();
+                    if (rc.IsExpiry && rc.ResetEpoch.HasValue && rc.ResetEpoch.Value <= now)
+                    {
+                        rc.Remaining = 0.0;
+                        rc.GatedBy = "expired";
+                    }
+                    ad.Reserves.Add(rc);
+                }
+            }
+            ad.Availability = ComputeAvailability(ad.Windows, ad.Reserves);
             return ad;
         }
     }
 
-    // ── vendor CLI plumbing ──────────────────────────────────────────────────
+    // NOTE (SRC-009): reserve detection and presentation end here. A
+    // reserve-aware MODEL/ACCOUNT ROUTER was drafted here and deleted: LIMISAW
+    // has no production operation that selects an account or a model -- the
+    // user picks an account, and Connections starts the vendor's own visible
+    // sign-in. Routing belongs to whatever consumer actually performs
+    // dispatch; inventing a caller here would make dead code look live.
+    // `ReservePool.SupportsModel` is the upstream-evidence eligibility check
+    // that consumer should use.
+
+    // в”Ђв”Ђ vendor CLI plumbing в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     // Nothing here ever installs anything. `Tools` is data: the exact command,
     // its publisher and where it lands, so the UI can show it and let the user
     // decide. Piping a remote script into a shell must never be implicit.
     static class Cli
     {
+        // PERF-007/R030: bounded CLI output. A status-line CLI's output is a
+        // few kilobytes; these caps give generous headroom. The stderr bound
+        // counts OBSERVED bytes (the retained diagnostic is the first line
+        // only), so a pathological child cannot grow the retained buffer.
+        public const int ClaudeCliMaxStdout = 2 * 1024 * 1024;
+        public const int ClaudeCliMaxStderr = 512 * 1024;
+        // PERF-007/R030: bounded retention. The child may emit anything; the
+        // parent retains a bounded window and keeps draining the pipe even
+        // after the cap is exceeded (stopping is how a parent deadlocks a
+        // child on a full buffer). stdout retains up to its cap of lines and
+        // marks itself Oversized past that; stderr retains only the FIRST
+        // meaningful line (the 160-char user diagnostic) plus a total-bytes
+        // counter that turns Oversized past its own bound. Both are locked,
+        // because the async stdout/stderr callbacks race.
+        class BoundedCapture
+        {
+            readonly int cap;
+            readonly bool firstLineOnly;
+            readonly object gate = new object();
+            readonly StringBuilder buf = new StringBuilder();
+            long observed;
+            bool firstLineTaken;
+            public bool Oversized { get; private set; }
+            public string Text { get { lock (gate) return buf.ToString(); } }
+
+            public BoundedCapture(int capChars, bool firstLineOnly)
+            { this.cap = capChars; this.firstLineOnly = firstLineOnly; }
+
+            public void Append(string line)
+            {
+                if (line == null) return;
+                lock (gate)
+                {
+                    observed += line.Length + 1;
+                    if (firstLineOnly)
+                    {
+                        if (!firstLineTaken && line.Trim().Length > 0)
+                        {
+                            firstLineTaken = true;
+                            string first = line.Trim();
+                            buf.Append(first.Length > 160 ? first.Substring(0, 160) : first);
+                        }
+                        if (observed > cap) Oversized = true;
+                        return;                    // continue draining: the callback returns, the pipe stays open
+                    }
+                    if (Oversized) return;         // drain, never retain more
+                    if (buf.Length + line.Length + 1 > cap) { Oversized = true; return; }
+                    buf.AppendLine(line);
+                }
+            }
+        }
+
         public class Tool
         {
             public string Key = "", Binary = "", Label = "";
@@ -428,13 +818,29 @@ class ProbeAccount
         // PATH first, then the installer's own directory: a CLI installed while
         // LIMISAW runs is NOT on this process's PATH (Windows hands every
         // process a snapshot at launch), so a PATH-only lookup would keep
+        // Test seam: the PATH the resolver walks. Production reads the process
+        // environment (declared null-shaped default below); a harness replaces
+        // it so CLI discovery is deterministic without touching this process's
+        // real environment. The connection adapters resolve the LOGIN/VERIFY
+        // binary through this same seam.
+        internal static Func<string> ResolvePathOverride = null;
+
         // reporting "not installed" until the app restarts.
         public static string Resolve(string key)
         {
             Tool tool = Find(key);
+            // PERF-003 (SRC-006:R020): inside a built discovery generation the
+            // executable comes from the snapshot — provider probes, Cli.Status
+            // and the projection share ONE resolution per generation.
+            if (ResolvePathOverride == null)
+            {
+                string snap = ExecutableDiscovery.SnapshotResolved(key);
+                if (snap != null) return snap;
+            }
+            ExecutableDiscovery.ResolveWalks++;
             string binary = tool != null ? tool.Binary : key;
             string[] exts = { ".exe", ".cmd", ".bat", "" };
-            string path = Environment.GetEnvironmentVariable("PATH") ?? "";
+            string path = ResolvePathOverride != null ? ResolvePathOverride() : Environment.GetEnvironmentVariable("PATH") ?? "";
             foreach (string dir in path.Split(Path.PathSeparator))
             {
                 if (dir.Length == 0) continue;
@@ -461,31 +867,73 @@ class ProbeAccount
             public string Stdout = "", Error = "";
         }
 
+        internal static bool IsBatchShim(string exe)
+        {
+            string ext = Path.GetExtension(exe ?? "");
+            return ext.Equals(".cmd", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".bat", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static string BatchShellArgs(string shim, string inner)
+        {
+            return "/d /s /c \" " + Quote(shim) + (inner.Length > 0 ? " " + inner : "") + " \"";
+        }
+
         // Run a CLI under an absolute deadline. Never throws, never blocks past
-        // the deadline, never opens a console window, never goes through a
-        // shell (so no argument can be reinterpreted).
+        // the deadline, never opens a console window. Batch shims (.cmd/.bat)
+        // are routed through ComSpec so npm-style launchers are launchable.
         public static Result Run(string exe, string[] args, double deadline, string cwd)
+        {
+            return Run(exe, args, deadline, cwd, null);
+        }
+
+        // `env` scopes the CHILD to one account: a value sets the variable, a
+        // null value removes it. This process's own environment is never
+        // touched, so two homes can be probed by two children - including at the
+        // same time - without either one seeing the other's identity.
+        public static Result Run(string exe, string[] args, double deadline, string cwd,
+            IDictionary<string, string> env)
         {
             var res = new Result();
             double remaining = deadline - Stamp.Now;
             if (remaining <= 0.1) { res.Error = "deadline_exceeded"; return res; }
-            var psi = new ProcessStartInfo(exe)
+            string inner = "";
+            foreach (string a in args) inner += (inner.Length > 0 ? " " : "") + Quote(a);
+            bool batch = IsBatchShim(exe);
+            var psi = new ProcessStartInfo(batch ? (Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe") : exe)
             {
                 UseShellExecute = false, CreateNoWindow = true,
                 RedirectStandardOutput = true, RedirectStandardError = true,
                 StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8,
+                Arguments = batch ? BatchShellArgs(exe, inner) : inner,
             };
-            foreach (string a in args) psi.Arguments += (psi.Arguments.Length > 0 ? " " : "") + Quote(a);
             if (!string.IsNullOrEmpty(cwd) && Directory.Exists(cwd)) psi.WorkingDirectory = cwd;
+            if (env != null)
+                foreach (KeyValuePair<string, string> pair in env)
+                {
+                    if (pair.Value == null) psi.EnvironmentVariables.Remove(pair.Key);
+                    else psi.EnvironmentVariables[pair.Key] = pair.Value;
+                }
             Process proc = null;
+            // One job per invocation: proc.Kill() ends this process only, so a
+            // vendor helper or grandchild would outlive the timeout and stack up
+            // across retries. Disposing the scope ends the whole tree, and its
+            // kill-on-close handle does the same if the app dies mid-sweep.
+            ChildSweeper.Scope scope = ChildSweeper.Open();
             try
             {
-                var stdout = new StringBuilder();
-                var stderr = new StringBuilder();
+                // PERF-007/R030: retained output is BOUNDED — stdout keeps up
+                // to its cap of retained lines, stderr keeps only the first
+                // diagnostic line, and BOTH keep draining the pipe after the
+                // cap is exceeded (stopping is the one way to deadlock the
+                // child on a full buffer).
+                var stdout = new BoundedCapture(ClaudeCliMaxStdout, false);
+                var stderr = new BoundedCapture(ClaudeCliMaxStderr, true);
                 proc = Process.Start(psi);
                 if (proc == null) { res.Error = "could not start " + Path.GetFileName(exe); return res; }
-                proc.OutputDataReceived += (s, e) => { if (e.Data != null) stdout.AppendLine(e.Data); };
-                proc.ErrorDataReceived += (s, e) => { if (e.Data != null) stderr.AppendLine(e.Data); };
+                scope.Adopt(proc);
+                proc.OutputDataReceived += (s, e) => { if (e.Data != null) stdout.Append(e.Data); };
+                proc.ErrorDataReceived += (s, e) => { if (e.Data != null) stderr.Append(e.Data); };
                 proc.BeginOutputReadLine();
                 proc.BeginErrorReadLine();
                 int budget = (int)Math.Max(100, Math.Min(remaining, 60.0) * 1000);
@@ -496,31 +944,40 @@ class ProbeAccount
                     return res;
                 }
                 proc.WaitForExit();     // flush the async readers
-                res.Stdout = stdout.ToString();
+                // R030: the cap exists BEYOND the diagnostic truncation.
+                if (stdout.Oversized || stderr.Oversized) { res.Error = "response_too_large"; return res; }
+                res.Stdout = stdout.Text;
                 if (proc.ExitCode != 0)
                 {
                     // stderr can carry an auth hint ("Not logged in"); that is a
                     // vendor message about the user's own account, never a secret.
-                    string first = "";
-                    foreach (string line in stderr.ToString().Split('\n'))
-                        if (line.Trim().Length > 0) { first = line.Trim(); break; }
-                    res.Error = first.Length > 0
-                        ? (first.Length > 160 ? first.Substring(0, 160) : first)
-                        : "exit " + proc.ExitCode;
+                    // The bounded stderr capture already owns the first line, so
+                    // there is no need to split and search.
+                    res.Error = stderr.Text.Length > 0 ? stderr.Text : "exit " + proc.ExitCode;
                     return res;
                 }
                 res.Ok = true;
                 return res;
             }
             catch (Exception ex) { res.Error = ex.GetType().Name; return res; }
-            finally { if (proc != null) proc.Dispose(); }
+            finally
+            {
+                if (proc != null) proc.Dispose();
+                scope.Dispose();   // ends the tree; a clean exit already left it empty
+            }
         }
 
-        static string Quote(string arg)
+        internal static string Quote(string arg)
         {
-            if (arg.Length > 0 && arg.IndexOfAny(new[] { ' ', '\t', '"' }) < 0) return arg;
+            // Quoting also arms the cmd interpreter for the batch-shim route: a
+            // bare `&`/`|`/`<`/`>`/`^`/`(`/`)` would be a command operator there,
+            // never an argument. Quoting them is harmless for direct .exe starts.
+            if (arg.Length > 0 && arg.IndexOfAny(QuoteChars) < 0) return arg;
             return "\"" + arg.Replace("\"", "\\\"") + "\"";
         }
+
+        internal static readonly char[] QuoteChars =
+            { ' ', '\t', '"', '&', '|', '<', '>', '^', '(', ')', '%' };
 
         // The pipeline that goes INSIDE one PowerShell session: OpenAI publishes
         // its command already wrapped in `powershell -c "..."`, and the UI must
@@ -546,12 +1003,235 @@ class ProbeAccount
         }
     }
 
-    // ── Codex: structured usage over the app-server's JSON-RPC ───────────────
+    // в”Ђв”Ђ Codex: structured usage over the app-server's JSON-RPC в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     // `codex app-server --stdio`, one child per CODEX_HOME, windows mapped by
     // their reported duration and never by primary/secondary position. A
     // missing bucket stays unavailable; it is never faked as zero.
     static class CodexSource
     {
+        static readonly object IdentityGate = new object();
+        static readonly Dictionary<string, string> KnownRemote = new Dictionary<string, string>();
+        static readonly HashSet<string> PendingDistinct = new HashSet<string>();
+        static readonly Dictionary<string, string> PendingAuthRevision = new Dictionary<string, string>();
+        static readonly HashSet<string> KnownDuplicateHomes = new HashSet<string>();
+        static readonly Dictionary<string, string> AuthRevisions = new Dictionary<string, string>();
+
+        internal static void AwaitDistinctAccount(string homeId, string home)
+        {
+            string revision = AuthRevision(home);
+            lock (IdentityGate)
+            {
+                PendingDistinct.Add(homeId);
+                PendingAuthRevision[homeId] = revision;
+            }
+        }
+        internal static void CancelDistinctAccount(string homeId)
+        {
+            lock (IdentityGate)
+            {
+                PendingDistinct.Remove(homeId);
+                PendingAuthRevision.Remove(homeId);
+            }
+        }
+        internal static bool LoginChangedAuth(string homeId, string home)
+        {
+            string current = AuthRevision(home);
+            lock (IdentityGate)
+            {
+                string before;
+                return !PendingAuthRevision.TryGetValue(homeId, out before) || current != before;
+            }
+        }
+        internal static bool IsKnownDuplicateHome(string homeId)
+        { lock (IdentityGate) return KnownDuplicateHomes.Contains(homeId); }
+
+        // A duplicate found by interactive verification, before the next sweep
+        // recomputes the set. Without this the retry path would have no home to
+        // reuse until a refresh happened to run.
+        internal static void MarkDuplicateHome(string homeId)
+        { lock (IdentityGate) { if (!string.IsNullOrEmpty(homeId)) KnownDuplicateHomes.Add(homeId); } }
+
+        // A home that just verified as a DISTINCT remote account is not a
+        // duplicate any more, whatever an earlier attempt in the same home was.
+        internal static void ClearDuplicateHome(string homeId)
+        { lock (IdentityGate) KnownDuplicateHomes.Remove(homeId); }
+
+        internal static string KnownRemoteIdentity(string homeId)
+        { lock (IdentityGate) { string value; return KnownRemote.TryGetValue(homeId, out value) ? value : ""; } }
+
+        // The installed app-server v2 schema describes accountId as the
+        // backend account associated with this usage snapshot. A nullable ID
+        // is not evidence that two homes differ. account/read's ChatGPT email
+        // is a lower-strength fallback; only its hash crosses this boundary.
+        internal static string RemoteIdentity(object rateLimitResult, object accountReadResult)
+        {
+            string id = J.Str(J.Get(rateLimitResult, "accountId"));
+            if (!string.IsNullOrWhiteSpace(id)) return IdentityDigest("account:", id.Trim());
+            object account = J.Get(accountReadResult, "account");
+            if (J.Str(J.Get(account, "type")) != "chatgpt") return "";
+            string email = J.Str(J.Get(account, "email"));
+            if (string.IsNullOrWhiteSpace(email)) return "";
+            return IdentityDigest("email:", email.Trim().ToLowerInvariant());
+        }
+
+        static string IdentityDigest(string kind, string value)
+        {
+            byte[] hash = System.Security.Cryptography.SHA256.Create()
+                .ComputeHash(System.Text.Encoding.UTF8.GetBytes(kind + value));
+            var sb = new System.Text.StringBuilder(kind.Length + 64);
+            sb.Append(kind);
+            foreach (byte b in hash) sb.Append(b.ToString("x2"));
+            return sb.ToString();
+        }
+
+        internal static List<ProbeAccount> DistinctRemoteAccounts(List<ProbeAccount> homes,
+            List<string> duplicates, List<string> unverified)
+        {
+            var owners = new HashSet<string>(StringComparer.Ordinal);
+            var ownerKinds = new HashSet<string>(StringComparer.Ordinal);
+            var usable = new List<ProbeAccount>();
+            bool codexPublished = false, publishedUnknown = false;
+            lock (IdentityGate)
+            {
+                KnownDuplicateHomes.Clear();
+                foreach (ProbeAccount home in homes)
+                {
+                    if (home.Provider != "codex") { usable.Add(home); continue; }
+                    string remote = home.RemoteAccountIdentity ?? "";
+                    if (remote.Length > 0 && owners.Contains(remote))
+                    {
+                        duplicates.Add(home.SourceId);
+                        KnownDuplicateHomes.Add(home.SourceId);
+                        continue;
+                    }
+                    if (PendingDistinct.Contains(home.SourceId)
+                        && !LoginChangedAuth(home.SourceId, home.ResetHome))
+                    {
+                        unverified.Add(home.SourceId);
+                        continue;
+                    }
+                    if (remote.Length == 0)
+                    {
+                        unverified.Add(home.SourceId);
+                        // Keep one local home visible with an explicit
+                        // unverified note. A second unreadable home cannot be
+                        // asserted as an independent remote account.
+                        if (codexPublished || PendingDistinct.Contains(home.SourceId)) continue;
+                        publishedUnknown = true;
+                    }
+                    else
+                    {
+                        string kind = remote.Substring(0, remote.IndexOf(':'));
+                        if (publishedUnknown || (ownerKinds.Count > 0 && !ownerKinds.Contains(kind)))
+                        {
+                            // An accountId and an email hash cannot be
+                            // compared. Keep the home local, report it as
+                            // unverified, and avoid claiming a second card.
+                            unverified.Add(home.SourceId);
+                            continue;
+                        }
+                        owners.Add(remote);
+                        ownerKinds.Add(kind);
+                        CancelDistinctAccount(home.SourceId);
+                    }
+                    usable.Add(home);
+                    codexPublished = true;
+                }
+            }
+            return usable;
+        }
+
+        internal static void RememberRemoteIdentity(string homeId, string remote)
+        {
+            lock (IdentityGate)
+            {
+                if (!string.IsNullOrEmpty(remote)) KnownRemote[homeId] = remote;
+                else KnownRemote.Remove(homeId);
+            }
+        }
+
+        // A re-login can replace auth.json while an app-server is warm. The
+        // file's metadata, never its contents, invalidates that home session
+        // so the next read cannot report the previous browser identity.
+        internal static void RefreshAuthSession(string home)
+        {
+            string id = HomeId(home);
+            string revision = AuthRevision(home);
+            bool changed = false;
+            lock (IdentityGate)
+            {
+                string old;
+                if (AuthRevisions.TryGetValue(id, out old) && old != revision)
+                {
+                    changed = true;
+                    KnownRemote.Remove(id);
+                }
+                AuthRevisions[id] = revision;
+            }
+            if (changed) Pool.EvictHome(home);
+        }
+
+        static string AuthRevision(string home)
+        {
+            try
+            {
+                var file = new FileInfo(Path.Combine(home, "auth.json"));
+                if (file.Exists) return file.Length.ToString() + ":" + file.LastWriteTimeUtc.Ticks.ToString();
+            }
+            catch { }
+            return "missing";
+        }
+
+        // A newly authenticated home is publishable only after every other
+        // authenticated home has a comparable vendor identity. Unknown is not
+        // "distinct". The caller distinguishes duplicate from still waiting.
+        internal static bool IsDistinctFromKnownHomes(string homeId, string remote, out bool duplicate)
+        {
+            duplicate = false;
+            if (string.IsNullOrEmpty(remote)) return false;
+            bool unknown = false;
+            List<CodexHome> homes = Homes();
+            foreach (CodexHome home in homes)
+                if (home.Id != homeId) RefreshAuthSession(home.Path);
+            lock (IdentityGate)
+            {
+                foreach (CodexHome home in homes)
+                {
+                    if (home.Id == homeId) continue;
+                    string other;
+                    if (!KnownRemote.TryGetValue(home.Id, out other) || other.Length == 0)
+                    { unknown = true; continue; }
+                    if (other == remote) duplicate = true;
+                    else if (other.Substring(0, other.IndexOf(':')) != remote.Substring(0, remote.IndexOf(':'))) unknown = true;
+                }
+            }
+            return !duplicate && !unknown;
+        }
+        // PERF-001: a cold `codex app-server` answers `initialize` only after a
+        // measured 14-19 s (ProbeAntigravity records the observation), so a
+        // cold attempt granted less than the LOW end of that range is a
+        // scheduled failure, not a fast one. 14.0 is the proven floor, not the
+        // observed maximum — a home that cannot receive a viable slice is
+        // returned as stale instead of being handed a doomed budget.
+        public const double ColdStartFloorSeconds = 14.0;
+
+        // PERF-001 cross-sweep cold fairness: the index of the cold home that
+        // receives the first viable attempt of the next sweep. Advancing by
+        // the number of homes served is what rotates the queue: two viable
+        // starts per sweep over five cold homes reaches every one of them in
+        // three sweeps, and no cold home monopolizes the budget.
+        internal static int ColdCursor;
+
+        // PERF-001 scheduling clock seam. The scheduler must read the same
+        // clock the fake session harness advances, so a fake cold start
+        // consumes virtual seconds no real timer can produce deterministically.
+        // Production leaves it null and reads the real Stamp.Now.
+        internal static Func<double> Clock = null;
+        static double NowS() { Func<double> c = Clock; return c != null ? c() : Stamp.Now; }
+
+        // PERF-001: reset only by tests; production state is the process.
+        internal static void ResetScheduling() { ColdCursor = 0; }
+
         public static List<ProbeAccount> Sweep(double deadline, double perAccount)
         {
             // CORE-003: discovery is separated from probing. The full target
@@ -568,19 +1248,87 @@ class ProbeAccount
             var liveKeys = new List<string>();
             foreach (CodexHome h in homes) liveKeys.Add(SessionPool.Key(h.Path));
             Pool.RetainOnly(liveKeys);
-            double remaining = deadline - Stamp.Now;
-            double slice = Math.Min(perAccount, remaining / Math.Max(1, homes.Count));
-            var accounts = new List<ProbeAccount>();
-            foreach (CodexHome home in homes)
+
+            // PERF-001: warm and cold homes are different jobs. A warm home
+            // needs one cheap rateLimits read; a cold home needs at least
+            // ColdStartFloorSeconds before `initialize` can possibly answer.
+            // Equal subdivision gives every home a slice below that floor the
+            // moment there are several homes — every attempt doomed, no
+            // account initialized. Warm work goes first (cheap, responsive,
+            // and it may leave MORE time for the cold queue), then each cold
+            // home receives a full viable slice only while the provider's own
+            // deadline still affords one; the rest are returned as stale slots
+            // without launching a doomed process. The cursor starts where the
+            // previous sweep's served count left the queue, so the cold homes
+            // that missed out are first in line next time.
+            // PERF-001: warm and cold homes are different jobs. A warm home
+            // needs one cheap rateLimits read; a cold home needs at least
+            // ColdStartFloorSeconds before `initialize` can possibly answer.
+            // Equal subdivision gives every home a slice below that floor the
+            // moment there are several homes — every attempt doomed, no
+            // account initialized. Warm work goes first (cheap, responsive,
+            // and it may leave MORE time for the cold queue), then each cold
+            // home receives a full viable slice only while the provider's own
+            // deadline still affords one; the rest are returned as stale slots
+            // without launching a doomed process. The cursor starts where the
+            // previous sweep's served count left the queue, so the cold homes
+            // that missed out are first in line next time.
+            var warm = new List<CodexHome>();
+            var cold = new List<CodexHome>();
+            foreach (CodexHome h in homes)
+                if (Pool.IsWarm(h.Path)) warm.Add(h); else cold.Add(h);
+            if (cold.Count == 0) ColdCursor = 0;
+            else if (ColdCursor >= cold.Count) ColdCursor %= cold.Count;
+
+            var results = new Dictionary<string, ProbeAccount>(homes.Count);
+
+            foreach (CodexHome home in warm)
             {
-                double start = Stamp.Now;
+                double start = NowS();
                 if (start >= deadline)
                 {
-                    accounts.Add(Unreadable(home, "deadline_exceeded", "sweep time ran out before this home could be probed"));
+                    results[home.Id] = Unreadable(home, "deadline_exceeded",
+                        "sweep time ran out before this home could be probed");
                     continue;
                 }
-                accounts.Add(Probe(home.Path, home.Name, home.Id, start + Math.Min(slice, deadline - start)));
+                results[home.Id] = Probe(home.Path, home.Name, home.Id,
+                    start + Math.Min(perAccount, deadline - start));
             }
+
+            int served = 0;
+            for (int i = 0; i < cold.Count; i++)
+            {
+                CodexHome home = cold[(ColdCursor + i) % cold.Count];
+                double start = NowS();
+                double left = deadline - start;
+                if (left < ColdStartFloorSeconds)
+                {
+                    // Not a failure of this home: a launch the remaining time
+                    // cannot carry would burn the budget and still read as
+                    // timeout. Stale keeps the last good windows visible.
+                    results[home.Id] = Unreadable(home, "cold_start_underfunded",
+                        "not enough sweep time left for a viable cold start — "
+                        + "later sweeps rotate this home back in");
+                    continue;
+                }
+                // A cold attempt gets the FULL viable slice: the measured
+                // floor plus whatever the per-account cap allows, never a
+                // fraction of what initialization alone already costs.
+                double budget = Math.Min(perAccount, left);
+                double end = start + budget;
+                results[home.Id] = Probe(home.Path, home.Name, home.Id, end);
+                served++;
+                // The virtual clock the fake harness advances consumed the
+                // budget; the real clock did the same by waiting.
+                start = NowS();
+                if (start >= end) continue;
+            }
+            ColdCursor = cold.Count > 0 ? (ColdCursor + served) % cold.Count : 0;
+
+            // Core discovery order, so card ordering never depends on how the
+            // scheduler classified the homes.
+            var accounts = new List<ProbeAccount>(homes.Count);
+            foreach (CodexHome h in homes) accounts.Add(results[h.Id]);
             return accounts;
         }
 
@@ -621,7 +1369,7 @@ class ProbeAccount
                 for (int j = 0; j < homes.Count; j++)
                     if (homes[j].Name == homes[i].Name) matches++;
                 if (matches < 2) continue;
-                string trailing = " · " + Path.GetFileName(homes[i].Path.TrimEnd('\\', '/'));
+                string trailing = " В· " + Path.GetFileName(homes[i].Path.TrimEnd('\\', '/'));
                 if (!homes[i].Name.EndsWith(trailing))
                     homes[i].Name = homes[i].Name + trailing;
             }
@@ -649,8 +1397,11 @@ class ProbeAccount
                 found.Add(new CodexHome(full, name, HomeId(full)));
             };
 
-            add(Environment.GetEnvironmentVariable("CODEX_HOME"), "Codex");
             add(Path.Combine(profile, ".codex"), "Codex");
+            // The default home is the established account when an explicit
+            // CODEX_HOME happens to point at a later duplicate. Connection
+            // targeting still honours CODEX_HOME independently.
+            add(Environment.GetEnvironmentVariable("CODEX_HOME"), "Codex");
             string[] siblings;
             try { siblings = Directory.GetDirectories(profile, ".codex-*"); }
             catch { siblings = new string[0]; }
@@ -714,6 +1465,7 @@ class ProbeAccount
 
         static ProbeAccount Probe(string home, string name, string id, double deadline)
         {
+            RefreshAuthSession(home);
             string exe = ResolveExe("codex");
             if (exe.Length == 0) return Fail(name, id, home, "cli_not_installed", "Codex CLI not found on PATH");
             // PERF-001: the app-server of a stable home is REUSED across sweeps.
@@ -723,59 +1475,75 @@ class ProbeAccount
             // home (already initialized, so a warm sweep is one read), starts
             // a replacement only when the child died, and is the seam the
             // session harness drives without any real `codex` on the machine.
-            SessionPool.Entry entry = Pool.Checkout(home, exe);
-            if (entry == null) return Fail(name, id, home, "spawn_failed", "codex app-server did not start");
-            try
+            SessionPool.SessionLease lease = Pool.Checkout(home, exe, deadline);
+            if (lease == null) return Fail(name, id, home, "spawn_failed", "codex app-server did not start");
+            using (lease)
             {
-                if (!entry.InitDone)
+                SessionPool.Entry entry = lease.Entry;
+                try
                 {
-                    // Each call may use whatever is LEFT of the deadline. The
-                    // first app-server of a session pays a cold start (measured
-                    // 14-19s), so a fixed per-call cap threw away time the
-                    // caller had already granted and read as "this account is
-                    // broken".
-                    object init = entry.Link.Call("initialize", new Dictionary<string, object> {
-                        { "clientInfo", new Dictionary<string, object> { { "name", "limisaw" }, { "version", "1.0.0" } } },
-                        { "capabilities", null },
-                    }, deadline);
-                    if (init == null) { Pool.Drop(entry); return Fail(name, id, home, "timeout", "codex app-server did not answer initialize"); }
-                    if (J.Get(init, "error") != null) { Pool.Drop(entry); return Fail(name, id, home, "initialize_error", J.Write(J.Get(init, "error"))); }
-                    entry.Link.Notify("initialized", null);
-                    entry.InitDone = true;
-                }
-                object rl = entry.Link.Call("account/rateLimits/read", null, deadline);
-                if (rl == null) { Pool.Drop(entry); return Fail(name, id, home, "timeout", "codex app-server did not answer rateLimits"); }
-                if (J.Get(rl, "error") != null)
-                {
-                    // A structured error is a HEALTHY session answering for an
-                    // account in a state we do not like; the child stays warm.
-                    Pool.Checkin(entry);
-                    return Fail(name, id, home, "rate_limits_error", J.Write(J.Get(rl, "error")));
-                }
+                    if (!entry.InitDone)
+                    {
+                        // Each call may use whatever is LEFT of the deadline. The
+                        // first app-server of a session pays a cold start (measured
+                        // 14-19s), so a fixed per-call cap threw away time the
+                        // caller had already granted and read as "this account is
+                        // broken".
+                        object init = entry.Link.Call("initialize", new Dictionary<string, object> {
+                            { "clientInfo", new Dictionary<string, object> { { "name", "limisaw" }, { "version", "1.0.0" } } },
+                            { "capabilities", null },
+                        }, deadline);
+                        if (init == null) { lease.Retire(); return Fail(name, id, home, "timeout", "codex app-server did not answer initialize"); }
+                        if (J.Get(init, "error") != null) { lease.Retire(); return Fail(name, id, home, "initialize_error", J.Write(J.Get(init, "error"))); }
+                        entry.Link.Notify("initialized", null);
+                        entry.InitDone = true;
+                    }
+                    object rl = entry.Link.Call("account/rateLimits/read", null, deadline);
+                    if (rl == null) { lease.Retire(); return Fail(name, id, home, "timeout", "codex app-server did not answer rateLimits"); }
+                    if (J.Get(rl, "error") != null)
+                    {
+                        // A structured error is a HEALTHY session answering for an
+                        // account in a state we do not like; the child stays warm.
+                        return Fail(name, id, home, "rate_limits_error", J.Write(J.Get(rl, "error")));
+                    }
 
-                object result = J.Get(rl, "result") ?? new Dictionary<string, object>();
-                string plan;
-                List<ProbeWindow> windows = ParseWindows(result, out plan);
-                var acc = new ProbeAccount
-                {
-                    Provider = "codex", ProviderLabel = "Codex", Name = name,
-                    SourceId = id, ResetHome = home,
-                    Status = Model.OK, Ok = true, Plan = plan,
-                    // The same payload that carries the windows carries the
-                    // banked resets; reading one and dropping the other is how
-                    // "you have 1 reset available" stayed invisible here.
-                    Credits = ParseResetCredits(result),
-                };
-                if (windows.Count == 0)
-                {
-                    windows.Add(ProbeWindow.Unavailable(Model.FIVE_HOUR));
-                    windows.Add(ProbeWindow.Unavailable(Model.WEEKLY));
+                    object result = J.Get(rl, "result") ?? new Dictionary<string, object>();
+                    object accountRead = null;
+                    if (string.IsNullOrWhiteSpace(J.Str(J.Get(result, "accountId"))) && Stamp.Now < deadline)
+                    {
+                        object reply = entry.Link.Call("account/read", new Dictionary<string, object>(), deadline);
+                        if (reply != null && J.Get(reply, "error") == null)
+                            accountRead = J.Get(reply, "result");
+                    }
+                    string remoteIdentity = RemoteIdentity(result, accountRead);
+                    RememberRemoteIdentity(id, remoteIdentity);
+                    string plan;
+                    List<ReservePool> reserves;
+                    List<ProbeWindow> windows = ParseWindows(result, out plan, out reserves);
+                    var acc = new ProbeAccount
+                    {
+                        Provider = "codex", ProviderLabel = "Codex", Name = name,
+                        SourceId = id, ResetHome = home,
+                        RemoteAccountIdentity = remoteIdentity,
+                        RemoteIdentityChecked = true,
+                        Status = Model.OK, Ok = true, Plan = plan,
+                        // The same payload that carries the windows carries the
+                        // banked resets; reading one and dropping the other is how
+                        // "you have 1 reset available" stayed invisible here.
+                        Credits = ParseResetCredits(result),
+                        Reserves = reserves,
+                    };
+                    if (windows.Count == 0)
+                    {
+                        windows.Add(ProbeWindow.Unavailable(Model.FIVE_HOUR));
+                        windows.Add(ProbeWindow.Unavailable(Model.WEEKLY));
+                    }
+                    acc.Windows = windows;
+                    acc.Availability = Model.ComputeAvailability(windows, reserves);
+                    return acc;
                 }
-                acc.Windows = windows;
-                Pool.Checkin(entry);
-                return acc;
+                catch (Exception ex) { lease.Retire(); return Fail(name, id, home, "probe_exception", ex.GetType().Name + ": " + ex.Message); }
             }
-            catch (Exception ex) { Pool.Drop(entry); return Fail(name, id, home, "probe_exception", ex.GetType().Name + ": " + ex.Message); }
         }
 
         // Codex varies the window set by plan: Plus reports 300 (5h) + 10080
@@ -808,7 +1576,14 @@ class ProbeAccount
         // live window.
         public static List<ProbeWindow> ParseWindows(object result, out string plan)
         {
+            List<ReservePool> reserves;
+            return ParseWindows(result, out plan, out reserves);
+        }
+
+        public static List<ProbeWindow> ParseWindows(object result, out string plan, out List<ReservePool> reserves)
+        {
             plan = null;
+            reserves = new List<ReservePool>();
             var byKey = new Dictionary<string, ProbeWindow>();
             var order = new List<string>();
             object snap = J.Get(result, "rateLimits") ?? new Dictionary<string, object>();
@@ -829,18 +1604,126 @@ class ProbeAccount
             foreach (string side in new[] { "primary", "secondary" })
                 add("", "", J.Get(snap, side));
 
-            Dictionary<string, object> byId = J.Obj(J.Get(result, "rateLimitsByLimitId"));
-            if (byId != null)
-                foreach (KeyValuePair<string, object> pool in byId)
+            try
+            {
+                Dictionary<string, object> byId = J.Obj(J.Get(result, "rateLimitsByLimitId"));
+                if (byId != null)
                 {
-                    // The default pool appears here too, under its own id.
-                    if (pool.Key == mainId) continue;
-                    string label = (J.Str(J.Get(pool.Value, "limitName")) ?? "").Trim();
-                    if (label.Length == 0) label = pool.Key;
-                    string id = Regex.Replace(pool.Key.ToLowerInvariant(), "[^a-z0-9]+", "_").Trim('_');
-                    foreach (string side in new[] { "primary", "secondary" })
-                        add(id, label, J.Get(pool.Value, side));
+                    foreach (KeyValuePair<string, object> pool in byId)
+                    {
+                        if (pool.Value == null) continue;
+                        string poolLimitId = (J.Str(J.Get(pool.Value, "limitId")) ?? pool.Key).Trim();
+                        // The default pool appears here too, under its own id.
+                        if (poolLimitId == mainId || pool.Key == mainId) continue;
+
+                        string rawLimitName = (J.Str(J.Get(pool.Value, "limitName")) ?? "").Trim();
+                        string normalModelSlug = (J.Str(J.Get(pool.Value, "normalModelSlug")) ?? "").Trim();
+
+                        bool isLuna = normalModelSlug.IndexOf("luna", StringComparison.OrdinalIgnoreCase) >= 0
+                                   || rawLimitName.IndexOf("luna", StringComparison.OrdinalIgnoreCase) >= 0
+                                   || poolLimitId.IndexOf("luna", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                        bool isGenericGpt = !isLuna && (rawLimitName.IndexOf("gpt-reserve", StringComparison.OrdinalIgnoreCase) >= 0
+                                                    || poolLimitId.Equals("base_model_inference", StringComparison.OrdinalIgnoreCase)
+                                                    || rawLimitName.IndexOf("gpt", StringComparison.OrdinalIgnoreCase) >= 0);
+
+                        string family;
+                        string label;
+                        string groupId;
+
+                        if (isLuna)
+                        {
+                            family = "luna";
+                            label = "luna-reserve";
+                            groupId = "luna_reserve";
+                        }
+                        else if (isGenericGpt)
+                        {
+                            family = "generic_gpt";
+                            label = rawLimitName.Length > 0 ? rawLimitName : "gpt-reserve";
+                            groupId = "base_model_inference";
+                        }
+                        else
+                        {
+                            family = "unknown";
+                            label = rawLimitName.Length > 0 ? rawLimitName : pool.Key;
+                            groupId = Regex.Replace(pool.Key.ToLowerInvariant(), "[^a-z0-9]+", "_").Trim('_');
+                            if (groupId.Length == 0) groupId = "unknown_reserve";
+                        }
+
+                        object primary = J.Get(pool.Value, "primary");
+                        object secondary = J.Get(pool.Value, "secondary");
+
+                        double? resets = primary != null ? Stamp.Epoch(J.Get(primary, "resetsAt")) : (double?)null;
+                        double? expires = primary != null ? Stamp.Epoch(J.Get(primary, "expiresAt")) : (double?)null;
+                        bool isExpiry = expires.HasValue && !resets.HasValue;
+                        double? effectiveReset = resets ?? expires;
+
+                        double? dur = primary != null ? J.Num(J.Get(primary, "windowDurationMins")) : (double?)null;
+                        double? used = primary != null ? J.Num(J.Get(primary, "usedPercent")) : (double?)null;
+                        double? remaining = used.HasValue ? Math.Max(0.0, Math.Min(100.0, 100.0 - used.Value)) : (double?)null;
+
+                        bool allocated = primary != null && dur.HasValue;
+                        bool available = allocated && used.HasValue;
+
+                        var resPool = new ReservePool
+                        {
+                            Id = groupId,
+                            RawLimitId = poolLimitId,
+                            RawLimitName = rawLimitName,
+                            Family = family,
+                            Label = label,
+                            ModelSlug = normalModelSlug,
+                            DurationMinutes = dur.HasValue ? (int)Math.Round(dur.Value) : (int?)null,
+                            Remaining = remaining,
+                            ResetEpoch = effectiveReset,
+                            IsExpiry = isExpiry,
+                            Allocated = allocated,
+                            Available = available,
+                            EvidenceQuality = "app-server-ratelimits"
+                        };
+                        // Eligibility is upstream evidence only: the pool's own
+                        // normalModelSlug (plus any eligible-model metadata the
+                        // vendor actually sent). A family NAME is not evidence
+                        // that a reserve covers every model containing "gpt" or
+                        // "luna", so no list is fabricated here. Unknown reserve
+                        // types stay visible in the UI but are non-authoritative
+                        // for eligibility (ReservePool.SupportsModel returns
+                        // false for them).
+                        reserves.Add(resPool);
+
+                        if (allocated)
+                        {
+                            add(groupId, label, primary);
+                            if (secondary != null) add(groupId, label, secondary);
+                        }
+                        else
+                        {
+                            // Eligible without current allocation: produce an inactive row so UI shows `--`
+                            string unallocKey = Model.Qualified(Model.WEEKLY, groupId);
+                            var unallocWin = new ProbeWindow
+                            {
+                                Key = unallocKey,
+                                Group = groupId,
+                                GroupLabel = label,
+                                DurationMinutes = 10080,
+                                Available = false,
+                                Allocated = false,
+                                Remaining = null,
+                                ResetEpoch = effectiveReset,
+                                IsExpiry = isExpiry,
+                                Source = "app-server"
+                            };
+                            if (!byKey.ContainsKey(unallocKey))
+                            {
+                                byKey[unallocKey] = unallocWin;
+                                order.Add(unallocKey);
+                            }
+                        }
+                    }
                 }
+            }
+            catch { /* schema drift / malformed payload safety: regular windows remain intact */ }
 
             foreach (var candidate in candidates)
             {
@@ -852,15 +1735,20 @@ class ProbeAccount
                 string key = Model.Qualified(baseKey, pool);
                 if (byKey.ContainsKey(key)) continue;     // first match wins
                 double? used = J.Num(J.Get(w, "usedPercent"));
+                double? resets = Stamp.Epoch(J.Get(w, "resetsAt"));
+                double? expires = Stamp.Epoch(J.Get(w, "expiresAt"));
+                bool isExp = expires.HasValue && !resets.HasValue;
                 var win = new ProbeWindow
                 {
                     Key = key,
                     Group = pool,
                     GroupLabel = label,
                     DurationMinutes = dur.HasValue ? (int)Math.Round(dur.Value) : (int?)null,
-                    Available = true,
+                    Available = used.HasValue,
+                    Allocated = true,
                     Remaining = used.HasValue ? Math.Max(0.0, Math.Min(100.0, 100.0 - used.Value)) : (double?)null,
-                    ResetEpoch = Stamp.Epoch(J.Get(w, "resetsAt")),
+                    ResetEpoch = resets ?? expires,
+                    IsExpiry = isExp,
                     Source = "app-server",
                 };
                 byKey[key] = win;
@@ -948,35 +1836,47 @@ class ProbeAccount
             if (exe.Length == 0) return "Codex CLI not found on PATH";
             // The reset rides the SAME pooled session the sweep uses — starting
             // a second child to spend the credit would pay the cold start just
-            // to answer faster than the vendor needs.
-            SessionPool.Entry entry = Pool.Checkout(home, exe);
-            if (entry == null) return "codex app-server did not start";
-            try
+            // to answer faster than the vendor needs. W2-001: the irreversible
+            // consume holds the exclusive home lease from before initialization
+            // through final response classification, so no sweep, verify or
+            // eviction can kill this session mid-transaction.
+            SessionPool.SessionLease lease = Pool.Checkout(home, exe, deadline);
+            if (lease == null) return "codex app-server did not start";
+            using (lease)
             {
-                if (!entry.InitDone)
+                SessionPool.Entry entry = lease.Entry;
+                try
                 {
-                    object init = entry.Link.Call("initialize", new Dictionary<string, object> {
-                        { "clientInfo", new Dictionary<string, object> { { "name", "limisaw" }, { "version", "1.0.0" } } },
-                        { "capabilities", null },
-                    }, deadline);
-                    if (init == null) { Pool.Drop(entry); return "codex app-server did not answer initialize"; }
-                    if (J.Get(init, "error") != null) { Pool.Drop(entry); return Trim(J.Write(J.Get(init, "error"))); }
-                    entry.Link.Notify("initialized", null);
-                    entry.InitDone = true;
+                    if (!entry.InitDone)
+                    {
+                        object init = entry.Link.Call("initialize", new Dictionary<string, object> {
+                            { "clientInfo", new Dictionary<string, object> { { "name", "limisaw" }, { "version", "1.0.0" } } },
+                            { "capabilities", null },
+                        }, deadline);
+                        if (init == null) { lease.Retire(); return "codex app-server did not answer initialize"; }
+                        if (J.Get(init, "error") != null) { lease.Retire(); return Trim(J.Write(J.Get(init, "error"))); }
+                        entry.Link.Notify("initialized", null);
+                        entry.InitDone = true;
+                    }
+                    object res = entry.Link.Call("account/rateLimitResetCredit/consume", null, deadline);
+                    if (res == null)
+                    {
+                        // The request may have reached Codex; the outcome is
+                        // unknowable. Retire through the lease so no other
+                        // operation interleaves while this one is unwinding.
+                        lease.Retire();
+                        return "the reset request timed out — check `codex` before trying again";
+                    }
+                    object err = J.Get(res, "error");
+                    if (err != null)
+                    {
+                        string message = J.Str(J.Get(err, "message"));
+                        return Trim(string.IsNullOrEmpty(message) ? J.Write(err) : message);
+                    }
+                    return Outcome(J.Str(J.Get(J.Get(res, "result"), "outcome")));
                 }
-                object res = entry.Link.Call("account/rateLimitResetCredit/consume", null, deadline);
-                if (res == null) { Pool.Drop(entry); return "the reset request timed out — check `codex` before trying again"; }
-                object err = J.Get(res, "error");
-                if (err != null)
-                {
-                    string message = J.Str(J.Get(err, "message"));
-                    Pool.Checkin(entry);
-                    return Trim(string.IsNullOrEmpty(message) ? J.Write(err) : message);
-                }
-                Pool.Checkin(entry);
-                return Outcome(J.Str(J.Get(J.Get(res, "result"), "outcome")));
+                catch (Exception ex) { lease.Retire(); return ex.GetType().Name; }
             }
-            catch (Exception ex) { Pool.Drop(entry); return ex.GetType().Name; }
         }
 
         static string Outcome(string outcome)
@@ -1008,97 +1908,410 @@ class ProbeAccount
             public Func<string, object, double, object> Call;
             public Action<string, object> Notify;
             public Func<bool> Alive = () => true;
+            // PERF-007/R030: an oversized protocol line poisons the session; the
+            // reader flags it unhealthy and the pool replaces it. A test stub
+            // defaults to healthy.
+            public Func<bool> Healthy = () => true;
             public Action Drop = () => { };
         }
 
-        // One session per exact canonical home, for the life of the process.
-        // An entry that dies is replaced on next checkout; a home that leaves
-        // discovery is evicted by RetainOnly; the kill-on-close job from the
-        // startup sweep means a pooled child can never outlive LIMISAW.
-        internal class SessionPool
-        {
-            public class Entry
+// One session per exact canonical home, for the life of the process.
+            // An entry that dies is replaced on next checkout; a home that leaves
+            // discovery is evicted by RetainOnly; the kill-on-close job from the
+            // startup sweep means a pooled child can never outlive LIMISAW.
+            //
+            // W2-001: an entry is not just reusable, it is OWNED while in use.
+            // One exclusive logical-operation lease per entry covers the whole
+            // app-server transaction (initialize + read / consume / verify).
+            // Checkout hands back a scoped SessionLease; the caller owns the
+            // LEASE, the pool owns the ENTRY. Retirement while leased defers
+            // Link.Drop to the lease release; Link.Drop happens at most once.
+            // The pool's Gate protects map membership and bookkeeping only —
+            // never vendor I/O, never a lease wait, never Link.Drop.
+            internal class SessionPool
             {
-                public string HomeKey;
-                public RpcLink Link;
-                public bool InitDone;
-                public bool Orphan; // dropped or evicted; never checked in again
-            }
+                public class Entry
+                {
+                    public string HomeKey;
+                    public RpcLink Link;
+                    public bool InitDone; // read/written as authority only under the lease
+                    // Per-entry state protected by StateGate:
+                    // - Leased: true while a SessionLease owns this entry
+                    // - Retiring: entry removed from future eligibility; Link.Drop deferred
+                    // - Dropped: terminal; Link.Drop already performed (exactly once)
+                    internal readonly object StateGate = new object();
+                    internal bool Leased;
+                    internal bool Retiring;
+                    internal bool Dropped;
+                    // Per-entry exclusive lease. SemaphoreSlim(1,1) — waitable
+                    // exclusion with a real timeout, no polling, no Gate held.
+                    internal readonly SemaphoreSlim Lease = new SemaphoreSlim(1, 1);
+                }
 
-            readonly object Gate = new object();
-            readonly Dictionary<string, Entry> ByHome = new Dictionary<string, Entry>();
+                // Scoped ownership token for one logical app-server operation.
+                // Dispose releases the exclusive lease exactly once and, when
+                // the entry was marked retiring, performs the deferred
+                // Link.Drop — still exactly once, still outside the Gate.
+                // Retire() marks the entry for destruction at release: the
+                // caller does not Drop a link behind its own lease.
+                public sealed class SessionLease : IDisposable
+                {
+                    public readonly Entry Entry;
+                    public RpcLink Link { get { return Entry.Link; } }
+                    int Disposed;
+                    internal SessionLease(Entry entry) { Entry = entry; }
+                    public void Retire()
+                    {
+                        MarkRetiring(Entry);
+                    }
+                    public void Dispose()
+                    {
+                        if (Interlocked.Exchange(ref Disposed, 1) != 0) return;
+                        bool retire;
+                        lock (Entry.StateGate)
+                        {
+                            retire = Entry.Retiring;
+                            Entry.Leased = false;
+                            Entry.Lease.Release(); // waiter wakes AFTER we exit this lock
+                        }
+                        if (retire) DropEntry(Entry);
+                    }
+                }
+
+                readonly object Gate = new object();
+                readonly Dictionary<string, Entry> ByHome = new Dictionary<string, Entry>();
+
+                // The single coherent destruction transition. Idempotent:
+                // whichever path first observes a retiring-or-removed entry
+                // with no active lease performs the one Link.Drop; every later
+                // path sees Dropped and does nothing. Never called under Gate.
+                static void DropEntry(Entry e)
+                {
+                    bool dropNow = false;
+                    lock (e.StateGate)
+                    {
+                        if (e.Dropped) return;
+                        if (e.Leased) return; // still owned; its Dispose will drop
+                        e.Dropped = true;
+                        dropNow = true;
+                    }
+                    if (dropNow) try { e.Link.Drop(); } catch { }
+                }
+
+                // в”Ђв”Ђ ONE STATE ACCESS POLICY (W2-001 reinspection) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+                // Entry lifecycle state (Leased / Retiring / Dropped) is read and
+                // written ONLY under Entry.StateGate — never under SessionPool.Gate
+                // alone. SessionPool.Gate owns ByHome membership and mapping
+                // replacement/removal only. These tiny helpers are the whole state
+                // machine; lock order where both locks meet: Gate THEN StateGate.
+
+                static bool IsRetiringOrDropped(Entry e)
+                {
+                    lock (e.StateGate) return e.Retiring || e.Dropped;
+                }
+
+                static bool IsIdle(Entry e)
+                {
+                    lock (e.StateGate) return !e.Leased;
+                }
+
+                static void MarkRetiring(Entry e)
+                {
+                    lock (e.StateGate) e.Retiring = true;
+                }
+
+                // TryClaim: under StateGate, an entry not retiring/dropped/leased
+                // becomes Leased. False means the caller saw the physical permit
+                // but may NOT keep the entry — it must Release() the permit.
+                static bool TryClaim(Entry e)
+                {
+                    lock (e.StateGate)
+                    {
+                        if (e.Retiring || e.Dropped || e.Leased) return false;
+                        e.Leased = true;
+                        return true;
+                    }
+                }
+
+                // Test seam (W2-001 L): invoked between stale validation and
+                // the logical claim, while the checkout holds the raw permit.
+                // Null in production. Lets a deterministic race force
+                // "permit acquired, then the entry becomes Leased (or
+                // Retiring) before the claim" — the exact window where the
+                // raw permit used to leak.
+                internal static Action<Entry> BeforeClaim = null;
 
             public static string Key(string home)
             {
                 return (home ?? "").TrimEnd('\\', '/').ToLowerInvariant();
             }
 
-            public Entry Checkout(string home, string exe)
+            // PERF-001: the scheduler's WARM/COLD classification. True when a
+            // usable (alive, healthy, initialized) app-server session already
+            // exists for this exact canonical home. Pure metadata: it never
+            // starts a process, never checks in or out, never touches the
+            // child — the operational distinction alone, with account
+            // identity and quota truth untouched. A retiring entry is not warm.
+            public bool IsWarm(string home)
+            {
+                Entry entry;
+                lock (Gate)
+                {
+                    if (!ByHome.TryGetValue(Key(home), out entry)) return false;
+                }
+                // Lifecycle state is StateGate's; Alive/Healthy the link's own.
+                return !IsRetiringOrDropped(entry)
+                    && entry.Link.Alive() && entry.Link.Healthy()
+                    && entry.InitDone;
+            }
+
+            // Acquire the exclusive logical-operation lease for this home's
+            // entry, bounded by the caller's EXISTING absolute deadline. The
+            // wait happens on the entry's own SemaphoreSlim — never under the
+            // pool Gate, never with a fresh invented timeout. Returns a scoped
+            // SessionLease; null when the deadline ran out first.
+            //
+            // PERMIT OWNERSHIP INVARIANT: once entry.Lease.Wait returns true,
+            // this Checkout OWNS one raw SemaphoreSlim permit. Exactly one of
+            // two things happens before any retry or return — the permit is
+            // handed to a returned SessionLease, or it is Released here. There
+            // is no third path: DropEntry never releases a permit, so any
+            // abandon path MUST release before continuing. Wait is never
+            // issued while SessionPool.Gate is held.
+            public SessionLease Checkout(string home, string exe, double deadline)
+            {
+                return Checkout(home, exe, deadline, true);
+            }
+
+            // Lease the EXISTING session for this home, or nothing. Never
+            // starts an app-server child. This is what a cleanup path uses:
+            // cancelling a dead vendor login must not resurrect the vendor.
+            public SessionLease CheckoutExisting(string home, double deadline)
+            {
+                return Checkout(home, null, deadline, false);
+            }
+
+            SessionLease Checkout(string home, string exe, double deadline, bool allowStart)
             {
                 string key = Key(home);
-                RpcLink dead = null;
-                try
+                while (true)
+                {
+                    // 1. under Gate: observe the current candidate only.
+                    Entry candidate = null; Entry dead = null;
+                    lock (Gate)
+                    {
+                        Entry cur;
+                        if (ByHome.TryGetValue(key, out cur))
+                        {
+                            if (IsRetiringOrDropped(cur) || !cur.Link.Alive() || !cur.Link.Healthy())
+                            {
+                                // Not eligible. If no lease is active it can be
+                                // destroyed now; a leased one is left to its
+                                // owner (its release performs the drop).
+                                ByHome.Remove(key);
+                                MarkRetiring(cur);
+                                if (IsIdle(cur)) dead = cur;
+                            }
+                            else candidate = cur;
+                        }
+                    }
+                    if (dead != null) DropEntry(dead);
+                    // 2. Gate released: wait for the lease until the deadline.
+                    if (candidate != null)
+                    {
+                        double remain = deadline - NowS();
+                        if (remain <= 0) return null;
+                        if (!candidate.Lease.Wait(TimeSpan.FromSeconds(Math.Min(remain, 2147483))))
+                        {
+                            // Bounded by the caller's own deadline, not a new one.
+                            return null;
+                        }
+                        // The raw permit is now owned by THIS checkout. Exactly
+                        // one of two things happens before any retry/return: a
+                        // returned SessionLease takes ownership, or the finally
+                        // below Releases it. No third path — DropEntry never
+                        // releases a permit.
+                        bool permitHeld = true;
+                        try
+                        {
+                            // 3. re-enter briefly: validate still current.
+                            if (IsRetiringOrDropped(candidate))
+                            {
+                                // STALE AFTER WAIT (Bug A): the owner released
+                                // to retire between our Wait and validation.
+                                // Abandon: retire, drop if idle, retry — the
+                                // finally Releases our raw permit first.
+                                MarkRetiring(candidate);
+                                DropEntry(candidate);
+                                continue;
+                            }
+                            // 4. claim the lease atomically under StateGate.
+                            Action<Entry> seam = BeforeClaim;
+                            if (seam != null) seam(candidate); // test seam only
+                            if (!TryClaim(candidate))
+                            {
+                                // FAILED CLAIM (Bug B): the entry was claimed
+                                // elsewhere between validation and claim.
+                                // Abandon: retire, drop if idle, retry — the
+                                // finally Releases our raw permit first.
+                                MarkRetiring(candidate);
+                                DropEntry(candidate);
+                                continue;
+                            }
+                            SessionLease result = new SessionLease(candidate);
+                            permitHeld = false; // SessionLease now owns release
+                            return result;
+                        }
+                        finally
+                        {
+                            if (permitHeld) candidate.Lease.Release();
+                        }
+                    }
+                    // 5. no candidate: start a fresh session OUTSIDE Gate.
+                    // A no-start checkout stops here: the exact session this
+                    // caller wanted is gone, and inventing a new one would
+                    // answer for a process that never knew the operation.
+                    if (!allowStart) return null;
+                    RpcLink link = StartSession != null ? StartSession(exe, home) : RealSession(exe, home);
+                    if (link == null) return null;
+                    var fresh = new Entry { HomeKey = key, Link = link };
+                    // The creator claims the permit BEFORE publication: a brand
+                    // new entry cannot be contended, so this is nonblocking and
+                    // must never invent a 5-second budget. Failure is an
+                    // internal invariant violation, not a deadline signal.
+                    if (!fresh.Lease.Wait(0))
+                    {
+                        try { link.Drop(); } catch { }
+                        continue;
+                    }
+                    lock (fresh.StateGate) fresh.Leased = true; // claim before publish
+                    // 6. publish: exactly one winner; the loser is disposed
+                    // outside Gate and never handed to anyone. A REPLACED old
+                    // mapping is tracked explicitly — an idle one would
+                    // otherwise escape DropEntry entirely (Bug C).
+                    Entry loser = null; Entry winner = null; Entry replaced = null;
+                    lock (Gate)
+                    {
+                        Entry cur;
+                        if (ByHome.TryGetValue(key, out cur)
+                            && !IsRetiringOrDropped(cur) && cur.Link.Alive() && cur.Link.Healthy())
+                        {
+                            winner = cur; loser = fresh;
+                        }
+                        else
+                        {
+                            if (cur != null)
+                            {
+                                ByHome.Remove(key);
+                                MarkRetiring(cur);
+                                replaced = cur;
+                            }
+                            ByHome[key] = fresh; winner = fresh;
+                        }
+                    }
+                    if (winner != fresh)
+                    {
+                        // We lost publication. Our fresh session was never
+                        // handed to anyone: release its private lease so
+                        // DropEntry can destroy it exactly once.
+                        lock (fresh.StateGate) { fresh.Leased = false; fresh.Retiring = true; fresh.Lease.Release(); }
+                        DropEntry(fresh);
+                        // Retry acquisition of the winner — OUTSIDE Gate,
+                        // bounded by the caller's own deadline. Same permit
+                        // ownership invariant as above.
+                        double remain2 = deadline - NowS();
+                        if (remain2 <= 0) return null;
+                        if (!winner.Lease.Wait(TimeSpan.FromSeconds(Math.Min(remain2, 2147483)))) return null;
+                        bool permitHeld2 = true;
+                        try
+                        {
+                            if (IsRetiringOrDropped(winner)) continue;
+                            if (!TryClaim(winner)) continue;
+                            SessionLease result = new SessionLease(winner);
+                            permitHeld2 = false; // SessionLease now owns release
+                            return result;
+                        }
+                        finally
+                        {
+                            if (permitHeld2) winner.Lease.Release();
+                        }
+                    }
+                    // Drop loser AND the replaced old mapping outside Gate
+                    // (both were retired under Gate; idle ones are destroyed
+                    // now, leased ones at their owner's release). Idempotent,
+                    // never under Gate.
+                    if (replaced != null) DropEntry(replaced);
+                    if (loser != null) DropEntry(loser);
+                    return new SessionLease(fresh);
+                }
+            }
+
+            // External eviction by discovery: RetainOnly never owns the active
+            // operation lease. It only removes future eligibility and marks
+            // retiring; an idle entry is dropped now, a leased one is left to
+            // its owner's release.
+            public void RetainOnly(List<string> keys)
+            {
+                var idle = new List<Entry>();
+                lock (Gate)
+                {
+                    var gone = new List<Entry>();
+                    foreach (KeyValuePair<string, Entry> kv in ByHome)
+                        if (!keys.Contains(kv.Key)) gone.Add(kv.Value);
+                    foreach (Entry e in gone)
+                    {
+                        ByHome.Remove(e.HomeKey);
+                        MarkRetiring(e);
+                        if (IsIdle(e)) idle.Add(e);
+                    }
+                }
+                foreach (Entry e in idle) DropEntry(e);
+            }
+
+            public void EvictHome(string home)
+            {
+                Entry old = null;
+                lock (Gate)
+                {
+                    string key = Key(home);
+                    if (ByHome.TryGetValue(key, out old))
+                    {
+                        ByHome.Remove(key);
+                        MarkRetiring(old);
+                    }
+                }
+                if (old != null) DropEntry(old);
+            }
+
+            public int Count
+            {
+                get
                 {
                     lock (Gate)
                     {
-                        Entry entry;
-                        if (ByHome.TryGetValue(key, out entry) && entry.Link.Alive())
-                        {
-                            entry.Orphan = false;
-                            return entry;
-                        }
-                        if (entry != null) { ByHome.Remove(key); entry.Orphan = true; dead = entry.Link; }
-                        RpcLink link = StartSession != null ? StartSession(exe, home) : RealSession(exe, home);
-                        if (link == null) return null;
-                        var fresh = new Entry { HomeKey = key, Link = link };
-                        ByHome[key] = fresh;
-                        return fresh;
+                        int n = 0;
+                        foreach (KeyValuePair<string, Entry> kv in ByHome)
+                            if (!IsRetiringOrDropped(kv.Value)) n++;
+                        return n;
                     }
                 }
-                finally { if (dead != null) dead.Drop(); } // outside the lock: may block on the child
             }
 
-            public void Checkin(Entry entry)
-            {
-                if (entry == null) return;
-                lock (Gate) entry.Orphan = false;
-            }
-
-            public void Drop(Entry entry)
-            {
-                if (entry == null) return;
-                lock (Gate)
-                {
-                    if (!entry.Orphan) ByHome.Remove(entry.HomeKey);
-                    entry.Orphan = true;
-                }
-                entry.Link.Drop(); // outside the lock: may block on the child
-            }
-
-            public void RetainOnly(List<string> keys)
-            {
-                var gone = new List<Entry>();
-                lock (Gate)
-                {
-                    foreach (KeyValuePair<string, Entry> kv in ByHome)
-                        if (!keys.Contains(kv.Key)) gone.Add(kv.Value);
-                    foreach (Entry e in gone) { ByHome.Remove(e.HomeKey); e.Orphan = true; }
-                }
-                foreach (Entry e in gone) e.Link.Drop(); // outside the lock: may block on the child
-            }
-
-            public int Count { get { lock (Gate) return ByHome.Count; } }
-
+            // Test hook only: drop every entry. Same deferred-retirement rule.
             public void Reset()
             {
-                List<Entry> all;
+                var idle = new List<Entry>();
                 lock (Gate)
                 {
-                    all = new List<Entry>(ByHome.Values);
+                    var all = new List<Entry>(ByHome.Values);
                     ByHome.Clear();
-                    foreach (Entry e in all) e.Orphan = true;
+                    foreach (Entry e in all)
+                    {
+                        MarkRetiring(e);
+                        if (IsIdle(e)) idle.Add(e);
+                    }
                 }
-                foreach (Entry e in all) e.Link.Drop();
+                foreach (Entry e in idle) DropEntry(e);
             }
 
             RpcLink RealSession(string exe, string home)
@@ -1114,6 +2327,11 @@ class ProbeAccount
         internal class RpcSession : IDisposable
         {
             Process P;
+            // The session's own containment. A pooled app-server lives for the
+            // life of the process, so its tree must end when the session is
+            // dropped (dead child, eviction, timeout) rather than at app exit —
+            // and must end even if the app is killed mid-sweep.
+            ChildSweeper.Scope Scope;
             readonly Dictionary<int, object> Responses = new Dictionary<int, object>();
             // PERF-001: a request whose caller gave up must never keep a slot.
             // The reply can still land after the timeout; it is matched here
@@ -1125,7 +2343,10 @@ class ProbeAccount
 
             public static RpcSession Start(string exe, string home)
             {
-                var psi = new ProcessStartInfo(exe, "app-server --stdio")
+                bool batch = Cli.IsBatchShim(exe);
+                string inner = batch ? "\"app-server\" \"--stdio\"" : "app-server --stdio";
+                var psi = new ProcessStartInfo(batch ? (Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe") : exe,
+                    batch ? Cli.BatchShellArgs(exe, inner) : "app-server --stdio")
                 {
                     UseShellExecute = false, CreateNoWindow = true,
                     RedirectStandardInput = true, RedirectStandardOutput = true,
@@ -1137,9 +2358,11 @@ class ProbeAccount
                 // API key that happens to sit in this process's environment.
                 foreach (string k in new[] { "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN" })
                     psi.EnvironmentVariables.Remove(k);
+                ChildSweeper.Scope scope = ChildSweeper.Open();
                 Process proc = Process.Start(psi);
-                if (proc == null) return null;
-                var session = new RpcSession { P = proc };
+                if (proc == null) { scope.Dispose(); return null; }
+                scope.Adopt(proc);
+                var session = new RpcSession { P = proc, Scope = scope };
                 proc.ErrorDataReceived += (s, e) => { };
                 proc.BeginErrorReadLine();
                 var reader = new Thread(session.ReadLoop);
@@ -1153,14 +2376,23 @@ class ProbeAccount
                 get { try { return !P.HasExited; } catch { return false; } }
             }
 
-            internal int PendingResponses { get { lock (Gate) return Responses.Count; } }
+             internal int PendingResponses { get { lock (Gate) return Responses.Count; } }
+            internal bool Healthy { get { return !Unhealthy; } }
+            bool Unhealthy;
+            // W2-001 secondary protocol safety: Call and Notify share one
+            // dedicated write lock around StandardInput Write+Flush, so two
+            // concurrent writers cannot interleave half a request frame. The
+            // response-map Gate is never held while writing; the reader loop
+            // keeps independent access. This is frame safety only — it does
+            // NOT replace the higher-level per-home logical-operation lease.
+            readonly object WriteLock = new object();
 
             void ReadLoop()
             {
                 try
                 {
                     string line;
-                    while ((line = P.StandardOutput.ReadLine()) != null)
+                    while ((line = ReadBoundedLine()) != null)
                     {
                         line = line.Trim();
                         if (line.Length == 0) continue;
@@ -1176,6 +2408,49 @@ class ProbeAccount
                     }
                 }
                 catch { }
+            }
+
+            // PERF-007/R030: ReadBoundedLine — retain only up to the protocol
+            // ceiling, then discard until the newline. An oversized line is
+            // never fully retained, never J.Parsed, never added to Responses;
+            // the offending session is marked unhealthy and terminated so the
+            // SessionPool replaces it with a fresh app-server (a poisoned
+            // connection is not a connection).
+            internal string Continuation { get; private set; }
+            const int RpcMaxLine = 512 * 1024;
+
+            string ReadBoundedLine()
+            {
+                var sb = new StringBuilder(1024);
+                int ch;
+                bool oversized = false;
+                while ((ch = P.StandardOutput.Read()) != -1)
+                {
+                    if (ch == '\n')
+                    {
+                        if (oversized)
+                        {
+                            lock (Gate) Unhealthy = true;
+                            lock (Gate) if (Responses != null) Responses.Clear();
+                            P.Kill();
+                            return null;
+                        }
+                        string line = sb.ToString().TrimEnd('\r');
+                        sb.Length = 0;
+                        return line;
+                    }
+                    if (!oversized)
+                    {
+                        if (sb.Length < RpcMaxLine) sb.Append((char)ch);
+                        else oversized = true;            // keep draining, never grow the retained string
+                    }
+                }
+                if (oversized)
+                {
+                    lock (Gate) Unhealthy = true;
+                    try { P.Kill(); } catch { }
+                }
+                return sb.Length > 0 ? sb.ToString() : null;
             }
 
             public object Call(string method, object parameters, double deadline)
@@ -1231,8 +2506,11 @@ class ProbeAccount
             {
                 try
                 {
-                    P.StandardInput.Write(J.Write(req) + "\n");
-                    P.StandardInput.Flush();
+                    lock (WriteLock)
+                    {
+                        P.StandardInput.Write(J.Write(req) + "\n");
+                        P.StandardInput.Flush();
+                    }
                     return true;
                 }
                 catch { return false; }
@@ -1254,6 +2532,9 @@ class ProbeAccount
                 try { if (P.StandardInput != null) P.StandardInput.Close(); } catch { }
                 try { if (!P.WaitForExit(2000)) P.Kill(); } catch { }
                 try { P.Dispose(); } catch { }
+                // Last: the child is asked to leave politely first, then the job
+                // takes whatever it started with it.
+                try { if (Scope != null) Scope.Dispose(); } catch { }
             }
         }
     }

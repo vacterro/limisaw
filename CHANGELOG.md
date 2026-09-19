@@ -1,5 +1,65 @@
 # LIMISAW 0.0.8 (2026-09-05)
 
+## 0.0.8
+
+**In the working tree since the 0.0.8 release build:** the window is now
+genuinely **resizable** (drag any edge or corner), every tab gets a **scrollable
+body viewport** (wheel, PgDn/PgUp/Home/End, a themed scrollbar), **Settings is
+reorganized** into compact TRAY/ACCOUNTS/ALERTS/APP blocks that reflow into two
+columns on wide windows, and window **position and size persist** — clamped
+safely back into whatever monitor they reopen on. Also: LIMISAW branding and
+icon pipeline, Zcode provider discovery with an in-app config-access toggle, and
+the bitmap-glyph tray renderer. Newest working-tree work: **six distinct tray
+layouts** — `Number`, `Two`, `Gauge` (thin single-reading meter), `Bars` (narrow
+vertical column per reading, one reading stays a narrow centred column),
+`Rows` (horizontal mini-bar per reading) and `Cells` (block/grid, inverse fill)
+— with the fill detail simplified to **1/8 + Exact** (legacy `TrayFill` 2/4
+still load, as `1/8`, without rewriting the ini), **themed delayed hover
+tooltips** beside the instant footer hint on every interactive action (same-target
+pointer movement never restarts the dwell, connection text is redacted before it
+reaches a tooltip), and the **canonical shell icon verified** by direct
+`ExtractIconEx` against the built `LIMISAW.exe` — including a negative control
+built without the icon.
+
+Newest working-tree work (correctness/stability wave): the **Connections** tab now
+draws from the same truth as the periodic sweep — a successful quota read
+converges a card to `Connected` (or `Connected ·· quota unavailable` when the
+vendor authenticates but exposes no window), and an explicit verification failure
+survives a repaint until a newer result supersedes it. A settings save that races
+an external editor **refuses** instead of silently overwriting the other writer.
+On exit, late refresh work is discarded instead of touching a torn-down tray.
+
+Newest working-tree work (performance wave): the scheduler no longer hands a cold
+`codex app-server` a knowingly doomed budget — warm homes read first and cold
+homes get a full viable slice (floor 14 s) only when the provider's own deadline
+still affords one, with a rotating cursor so every cold home eventually runs; the
+Antigravity and Claude journal walks are lazy, deadline-bounded and keep bounded
+newest-first candidate sets instead of materializing whole directory trees; the
+Antigravity body cache owns its lifetime (live-set pruning after complete scans,
+a 512-entry hard ceiling) without losing cache hits; scrolling clips WORK, not
+just pixels — one per-paint layout snapshot, one `AllMetrics` per tray paint, and
+expensive card/row rendering only inside the viewport band while geometry,
+heights and drag targets stay full-population; and a stationary tray hover
+rebuilds and re-measures the popup once per content generation instead of once
+per MouseMove.
+
+Newest working-tree work (audit/6 core wave): **settings saves can no longer
+destroy an external edit that landed before the save started** — LIMISAW now
+tracks the exact INI bytes it last accepted and refuses (with a clear reason)
+any save that would overwrite a newer revision, while an ordinary window
+move/resize defers its geometry instead of overwriting; **an external INI with
+a malformed typed value (`NotifyOnReset=maybe`, a garbage integer) is refused
+as a reload** instead of silently borrowing the running value, so an accepted
+snapshot is always reproducible after restart, and the user's explicit save
+canonicalizes the known bad revision away; **connection verification no longer
+lets a slow retry overwrite a terminal result** — the coordinator distinguishes
+progress from completion, releases the vendor slot only on terminal
+publication, a stale watcher expiry can no longer cancel a newer operation,
+and changing the Zcode config-access permission now invalidates the whole
+in-flight operation (the contract the future FreeBuff permission model
+reuses); and **a failed Claude/Antigravity interactive launch reports false**
+instead of starting a 90-second watcher for a login that never launched.
+
 An external audit of 0.0.7 filed 19 defects. Eighteen were real and every one is
 fixed here, each with a harness that fails against the old code: the suite grows
 from 14 harnesses to 27. The nineteenth claimed the alert sounds were missing

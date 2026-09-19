@@ -52,6 +52,15 @@ public static class RefreshCoalesce
     static int Sweeps;
     static object PreReset, PostReset;
 
+    // W2-002 (SRC-004:R016): the error-path variant. The FIRST sweep throws out
+    // of the hardened SweepSource (the refresh gate that coalesces a re-read
+    // arriving during a sweep is exercised on the failure path, not only the
+    // clean one), so SetError is what ends the sweep and must drain the same
+    // PendingRefresh. Every later call is the follow-up the gate promised.
+    static readonly ManualResetEvent ErrStarted = new ManualResetEvent(false);
+    static readonly ManualResetEvent ErrRelease = new ManualResetEvent(false);
+    static int ErrSweeps;
+
     const int PreRem = 40;
     const int PostRem = 55;   // a rise of 15 is below the reset-balloon threshold
 
@@ -66,6 +75,18 @@ public static class RefreshCoalesce
             Started.Set();
             Release.WaitOne(20000);
             return (T)PreReset;
+        }
+        return (T)PostReset;
+    }
+
+    static T ErrSweep<T>(bool zcodeReadConfig)
+    {
+        int n = Interlocked.Increment(ref ErrSweeps);
+        if (n == 1)
+        {
+            ErrStarted.Set();
+            ErrRelease.WaitOne(20000);
+            throw new InvalidOperationException("vendor exploded mid-sweep");
         }
         return (T)PostReset;
     }
@@ -244,6 +265,43 @@ public static class RefreshCoalesce
                 Check("and one follow-up does not become a refresh carousel",
                     Sweeps == 2 && !Flag(form, "Refreshing"),
                     "sweeps=" + Sweeps + " after 750ms idle");
+
+                // ── W2-002: the same call during a sweep that THROWS ──
+                // SetError must end the sweep the same way Publish does: the
+                // pending re-read is drained and run, not stranded. The old
+                // SetError set Refreshing=false and stopped, so ResetCompleted
+                // or a manual RefreshData in flight during a crash lost its
+                // follow-up.
+                MethodInfo errSweep = typeof(RefreshCoalesce)
+                    .GetMethod("ErrSweep", BindingFlags.NonPublic | BindingFlags.Static)
+                    .MakeGenericMethod(resType);
+                Field("SweepSource").SetValue(form,
+                    Delegate.CreateDelegate(typeof(Func<,>).MakeGenericType(typeof(bool), resType), errSweep));
+                Interlocked.Exchange(ref ErrSweeps, 0);
+                Field("Accounts").SetValue(form, Activator.CreateInstance(typeof(List<>).MakeGenericType(accType)));
+                Field("PrevAccounts").SetValue(form, Activator.CreateInstance(typeof(List<>).MakeGenericType(accType)));
+
+                Call(form, "RefreshData");
+                Check("a refresh that is about to throw starts a sweep", ErrStarted.WaitOne(10000),
+                    "errSweeps=" + ErrSweeps);
+                Check("...and the gate reports it in flight",
+                    Flag(form, "Refreshing"), "Refreshing=" + Flag(form, "Refreshing"));
+
+                // A follow-up request lands WHILE the doomed sweep runs.
+                Call(form, "RefreshData");
+                Check("the pending re-read is recorded on the error path",
+                    Flag(form, "PendingRefresh"), "PendingRefresh=" + Flag(form, "PendingRefresh"));
+
+                ErrRelease.Set();
+                bool errSettled = Wait(() => ErrSweeps >= 2 && !Flag(form, "Refreshing"), 30000);
+                Check("a refresh during a THROWING sweep still runs its follow-up", errSettled,
+                    "errSweeps=" + ErrSweeps + ", Refreshing=" + Flag(form, "Refreshing"));
+                Check("...exactly one follow-up, not a retry loop",
+                    ErrSweeps == 2, "errSweeps=" + ErrSweeps);
+                Check("...and the follow-up's fresh snapshot is what shows",
+                    Shown(form) == PostRem, "shown=" + Shown(form) + "%, expected " + PostRem + "%");
+                Check("...and the queue is drained",
+                    !Flag(form, "PendingRefresh"), "PendingRefresh=" + Flag(form, "PendingRefresh"));
             }
 
             // The gate and the reset completion are the two halves of this
@@ -256,6 +314,10 @@ public static class RefreshCoalesce
             Check("the reset completion still asks for the re-read",
                 ui.IndexOf("void ResetCompleted(string outcome)", StringComparison.Ordinal) >= 0
                 && ui.IndexOf("Action done = () => ResetCompleted(outcome);", StringComparison.Ordinal) >= 0, "");
+            Check("SetError ends the sweep through the SAME completion as Publish",
+                ui.IndexOf("void CompleteSweep()", StringComparison.Ordinal) >= 0
+                && ui.IndexOf("SetError(string msg)", StringComparison.Ordinal) >= 0
+                && ui.IndexOf("CompleteSweep();", StringComparison.Ordinal) >= 0, "");
         }
         finally
         {

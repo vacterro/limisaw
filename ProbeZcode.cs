@@ -112,12 +112,25 @@ namespace Limisaw
             return path.Length > 0 && File.Exists(path);
         }
 
+        public static bool ConfigExists()
+        {
+            string path = ConfigPath();
+            return path.Length > 0 && File.Exists(path);
+        }
+
         // True when either supported env credential is set and non-blank.
         public static bool HasEnvKey()
         {
+            return EnvKey() != null;
+        }
+
+        // Which env credential is set, by name (ZAI_API_KEY wins — the same
+        // order Resolve() consumes them). The VALUE never passes through here.
+        public static string EnvKey()
+        {
             foreach (string name in new[] { EnvPrimary, EnvAlternate })
-                if (((Environment.GetEnvironmentVariable(name) ?? "").Trim()).Length > 0) return true;
-            return false;
+                if (((Environment.GetEnvironmentVariable(name) ?? "").Trim()).Length > 0) return name;
+            return null;
         }
 
         // ── credential ───────────────────────────────────────────────────────
@@ -127,62 +140,395 @@ namespace Limisaw
             public string Origin = "";     // shown to the user, never the key
             public string Refusal;         // why there is no key, if there is none
             public string Host;            // which host this credential belongs to, when known
+            // The machine-readable situation, for the Settings row and tests.
+            // One of: "", "env", "config", "not-detected", "config-denied",
+            // "no-provider", "no-key".
+            public string State = "";
         }
 
         public const string EnvPrimary = "ZAI_API_KEY";
         public const string EnvAlternate = "ZCODE_API_KEY";
 
-        // `allowConfig` is LIMISAW.ini's ZcodeReadConfig. It is passed in rather
-        // than read here so the decision has exactly one owner (LimisawSettings)
-        // and the test can drive both halves without touching an ini.
+        // `allowConfig` is LIMISAW.ini's ZcodeReadConfig (Settings: "Config
+        // access"). It is passed in rather than read here so the decision has
+        // exactly one owner (LimisawSettings) and the test can drive both
+        // halves without touching an ini.
+        //
+        // Every refusal names the situation it actually is — not detected, not
+        // permitted, no supported provider, provider without a readable key —
+        // because "unavailable" telling the user to sign in when the real
+        // problem is a permission LIMISAW itself owns is a dead end.
         public static Key Resolve(bool allowConfig)
         {
             foreach (string name in new[] { EnvPrimary, EnvAlternate })
             {
                 string value = (Environment.GetEnvironmentVariable(name) ?? "").Trim();
                 if (value.Length > 0)
-                    return new Key { Value = value, Origin = "$" + name };
+                    return new Key { Value = value, Origin = "$" + name, State = "env" };
             }
             if (!allowConfig)
-                return new Key
-                {
-                    Refusal = "set " + EnvPrimary + ", or ZcodeReadConfig=1 in "
-                        + "LIMISAW.ini to let LIMISAW read Zcode's own key",
-                };
+                return ConfigExists()
+                    ? new Key
+                    {
+                        Refusal = "Zcode detected — config access is off; enable it in Settings, or set " + EnvPrimary,
+                        State = "config-denied",
+                    }
+                    : new Key
+                    {
+                        Refusal = "Zcode not detected — install Zcode, enable config access in Settings, or set " + EnvPrimary,
+                        State = "not-detected",
+                    };
             string path = ConfigPath();
             if (path.Length == 0 || !File.Exists(path))
-                return new Key { Refusal = "Zcode config not found (" + EnvPrimary + " not set either)" };
-            string providerId;
-            string key = FromConfig(path, out providerId);
-            if (key == null)
-                return new Key { Refusal = "no Coding Plan key in Zcode's config — sign in to Zcode, or set " + EnvPrimary };
-            return new Key { Value = key, Origin = "Zcode config", Host = HostHint(providerId) };
+                return new Key { Refusal = "Zcode config not found (" + EnvPrimary + " not set either)", State = "not-detected" };
+            ConfigScan scan = ScanConfigCached(path);
+            if (!scan.Parsed)
+                return new Key { Refusal = "Zcode config could not be read as JSON", State = "no-provider" };
+            if (!scan.HasProviderMap)
+                return new Key { Refusal = "Zcode config has no provider list", State = "no-provider" };
+            if (!scan.VendorProviderSeen)
+                return new Key
+                {
+                    Refusal = "config allowed — no Z.ai / BigModel provider in Zcode's config",
+                    State = "no-provider",
+                };
+            if (string.IsNullOrEmpty(scan.Key))
+                return new Key
+                {
+                    Refusal = "config allowed — the Z.ai / BigModel provider has no readable API key",
+                    State = "no-key",
+                };
+            return new Key
+            {
+                Value = scan.Key,
+                Origin = "Zcode config",
+                Host = scan.HostHint,
+                State = "config",
+            };
         }
 
         // Which host a config provider belongs to. A HINT for order only: both
         // hosts are still tried, so a wrong guess costs nothing but a reorder,
         // while a right one spends the budget on the host that owns the key.
-        static string HostHint(string providerId)
+        // NEVER a destination: the quota request goes only to the two constant
+        // hosts above, whatever a config file claims.
+        static string HostHint(string providerId, string baseUrl)
         {
-            if (providerId == null) return null;
-            if (providerId.IndexOf("bigmodel", StringComparison.OrdinalIgnoreCase) >= 0) return HostBigModel;
-            if (providerId.IndexOf("zai", StringComparison.OrdinalIgnoreCase) >= 0) return HostZai;
+            if (providerId != null)
+            {
+                if (providerId.IndexOf("bigmodel", StringComparison.OrdinalIgnoreCase) >= 0) return HostBigModel;
+                if (providerId.IndexOf("zai", StringComparison.OrdinalIgnoreCase) >= 0) return HostZai;
+            }
+            string host = HostOf(baseUrl);
+            if (host == "open.bigmodel.cn" || host.EndsWith(".bigmodel.cn", StringComparison.Ordinal)) return HostBigModel;
+            if (host == "api.z.ai" || host == "zcode.z.ai" || host.EndsWith(".z.ai", StringComparison.Ordinal)) return HostZai;
             return null;
         }
 
-        // Exactly one field out of one file: the Coding Plan provider's apiKey.
-        // Nothing else in that config is looked at, and the file is opened
-        // read-only. The order matters — a Coding Plan key reports plan windows,
-        // while the plain `builtin:zai` API key reports the same endpoint for a
-        // pay-as-you-go account, so the plan providers are preferred.
-        static readonly string[] ProviderIds =
+        static string HostOf(string url)
         {
-            "builtin:zai-coding-plan",
-            "builtin:bigmodel-coding-plan",
-            "builtin:zai",
-            "builtin:bigmodel",
-        };
+            if (string.IsNullOrEmpty(url)) return "";
+            try { return new Uri(url.Trim()).Host.ToLowerInvariant(); }
+            catch { return ""; }
+        }
 
+        // One provider entry out of Zcode's config, classified. The key is the
+        // only secret-shaped thing read here and it never leaves this class
+        // except into the Key that the probe uses for one header.
+        public class ZcodeProvider
+        {
+            public string Id = "";
+            public bool Enabled = true;      // absent flag counts as enabled
+            public bool CodingPlan;          // a *-coding-plan id
+            public bool StartPlan;           // a *-start-plan id
+            public string BaseUrl = "";      // HINT ONLY, never a destination
+            public string Key = "";
+
+            // Higher is preferred. Enabled outranks disabled (a disabled
+            // provider's key is a leftover, not a live credential), a Coding
+            // Plan key outranks the generic pay-as-you-go one (it reports plan
+            // windows, which is what the tray shows), a start-plan variant
+            // sits between the two. Equal rank keeps config order.
+            //
+            // Rank only ever compares KEY-BEARING candidates. A provider with
+            // no key has no credential to offer, however plan-shaped its id —
+            // letting it outrank a usable key was the bug where an enabled
+            // coding-plan slot without an apiKey masked a working generic
+            // provider's real credential.
+            public int Rank
+            {
+                get { return (Enabled ? 4 : 0) + (CodingPlan ? 2 : 0) + (StartPlan ? 1 : 0); }
+            }
+            public bool HasKey
+            {
+                get { return Key != null && Key.Trim().Length > 0; }
+            }
+        }
+
+        // The trust boundary. Only the vendor's own built-in provider family
+        // may hand LIMISAW a credential: a `builtin:` id carrying the vendor's
+        // name, or a `builtin:` entry whose own base URL is one of the vendor's
+        // known hosts. Everything else — custom, OpenAI-compatible,
+        // third-party, however vendor-like its name — is invisible to the
+        // credential scan no matter what key it holds.
+        internal static bool VendorFamily(string id, string baseUrl)
+        {
+            if (!(id ?? "").StartsWith("builtin:", StringComparison.OrdinalIgnoreCase)) return false;
+            bool zaiId = id.IndexOf("zai", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool bigId = id.IndexOf("bigmodel", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (zaiId || bigId) return true;
+            string host = HostOf(baseUrl);
+            return host == "api.z.ai" || host == "zcode.z.ai"
+                || host.EndsWith(".z.ai", StringComparison.Ordinal)
+                || host == "open.bigmodel.cn" || host.EndsWith(".bigmodel.cn", StringComparison.Ordinal);
+        }
+
+        public class ConfigScan
+        {
+            public bool Parsed;             // the file existed and was valid JSON under the size cap
+            public bool HasProviderMap;     // a provider map is present
+            public bool VendorProviderSeen; // at least one Z.ai / BigModel family entry
+            public string ProviderId;       // the entry the key came from
+            public string Key;              // empty when nothing readable
+            public string HostHint;
+            public ZcodeGenerationSummary Summary; // secret-free generation snapshot (R020)
+        }
+
+        // ── SRC-007 (completes SRC-006:R020): the shared secret-free generation
+        // summary. ONE immutable snapshot per refresh generation, consumed by
+        // BOTH the worker (Probe/Resolve) and the Level-0/UI projection
+        // (BuildZcodeConnection/Verify) with no extra config read/parse/stat:
+        // it is filled by the single ScanConfig pass that generation already
+        // performs. Contains ONLY safe metadata:
+        //   ConfigPresent / CredentialOrigin / ProviderId / HostCategory /
+        //   ConfigRevision.
+        // ConfigRevision identifies the config file revision the generation
+        // represents, derived from NON-SECRET metadata captured during the
+        // same single scan (canonical path + length + last-write ticks). The
+        // config BODY is never hashed and never stored — hashing it would mean
+        // keeping a digest of credential-bearing bytes and re-reading them on
+        // every check. ABSOLUTE SECRET RULE: no API key, no bearer token, no
+        // config body, no raw credential JSON, no arbitrary provider values
+        // ever enters this summary.
+        public class ZcodeGenerationSummary
+        {
+            public bool ConfigPresent;
+            public string CredentialOrigin;   // environment / config / none
+            public string ProviderId;        // the provider entry id (safe: a builtin: name, never a key)
+            public bool VendorProviderSeen;  // a trusted family entry exists (with or without a key)
+            public string HostCategory;      // zai / bigmodel / unknown
+            public string ConfigRevision;    // path+length+mtime token, never content
+
+            internal static ZcodeGenerationSummary Build(bool present, string origin,
+                string providerId, bool providerSeen, string hostCategory, string revision)
+            {
+                var s = new ZcodeGenerationSummary();
+                s.ConfigPresent = present;
+                s.CredentialOrigin = origin ?? "";
+                s.ProviderId = providerId ?? "";
+                s.VendorProviderSeen = providerSeen;
+                s.HostCategory = hostCategory ?? "unknown";
+                s.ConfigRevision = revision ?? "";
+                return s;
+            }
+        }
+
+        // Short stable digest of a non-secret string (same shape as
+        // LIMISAW SoundCue.Tag / Probe.HomeId).
+        static string Tag(string text)
+        {
+            byte[] bytes = System.Security.Cryptography.SHA256.Create()
+                .ComputeHash(System.Text.Encoding.UTF8.GetBytes(text ?? ""));
+            var sb = new System.Text.StringBuilder(16);
+            for (int i = 0; i < 8; i++) sb.Append(bytes[i].ToString("x2"));
+            return sb.ToString();
+        }
+
+        // ── PERF-003 (SRC-006:R020): generation-scoped config body cache ─────
+        // The Zcode config body is read/parsed AT MOST ONCE per refresh
+        // generation: Resolve (BuildZcodeConnection in the snapshot build),
+        // Probe (the sweep) and Verify (a user check) all consume the same
+        // cached scan. A generation is an immutable discovery transaction:
+        // changes made during it become visible only after BeginGeneration.
+        // Only active when a refresh generation exists — legacy call sites
+        // keep the always-fresh behaviour. The cached scan carries the
+        // credential only inside ProbeZcode's sealed scope.
+        static ConfigScan CachedScan;
+        static string CachedScanPath;
+        static int CachedScanGen = int.MinValue;
+
+        internal static ConfigScan ScanConfigCached(string path)
+        {
+            int gen = ExecutableDiscovery.CurrentGeneration;
+            if (gen <= 0) return ScanConfig(path);
+            if (CachedScan != null && CachedScanGen == gen && CachedScanPath == path)
+                return CachedScan;
+            ConfigScan scan = ScanConfig(path);
+            CachedScan = scan;
+            CachedScanGen = gen;
+            CachedScanPath = path;
+            return scan;
+        }
+
+        internal static void ResetConfigCacheForTests()
+        { CachedScan = null; CachedScanPath = null; CachedScanGen = int.MinValue; CachedSummary = null; CachedSummaryGen = int.MinValue; }
+
+        // ── SRC-007: the shared secret-free generation summary accessor ────
+        // ONE summary per refresh generation, consumed by BOTH the worker and
+        // the Level-0/UI projection. Inside a generation it is IMMUTABLE and
+        // memoized once: no config read/parse/stat walk happens again after
+        // the snapshot is built — a disk mutation during generation N cannot
+        // alter N. Outside a generation (legacy/tests, gen <= 0) it is
+        // computed fresh each call from the same one-scan budget.
+        static ZcodeGenerationSummary CachedSummary;
+        static int CachedSummaryGen = int.MinValue;
+
+        public static ZcodeGenerationSummary GenerationSummary(bool allowConfig)
+        {
+            int gen = ExecutableDiscovery.CurrentGeneration;
+            if (gen > 0 && CachedSummary != null && CachedSummaryGen == gen) return CachedSummary;
+            ZcodeGenerationSummary s = BuildSummary(allowConfig);
+            if (gen > 0) { CachedSummary = s; CachedSummaryGen = gen; }
+            return s;
+        }
+
+        // Builds the snapshot. env credential wins the origin exactly like
+        // Resolve; the config body is read only when the config path is the
+        // one actually consulted, and only through the per-generation cached
+        // scan, so the budget stays <=1 read + <=1 parse per generation.
+        static ZcodeGenerationSummary BuildSummary(bool allowConfig)
+        {
+            if (HasEnvKey())
+                return ZcodeGenerationSummary.Build(ConfigExists(), "environment", "", false, "unknown", "");
+            if (!allowConfig)
+                return ZcodeGenerationSummary.Build(ConfigExists(), "none", "", false, "unknown", "");
+            string path = ConfigPath();
+            if (path.Length == 0 || !File.Exists(path))
+                return ZcodeGenerationSummary.Build(false, "none", "", false, "unknown", "");
+            ZcodeGenerationSummary s = (ExecutableDiscovery.CurrentGeneration > 0
+                ? ScanConfigCached(path) : ScanConfig(path)).Summary;
+            return s ?? ZcodeGenerationSummary.Build(true, "none", "", false, "unknown", "");
+        }
+
+        // The whole config scan in one place: exactly one field out of one
+        // file — the best usable (key-bearing) Z.ai / BigModel provider's
+        // apiKey — read-only, size-capped, everything else in the config
+        // ignored. Provider ids are DISCOVERED, not a fixed list: Zcode
+        // legitimately ships variants (`builtin:zai-coding-plan`,
+        // `builtin:zai-start-plan`, the bigmodel twins, future plan ids), and
+        // a fixed array silently went blind the day the vendor added one.
+        internal static ConfigScan ScanConfig(string path)
+        {
+            var scan = new ConfigScan();
+            object doc;
+            long length = 0, mtimeTicks = 0;
+            try
+            {
+                // A config that grew huge is a config we do not understand;
+                // refusing to parse it beats loading an arbitrary blob. The
+                // metadata check is only the fast refusal (W2-005): the OPENED
+                // handle is the real bound, so a file that grows after this stat
+                // still cannot be read past the cap.
+                var info = new FileInfo(path);
+                length = info.Length;
+                mtimeTicks = info.LastWriteTimeUtc.Ticks;
+                if (info.Length > 4 * 1024 * 1024) { FillSummary(scan, path, length, mtimeTicks, null); return scan; }
+                long bytesRead;
+                string readError;
+                // PERF-003 (SRC-006:R020): one body read + one parse per
+                // generation are the audited budget; the counting seams are
+                // what the regression harness asserts.
+                ExecutableDiscovery.ConfigReads++;
+                string text = BoundedFile.ReadAllText(path, 4 * 1024 * 1024, out bytesRead, out readError);
+                if (text == null) { FillSummary(scan, path, length, mtimeTicks, null); return scan; }
+                doc = J.Parse(text);
+            }
+            catch { FillSummary(scan, path, length, mtimeTicks, null); return scan; }
+            if (doc == null) { FillSummary(scan, path, length, mtimeTicks, null); return scan; }
+            ExecutableDiscovery.ConfigParses++;
+            scan.Parsed = true;
+            object providers = J.Get(doc, "provider");
+            if (providers == null) { FillSummary(scan, path, length, mtimeTicks, null); return scan; }
+            scan.HasProviderMap = true;
+
+            ZcodeProvider bestKey = null;
+            var map = J.Obj(providers);
+            if (map == null) { FillSummary(scan, path, length, mtimeTicks, null); return scan; }
+            foreach (KeyValuePair<string, object> entry in map)
+            {
+                string id = entry.Key ?? "";
+                object body = entry.Value;
+                if (body == null) continue;
+                string baseUrl = J.Str(J.Get(J.Get(body, "options"), "baseURL"))
+                    ?? J.Str(J.Get(body, "baseURL")) ?? "";
+                if (!VendorFamily(id, baseUrl)) continue;
+                var p = new ZcodeProvider
+                {
+                    Id = id,
+                    BaseUrl = baseUrl,
+                    CodingPlan = id.IndexOf("coding-plan", StringComparison.OrdinalIgnoreCase) >= 0,
+                    StartPlan = id.IndexOf("start-plan", StringComparison.OrdinalIgnoreCase) >= 0,
+                    Key = J.Str(J.Get(J.Get(body, "options"), "apiKey")) ?? J.Str(J.Get(body, "apiKey")) ?? "",
+                };
+                object enabledFlag = J.Get(body, "enabled");
+                if (enabledFlag == null) enabledFlag = J.Get(J.Get(body, "options"), "enabled");
+                if (enabledFlag != null)
+                {
+                    if (enabledFlag is bool) p.Enabled = (bool)enabledFlag;
+                    else
+                    {
+                        string text = J.Str(enabledFlag);
+                        if (text != null) p.Enabled = string.Equals(text.Trim(), "true", StringComparison.OrdinalIgnoreCase);
+                    }
+                }
+                // Two independent facts, tracked separately: a trusted vendor
+                // family entry EXISTS (with or without a key — the Settings
+                // row says "provider found, no readable key", never "no
+                // provider"), and the best USABLE credential source. Only
+                // key-bearing candidates compete for the key, so a keyless
+                // high-rank provider can never suppress a working one.
+                scan.VendorProviderSeen = true;
+                if (p.HasKey && (bestKey == null || RankBetter(p, bestKey))) bestKey = p;
+            }
+            if (bestKey != null)
+            {
+                scan.ProviderId = bestKey.Id;
+                scan.Key = bestKey.Key.Trim();
+                scan.HostHint = HostHint(bestKey.Id, bestKey.BaseUrl);
+            }
+            FillSummary(scan, path, length, mtimeTicks, bestKey);
+            return scan;
+        }
+
+        // SRC-007: fill the secret-free generation summary from facts the ONE
+        // scan already produced (no extra read/parse/stat: length and mtime
+        // came from the FileInfo the scan already took). `bestKey` may be
+        // null (no usable key): provider presence is reported through
+        // VendorProviderSeen, ProviderId stays empty, and host falls back to
+        // the provider map's own family hint when one exists.
+        static void FillSummary(ConfigScan scan, string path, long length, long mtimeTicks, ZcodeProvider bestKey)
+        {
+            string hostCategory;
+            if (bestKey != null)
+                hostCategory = HostHint(bestKey.Id, bestKey.BaseUrl) == HostBigModel ? "bigmodel" : "zai";
+            else hostCategory = "unknown";
+            string revision = Tag(path.ToLowerInvariant() + "|" + length + "|" + mtimeTicks);
+            scan.Summary = ZcodeGenerationSummary.Build(
+                true, "config", bestKey != null ? bestKey.Id : "", scan.VendorProviderSeen, hostCategory, revision);
+        }
+
+        // Compared ONLY between providers that carry a key: enabled outranks
+        // disabled, then Coding Plan > Start Plan > generic, then the config's
+        // own order stands (first seen wins). A keyless provider never enters
+        // the comparison, so it cannot mask a usable credential by rank.
+        static bool RankBetter(ZcodeProvider candidate, ZcodeProvider incumbent)
+        {
+            return candidate.Rank > incumbent.Rank;
+        }
+
+        // Exactly one field out of one file: the best Z.ai / BigModel
+        // provider's apiKey. Nothing else in that config is looked at, and the
+        // file is opened read-only.
         public static string FromConfig(string path)
         {
             string providerId;
@@ -194,33 +540,9 @@ namespace Limisaw
         public static string FromConfig(string path, out string providerId)
         {
             providerId = null;
-            object doc;
-            try
-            {
-                // A config that grew huge is a config we do not understand;
-                // refusing to parse it beats loading an arbitrary blob.
-                var info = new FileInfo(path);
-                if (info.Length > 4 * 1024 * 1024) return null;
-                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var reader = new StreamReader(fs))
-                    doc = J.Parse(reader.ReadToEnd());
-            }
-            catch { return null; }
-            object providers = J.Get(doc, "provider");
-            if (providers == null) return null;
-            foreach (string id in ProviderIds)
-            {
-                object entry = J.Get(providers, id);
-                if (entry == null) continue;
-                string key = J.Str(J.Get(J.Get(entry, "options"), "apiKey"));
-                if (string.IsNullOrEmpty(key)) key = J.Str(J.Get(entry, "apiKey"));
-                if (!string.IsNullOrEmpty(key) && key.Trim().Length > 0)
-                {
-                    providerId = id;
-                    return key.Trim();
-                }
-            }
-            return null;
+            ConfigScan scan = ScanConfig(path);
+            providerId = scan.ProviderId;
+            return scan.Key;
         }
 
         // A secret must not reach a card, a log or an exception message. Every
@@ -330,6 +652,47 @@ namespace Limisaw
             }
         }
 
+        // W2-001: one explicit success-response ceiling. The quota payload is a
+        // small JSON object; 1 MiB is orders of magnitude past any real
+        // response while keeping retained memory tiny. Measured in BYTES, not
+        // UTF-16 chars: the cap must bound what the socket can hand us, not
+        // what a StringBuilder happened to reserve.
+        internal const int MaxResponseBytes = 1024 * 1024;
+
+        // The bounded reader for the one success path. Returns the decoded body
+        // only when it fits the cap and the absolute deadline; otherwise null
+        // with a machine-readable error. A declared length past the cap is
+        // refused before any read; an unknown/chunked body is read
+        // incrementally and abandoned the instant max+1 proves it oversized.
+        internal static string ReadBoundedResponse(Stream stream, long contentLength, int maxBytes,
+            double absoluteDeadline, out string error)
+        {
+            error = null;
+            if (contentLength > maxBytes) { error = "response_too_large"; return null; }
+            var acc = new System.IO.MemoryStream();
+            var buf = new byte[8192];
+            while (true)
+            {
+                // The absolute deadline, not ReadWriteTimeout, is the operation
+                // budget: a server that trickles bytes just inside each socket
+                // timeout can never keep this loop alive past the caller's
+                // deadline.
+                if (Stamp.Now > absoluteDeadline) { error = "deadline_exceeded"; return null; }
+                long room = (long)maxBytes + 1 - acc.Length;
+                if (room <= 0) { error = "response_too_large"; return null; }
+                int toRead = buf.Length;
+                if (toRead > room) toRead = (int)room;
+                int n;
+                try { n = stream.Read(buf, 0, toRead); }
+                catch (Exception ex) { error = ex.GetType().Name; return null; }
+                if (n <= 0) break;
+                acc.Write(buf, 0, n);
+                if (acc.Length > maxBytes) { error = "response_too_large"; return null; }
+            }
+            try { return System.Text.Encoding.UTF8.GetString(acc.ToArray()); }
+            catch (Exception ex) { error = ex.GetType().Name; return null; }
+        }
+
         // One GET, one header, no body, no redirects followed to another host.
         // Returns null and an explanation rather than throwing, so a dead
         // network is one card's error instead of a lost sweep.
@@ -357,15 +720,28 @@ namespace Limisaw
                     if ((int)response.StatusCode >= 300)
                     { error = "HTTP " + (int)response.StatusCode; return null; }
                     if (stream == null) { error = "empty response"; return null; }
-                    using (var reader = new StreamReader(stream)) return reader.ReadToEnd();
+                    // W2-001/R030: the success body is BOUNDED and the absolute
+                    // deadline is re-checked on every read. A declared length
+                    // past the ceiling is refused without reading; an
+                    // unknown/chunked body is read incrementally only until
+                    // max+1 proves it oversized. Oversized or truncated input
+                    // is NEVER parsed as quota truth.
+                    return ReadBoundedResponse(stream, response.ContentLength, MaxResponseBytes, deadline, out error);
                 }
             }
             catch (WebException ex)
             {
-                var response = ex.Response as HttpWebResponse;
-                error = response != null
-                    ? "HTTP " + (int)response.StatusCode
-                    : ex.Status.ToString();
+                // W2-010: the error response is a real WebResponse holding a
+                // connection from the pool. Reading the status and walking away
+                // leaked it on every 401/403/500, one lease per refresh against
+                // a host the account will keep failing against until the key
+                // is fixed.
+                using (var response = ex.Response as HttpWebResponse)
+                {
+                    error = response != null
+                        ? "HTTP " + (int)response.StatusCode
+                        : ex.Status.ToString();
+                }
                 return null;
             }
             catch (Exception ex) { error = ex.GetType().Name; return null; }

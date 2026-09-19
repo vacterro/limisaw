@@ -81,20 +81,36 @@ namespace Limisaw
         // installed — that is what the journal fallback exists for, not a fault.
         static List<ProbeWindow> CliWindows(double deadline, out string error)
         {
-            error = null;
+            var windows = ReadCliUsage(deadline);
+            error = windows == null ? LastCliUsageError : null;
+            return windows;
+        }
+
+        // ── R074: the narrow structured entry point for the CONNECTION adapter ──
+        // The connection adapter must reuse — never fork — this path: the exact
+        // command (`agy -p "/usage" --output-format json`), the bounded Cli.Run,
+        // the payload limits, the JSON parser and the pool-qualified windows all
+        // stay owned here. LastCliUsageError holds the same sanitized `error`
+        // string the journal fallback would see; a null result with a null error
+        // means the CLI is simply absent.
+        internal static string LastCliUsageError;
+
+        internal static List<ProbeWindow> ReadCliUsage(double deadline)
+        {
+            LastCliUsageError = null;
             string exe = Cli.Resolve("antigravity");
             if (exe.Length == 0) return null;
             Cli.Result res = Cli.Run(exe,
                 new[] { "-p", "/usage", "--output-format", "json" }, deadline, null);
-            if (!res.Ok) { error = "agy /usage: " + res.Error; return null; }
+            if (!res.Ok) { LastCliUsageError = "agy /usage: " + res.Error; return null; }
             object payload = J.Parse(res.Stdout);
-            if (payload == null) { error = "agy /usage did not return JSON"; return null; }
+            if (payload == null) { LastCliUsageError = "agy /usage did not return JSON"; return null; }
             string status = J.Str(J.Get(payload, "status"));
             if (!string.IsNullOrEmpty(status) && status != "SUCCESS")
-            { error = "agy /usage: " + status; return null; }
+            { LastCliUsageError = "agy /usage: " + status; return null; }
             List<Row> rows = ParseUsagePayload(payload);
             if (rows.Count == 0)
-            { error = "agy /usage reported no readable quota window"; return null; }
+            { LastCliUsageError = "agy /usage reported no readable quota window"; return null; }
             return WindowsFrom(rows, "antigravity-cli-usage");
         }
 
@@ -254,12 +270,18 @@ namespace Limisaw
                     + "Antigravity CLI for exact quota");
             acc.Status = Model.OK;
             acc.Ok = true;
-            // Once resets_at passes, Model.Resolve renders this same window as
-            // refilled (AssumedFull) and the reset alert fires; that is why an
-            // elapsed stamp is passed through as-is.
+            bool active = refusal.ResetEpoch > now;
+            // W2-003: an ACTIVE block is the vendor's own verdict — exhausted
+            // until the reset, a real 0. An ELAPSED one (inside the grace) is
+            // only an EVENT: the block ended, but nothing has measured the
+            // quota since, so the window stays unreadable instead of crossing
+            // ApplyElapsedResets as a fabricated 100% "refilled". The reset
+            // stamp is kept either way — the reset alert keys on it.
+            acc.UnverifiedReset = !active;
             acc.Windows.Add(new ProbeWindow
             {
-                Key = "quota", Available = true, Remaining = 0.0,
+                Key = "quota", Available = active,
+                Remaining = active ? 0.0 : (double?)null,
                 ResetEpoch = refusal.ResetEpoch, Source = "antigravity-brain-message",
             });
             return acc;
@@ -322,6 +344,16 @@ namespace Limisaw
             public Refusal Best;
             public bool DeadlineHit;
             public int OpenedFiles, CachedFiles;
+            // PERF-002: the deterministic cost counters. A scan must stop
+            // enumerating the tree once its deadline or cap can safely end the
+            // work — these count the metadata VISITS (dirs + files) so the
+            // harness can prove operation counts, not wall-clock guesses.
+            public int DirVisits, FileVisits;
+            // PERF-002: true when the whole tree was walked to completion, so
+            // the caller may treat absence (or the live set) as authoritative.
+            // A deadline-cut walk leaves this false and may never prove a
+            // negative or prune a live set it never saw.
+            public bool Completed;
         }
 
         // PERF-002 cache: a body is parsed only when its file changed. Keyed by
@@ -330,23 +362,41 @@ namespace Limisaw
         // first. The counters are what the harness asserts against: without
         // the cache and the deadline, a full scan could open 16 dirs × 200
         // files × 64KiB — the 200MiB bound the audit measured.
-        class CacheEntry { public double Mtime; public long Length; public List<Refusal> Events; }
+        class CacheEntry { public double Mtime; public long Length; public List<Refusal> Events; public long LastSeen; }
         static readonly Dictionary<string, CacheEntry> BodyCache = new Dictionary<string, CacheEntry>();
         internal static long BodyReads, BytesRead;
+        // PERF-002: enumeration seams. Production defaults to the lazy
+        // Directory.Enumerate* APIs; the harness wraps them with counting
+        // generators to prove the scanner PULLS only what it needs (an eager
+        // GetDirectories/GetFiles materializes the whole tree before the
+        // scanner gets control — exactly the waste this repair removes).
+        internal static Func<string, IEnumerable<string>> EnumerateDirs =
+            root => Directory.EnumerateDirectories(root);
+        internal static Func<string, string, IEnumerable<string>> EnumerateFiles =
+            (dir, pattern) => Directory.EnumerateFiles(dir, pattern);
         internal static void ResetBodyCache()
         {
             BodyCache.Clear(); BodyReads = 0; BytesRead = 0;
+            ScanGeneration = 0;
         }
+        // PERF-003: monotonic scan generation stamping every cache visit, and
+        // the hard cardinality ceiling — see the PERF-003 block below.
+        internal static long ScanGeneration;
 
         internal static JournalScan LatestRefusal(string dataDir, double now, double deadline)
         {
             var scan = new JournalScan();
             if (string.IsNullOrEmpty(dataDir)) return scan;
             string root = Path.Combine(dataDir, "brain");
-            if (!Directory.Exists(root)) return scan;
+            if (!Directory.Exists(root)) { scan.Completed = true; return scan; }
+            ScanGeneration++;
             var events = new List<Refusal>();
-            foreach (string dir in RecentConversations(root, now))
-                events.AddRange(EventsFrom(dir, now, deadline, scan));
+            var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string dir in RecentConversations(root, now, deadline, scan))
+            {
+                if (scan.DeadlineHit) break;
+                events.AddRange(EventsFrom(dir, now, deadline, scan, seenPaths));
+            }
             Refusal best = null;
             foreach (Refusal ev in events)
             {
@@ -357,16 +407,54 @@ namespace Limisaw
                     best = ev;
             }
             scan.Best = best;
+            // PERF-002: a deadline-cut walk cannot report "no refusal" while a
+            // warm cache still holds parsed evidence — the old scan answered
+            // cache hits past the deadline and that contract stays. The cached
+            // events are served WITHOUT touching LastSeen (an unseen entry
+            // must not look seen, so a partial scan still prunes nothing).
+            if (scan.Best == null && scan.DeadlineHit)
+            {
+                foreach (KeyValuePair<string, CacheEntry> kv in BodyCache)
+                    foreach (Refusal ev in kv.Value.Events)
+                    {
+                        bool activeNow = ev.ResetEpoch > now;
+                        bool activeBest = scan.Best != null && scan.Best.ResetEpoch > now;
+                        if (scan.Best == null || (activeNow && !activeBest)
+                            || (activeNow == activeBest && ev.ObservedAt > scan.Best.ObservedAt))
+                            scan.Best = ev;
+                    }
+            }
+            // PERF-003: two independent bounds own the cache.
+            //  Live-set pruning is a COMPLETE-scan privilege: a scan the
+            //  deadline cut has not seen the whole tree, so an unseen entry
+            //  may still be live and pruning it would destroy a warm cache
+            //  for nothing. A complete scan may prove absence.
+            //  The hard cardinality ceiling applies after EVERY scan — it is
+            //  the second safety bound for repeated partial scans and name
+            //  churn, evicting least-recently-seen entries deterministically.
+            if (!scan.DeadlineHit) PruneLiveSet(seenPaths);
+            EnforceBodyCacheCap();
             return scan;
         }
 
-        static List<string> RecentConversations(string root, double now)
+        // PERF-002: the conversation walk is LAZY and deadline-bounded. It
+        // stats each candidate's message directory (the only way to know its
+        // age), keeps a bounded newest-K set (K = MaxDirs) instead of sorting
+        // the whole population, and stops the moment the deadline expires —
+        // marking the scan partial. Enumeration order is not freshness order,
+        // so the bounded set is maintained by INSERTION against the current
+        // worst candidate, never by Take(MaxDirs).
+        static List<string> RecentConversations(string root, double now, double deadline, JournalScan scan)
         {
-            var found = new List<KeyValuePair<double, string>>();
-            string[] names;
-            try { names = Directory.GetDirectories(root); } catch { return new List<string>(); }
-            foreach (string name in names)
+            // Bounded newest-first candidates: (mtime, dir). Capacity MaxDirs.
+            var best = new List<KeyValuePair<double, string>>(MaxDirs);
+            IEnumerable<string> dirs;
+            try { dirs = EnumerateDirs(root); }
+            catch { return best.ConvertAll(kv => kv.Value); }
+            foreach (string name in dirs)
             {
+                scan.DirVisits++;
+                if (Stamp.Now >= deadline) { scan.DeadlineHit = true; break; }
                 string dir = Path.Combine(name, ".system_generated", "messages");
                 double mtime;
                 try
@@ -376,40 +464,89 @@ namespace Limisaw
                 }
                 catch { continue; }
                 if (now - mtime > MaxAgeS) continue;
-                found.Add(new KeyValuePair<double, string>(mtime, dir));
+                InsertBounded(best, mtime, dir, MaxDirs);
             }
-            found.Sort((a, b) => b.Key.CompareTo(a.Key));
-            var dirs = new List<string>();
-            for (int i = 0; i < found.Count && i < MaxDirs; i++) dirs.Add(found[i].Value);
-            return dirs;
+            best.Sort((a, b) => b.Key.CompareTo(a.Key));
+            return best.ConvertAll(kv => kv.Value);
         }
 
-        static List<Refusal> EventsFrom(string directory, double now, double deadline, JournalScan scan)
+        // PERF-002: one bounded newest-candidate structure shared by both
+        // scanners. The caps are tiny (16 dirs, 200 files), so a linear
+        // worst-eviction beats any dependency: if the list is full and the
+        // newcomer is newer than the oldest kept candidate, the oldest dies.
+        static void InsertBounded(List<KeyValuePair<double, string>> best, double mtime, string value, int cap)
+        {
+            if (best.Count < cap) { best.Add(new KeyValuePair<double, string>(mtime, value)); return; }
+            int worst = 0;
+            for (int i = 1; i < best.Count; i++) if (best[i].Key < best[worst].Key) worst = i;
+            if (mtime <= best[worst].Key) return;
+            best.RemoveAt(worst);
+            best.Add(new KeyValuePair<double, string>(mtime, value));
+        }
+
+        static List<Refusal> EventsFrom(string directory, double now, double deadline, JournalScan scan, HashSet<string> seenPaths)
         {
             var events = new List<Refusal>();
-            string[] names;
-            try { names = Directory.GetFiles(directory, "*.json"); } catch { return events; }
-            // PERF-002: newest FIRST, then the cap. The old code capped whatever
-            // order GetFiles answered with, so in a conversation with more
-            // messages than the cap the newest refusal — the only one that
-            // still matters — could sit outside the prefix and never be read.
-            // Stating every file is metadata; no body is read here.
-            var fresh = new List<KeyValuePair<double, string>>();
+            // PERF-002: the file walk is LAZY (EnumerateFiles) and the deadline
+            // bounds the METADATA walk too, not only the body reads. Newest-K
+            // selection happens WHILE walking: a bounded list of at most
+            // MaxFilesPerDir candidates, evicting its worst member as newer
+            // ones arrive. A tree with tens of thousands of stale messages
+            // costs a stat each but never a materialized whole-directory
+            // array, and the deadline stops the walk itself.
+            var candidates = new List<KeyValuePair<double, string>>(MaxFilesPerDir);
             var lengths = new Dictionary<string, long>();
+            IEnumerable<string> names;
+            try { names = EnumerateFiles(directory, "*.json"); }
+            catch { return events; }
             foreach (string path in names)
             {
+                scan.FileVisits++;
+                if (Stamp.Now >= deadline) { scan.DeadlineHit = true; break; }
                 try
                 {
                     double mtime = Stamp.Of(File.GetLastWriteTimeUtc(path));
                     if (now - mtime > MaxAgeS) continue;
-                    fresh.Add(new KeyValuePair<double, string>(mtime, path));
-                    lengths[path] = new FileInfo(path).Length;
+                    // PERF-002: every live fresh file joins the live set for
+                    // this scan (PERF-003 pruning) and a warm cache entry is
+                    // served IMMEDIATELY — the cap was and is a bound on body
+                    // OPENs, never on cached answers, so no evidence a cache
+                    // already holds can drop out of the result.
+                    seenPaths.Add(path);
+                    CacheEntry hit;
+                    long length;
+                    try { length = new FileInfo(path).Length; }
+                    catch { continue; }
+                    if (BodyCache.TryGetValue(path, out hit) && hit.Mtime == mtime && hit.Length == length)
+                    {
+                        hit.LastSeen = ScanGeneration;
+                        scan.CachedFiles++;
+                        events.AddRange(hit.Events);
+                        continue;
+                    }
+                    // A body-read candidate competes for one of MaxFilesPerDir
+                    // bounded slots: the worst (oldest) candidate dies when a
+                    // newer one arrives, so retention stays O(cap) no matter
+                    // how many files the directory holds.
+                    if (candidates.Count == MaxFilesPerDir)
+                    {
+                        int worst = 0;
+                        for (int i = 1; i < candidates.Count; i++) if (candidates[i].Key < candidates[worst].Key) worst = i;
+                        if (mtime <= candidates[worst].Key) continue;
+                        lengths.Remove(candidates[worst].Value);
+                        candidates.RemoveAt(worst);
+                    }
+                    candidates.Add(new KeyValuePair<double, string>(mtime, path));
+                    lengths[path] = length;
                 }
                 catch { continue; }
             }
-            fresh.Sort((a, b) => b.Key.CompareTo(a.Key));
+            // PERF-002: newest first, then the cap — the same accepted cost as
+            // before (the newest 200 may still be opened), now decided over a
+            // bounded candidate set instead of the whole directory.
+            candidates.Sort((a, b) => b.Key.CompareTo(a.Key));
             int opened = 0;
-            foreach (KeyValuePair<double, string> kv in fresh)
+            foreach (KeyValuePair<double, string> kv in candidates)
             {
                 if (opened >= MaxFilesPerDir) break;
                 string path = kv.Value;
@@ -417,11 +554,9 @@ namespace Limisaw
                 CacheEntry hit;
                 if (BodyCache.TryGetValue(path, out hit) && hit.Mtime == mtime && hit.Length == lengths[path])
                 {
-                    // A cached file is answered from the stat the caller already
-                    // paid for — it costs no body read, so it is served even
-                    // past the deadline. The deadline bounds BODY reads, not
-                    // metadata, and a warm cache must keep answering when the
-                    // sweep has no time left.
+                    // (Defensive: the walk serves cached entries already; this
+                    // branch keeps the body loop correct if one raced in.)
+                    hit.LastSeen = ScanGeneration;
                     scan.CachedFiles++;
                     events.AddRange(hit.Events);
                     continue;
@@ -447,10 +582,67 @@ namespace Limisaw
                         }
                     }
                 }
-                BodyCache[path] = new CacheEntry { Mtime = mtime, Length = lengths[path], Events = parsed };
+                BodyCache[path] = new CacheEntry { Mtime = mtime, Length = lengths[path], Events = parsed, LastSeen = ScanGeneration };
                 events.AddRange(parsed);
             }
             return events;
+        }
+
+        // ── PERF-003: bounded BodyCache ownership ────────────────────────────
+        // The cache used to grow for the life of the process: every journal
+        // path ever parsed stayed forever, so memory followed historical file
+        // churn instead of the current useful working set. Two bounds now own
+        // it, without touching forensic truth — an evicted entry can only
+        // cost a future safe body reread, never a wrong number.
+        //
+        //  1. Live-set pruning after a COMPLETE scan: entries not seen this
+        //     scan (and therefore no longer in the live candidate set) are
+        //     evicted. A DEADLINE-CUT scan prunes nothing — it has not seen
+        //     the whole tree and may not prove a path dead.
+        //  2. A hard cardinality ceiling (MaxBodyCacheEntries): protects
+        //     against repeated partial scans and filename churn. Over the
+        //     cap, the least-recently-SEEN entries are evicted
+        //     deterministically.
+        internal const int MaxBodyCacheEntries = 512;
+        internal static int BodyCacheCount { get { lock (BodyCache) return BodyCache.Count; } }
+        internal static long LastPruneRemoved;
+
+        // Bound 1 — live-set pruning, COMPLETE scans only. Every entry the
+        // scan did not see is no longer provably live (unlisted or aged out),
+        // so it dies. A partial scan never calls this.
+        static void PruneLiveSet(HashSet<string> seenPaths)
+        {
+            var dead = new List<string>();
+            lock (BodyCache)
+            {
+                foreach (KeyValuePair<string, CacheEntry> kv in BodyCache)
+                    if (!seenPaths.Contains(kv.Key)) dead.Add(kv.Key);
+                foreach (string path in dead) BodyCache.Remove(path);
+            }
+            if (dead.Count > 0) LastPruneRemoved = dead.Count;
+        }
+
+        // Bound 2 — the hard ceiling, enforced after every scan. Over the cap
+        // the least-recently-SEEN entry dies first: the stalest working set.
+        // Eviction never changes a number, only whether the next look at that
+        // path pays a fresh, safe body read.
+        static void EnforceBodyCacheCap()
+        {
+            List<string> evicted = null;
+            lock (BodyCache)
+            {
+                while (BodyCache.Count > MaxBodyCacheEntries)
+                {
+                    string oldest = null; long seen = long.MaxValue;
+                    foreach (KeyValuePair<string, CacheEntry> kv in BodyCache)
+                        if (kv.Value.LastSeen < seen) { seen = kv.Value.LastSeen; oldest = kv.Key; }
+                    if (oldest == null) break;
+                    BodyCache.Remove(oldest);
+                    if (evicted == null) evicted = new List<string>();
+                    evicted.Add(oldest);
+                }
+            }
+            if (evicted != null) LastPruneRemoved = evicted.Count;
         }
 
         static string ReadCapped(string path, int maxBytes)
@@ -478,6 +670,25 @@ namespace Limisaw
         public const double TotalBudgetS = 66.0;
         public const double PerAccountBudgetS = 26.0;
 
+        // The smallest per-provider slot that still affords a Codex cold start.
+        // A cold `codex app-server` needs at least ColdStartFloorSeconds, so a
+        // provider whose slot is shallower is returned `cold_start_underfunded`
+        // EVERY sweep and can never warm — the starvation this guards. Equal
+        // division alone starves Codex once five providers are active
+        // (66 / 5 = 13.2 s < 14 s). 16.5 s is exactly the share the original
+        // four-provider budget granted, kept so a machine with four or fewer
+        // active providers is scheduled byte-for-byte as before.
+        public const double MinViableShareS = TotalBudgetS / 4.0;
+
+        // The per-provider slot for `providers` active vendors: the equal share,
+        // floored at MinViableShareS. The total budget follows the slots
+        // (deadline = start + share * providers), so the floor widens the sweep
+        // only when it must and never clamps a later provider off the end.
+        internal static double ProviderShare(int providers)
+        {
+            return Math.Max(TotalBudgetS / providers, MinViableShareS);
+        }
+
         public static ProbeResult Run()
         {
             return Run(false);
@@ -488,40 +699,80 @@ namespace Limisaw
         // one owner means the test can drive both halves.
         public static ProbeResult Run(bool zcodeReadConfig)
         {
+            return Run(zcodeReadConfig, false);
+        }
+
+        // T-50: `freebuffReadConfig` is FreeBuff's own credential permission,
+        // and FreeBuff is OPTIONAL — it participates only when positively
+        // detected. T-51 P1-1: `freebuffFound` is the generation's PUBLISHED
+        // presence, read from the snapshot so the worker that already built the
+        // generation does not fork a second discovery walk; before a generation
+        // exists the worker is the builder, so its own probe is authoritative.
+        public static ProbeResult Run(bool zcodeReadConfig, bool freebuffReadConfig)
+        {
+            bool? published = ExecutableDiscovery.PublishedPresence("freebuff");
+            bool freebuffFound = published.HasValue
+                ? published.Value
+                : (ExecutableDiscovery.OptionalVendorPresent != null
+                    && ExecutableDiscovery.OptionalVendorPresent("freebuff"));
+            return Run(zcodeReadConfig, freebuffReadConfig, freebuffFound);
+        }
+
+        public static ProbeResult Run(bool zcodeReadConfig, bool freebuffReadConfig, bool freebuffFound)
+        {
             double now = Stamp.Now;
-            double deadline = now + TotalBudgetS;
             var result = new ProbeResult();
             var accounts = new List<ProbeAccount>();
 
-            // CORE-003 fair shares: every provider that could have an account
-            // gets an equal slice of the sweep budget up front. A Codex machine
-            // with many homes can no longer starve Claude/Antigravity/Zcode out
-            // of the sweep — a slow Codex home eats its own share, never the
-            // providers scheduled behind it. Discovery of Codex homes happens
-            // inside Sweep before any probing, so the share divides across the
-            // whole target set, not whoever sorted first.
+            // W2-001: the schedule is built from the ACTIVE providers, so each
+            // one gets a distinct cumulative slot. The old fixed multiples
+            // (now + share, now + 2*share, ...) counted Codex unconditionally
+            // — with no Codex home, every later provider inherited a slot that
+            // started before its own turn, and Claude's end was Codex's end, so
+            // a slow healthy Codex expired Claude while the final share
+            // (66 - 4*12.45 = 16.5s) was unreachable by construction.
             bool claudeOn = ClaudeSource.Installed();
             bool agyOn = AntigravitySource.Installed();
             bool zcodeOn = ZcodeSource.Installed();
-            int providers = 1 + (claudeOn ? 1 : 0) + (agyOn ? 1 : 0) + (zcodeOn ? 1 : 0);
-            double share = Math.Max(0.2, TotalBudgetS / providers);
+            // T-50: FreeBuff is OPTIONAL and only present when positively
+            // detected. It takes a slot only then, so the four core vendors'
+            // budget is never diluted by a vendor that is not installed.
+            bool freebuffOn = FreebuffSource.Installed(freebuffFound);
+            int providers = 1 + (claudeOn ? 1 : 0) + (agyOn ? 1 : 0) + (zcodeOn ? 1 : 0) + (freebuffOn ? 1 : 0);
+            // The per-provider slot is floored at a viable Codex cold start, and
+            // the total budget follows the slots. With four or fewer providers
+            // the equal share already clears the floor, so share and deadline are
+            // identical to the original 66 s / 16.5 s schedule. A fifth active
+            // vendor would otherwise cut every slot to 13.2 s and starve Codex
+            // forever (13.2 < ColdStartFloorSeconds); the floor widens the sweep
+            // exactly far enough to keep every vendor's slot viable.
+            double share = ProviderShare(providers);
+            double deadline = now + share * providers;
+            double codexEnd = now + share;
+            double claudeEnd = codexEnd + (claudeOn ? share : 0);
+            double agyEnd = claudeEnd + (agyOn ? share : 0);
+            double zcodeEnd = agyEnd + (zcodeOn ? share : 0);
+            double freebuffEnd = zcodeEnd + (freebuffOn ? share : 0);
 
-            try { accounts.AddRange(CodexSource.Sweep(now + share, share)); }
+            try { accounts.AddRange(CodexSource.Sweep(codexEnd, share)); }
             catch (Exception ex) { accounts.Add(Broken("codex", "Codex", ex)); }
 
             if (claudeOn)
             {
-                double end = Math.Min(now + share, deadline);
+                double end = Math.Min(claudeEnd, deadline);
                 if (end - Stamp.Now > 0.2)
                 {
-                    try { accounts.Add(ClaudeSource.Probe(end)); }
+                    // One card per Claude config directory, exactly like Codex
+                    // homes: a second subscription is a second home, and it used
+                    // to be invisible here.
+                    try { accounts.AddRange(ClaudeSource.Sweep(end, share)); }
                     catch (Exception ex) { accounts.Add(Broken("claude", "Claude Code", ex)); }
                 }
             }
 
             if (agyOn)
             {
-                double end = Math.Min(now + 2 * share, deadline);
+                double end = Math.Min(agyEnd, deadline);
                 if (end - Stamp.Now > 0.2)
                 {
                     try { accounts.Add(AntigravitySource.Probe(end)); }
@@ -531,7 +782,7 @@ namespace Limisaw
 
             if (zcodeOn)
             {
-                double end = Math.Min(now + 3 * share, deadline);
+                double end = Math.Min(zcodeEnd, deadline);
                 if (end - Stamp.Now > 0.2)
                 {
                     try { accounts.Add(ZcodeSource.Probe(end, zcodeReadConfig)); }
@@ -539,8 +790,20 @@ namespace Limisaw
                 }
             }
 
+            if (freebuffOn)
+            {
+                double end = Math.Min(freebuffEnd, deadline);
+                if (end - Stamp.Now > 0.2)
+                {
+                    try { accounts.Add(FreebuffSource.Probe(end, freebuffReadConfig, freebuffFound)); }
+                    catch (Exception ex) { accounts.Add(Broken("freebuff", "FreeBuff", ex)); }
+                }
+            }
+
             double at = Stamp.Now;
-            foreach (ProbeAccount acc in accounts) result.Accounts.Add(Model.Flatten(acc, at));
+            foreach (ProbeAccount acc in CodexSource.DistinctRemoteAccounts(accounts,
+                result.DuplicateCodexHomes, result.UnverifiedCodexHomes))
+                result.Accounts.Add(Model.Flatten(acc, at));
             result.Clis = Cli.Status();
             return result;
         }

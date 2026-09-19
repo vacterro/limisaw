@@ -306,10 +306,19 @@ public static class SliderCommit
         Console.WriteLine();
         Console.WriteLine("== the preview slider commits once and touches no alert state ==");
         SSet("PreviewPct", 65);
-        Paint(700);
+        // T-42: the two-column breakpoint. The one-column 560px layout keeps
+        // the wide rail the drag walk needs; at 700px the same slider lives in
+        // its two-column column, still usable.
+        Paint(560);
 
         Rectangle rail = Rail("VolRailPreview");
         Check("the preview rail is live", rail.Width >= 120, "rail " + rail.Width + "px");
+
+        Paint(700);
+        Rectangle railWide = Rail("VolRailPreview");
+        Check("...and stays live in the two-column layout", railWide.Width >= 60 && railWide != Rectangle.Empty,
+            "rail " + railWide.Width + "px");
+        rail = railWide;
 
         IDictionary notified = Notified();
         notified.Clear();

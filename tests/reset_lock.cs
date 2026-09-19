@@ -26,6 +26,9 @@ public static class ResetLock
     {
         public string Provider = "codex", Name = "Codex";
         public bool Ok = true;
+        // W2-003: the journal refusal's reset passed inside the grace — the
+        // reset EVENT rides on this snapshot, the quota is unverified.
+        public bool ResetUnverified;
         public List<WindowData> Windows = new List<WindowData>();
         public string Key { get { return Provider + "/" + Name; } }
         public WindowData Find(string key)
@@ -40,6 +43,7 @@ public static class ResetLock
         public string AccountLabel = "", LimitLabel = "";
         public int NewRemaining; public string ResetAt;
         public bool LockedByWeekly;
+        public bool Unverified;
     }
 
     static List<string> NotifiedResetKeys = new List<string>();
@@ -68,8 +72,25 @@ public static class ResetLock
         }));
     }
 
+    // W2-003: the unverified-reset branch of DetectResets. Same once-per-event
+    // suppression as CheckReset, but the announcement says the truth.
+    static void CheckUnverifiedReset(AccountData acc, WindowData w)
+    {
+        string key = acc.Key + "_" + w.Key + "_" + w.Reset + "_unverified";
+        if (NotifiedResetKeys.Contains(key)) return;
+        NotifiedResetKeys.Add(key);
+        if (NotifiedResetKeys.Count > 100) NotifiedResetKeys.RemoveRange(0, 50);
+        Fired.Add(NotifyText(new ResetEvent
+        {
+            AccountLabel = acc.Name, LimitLabel = WindowTitle(w),
+            ResetAt = w.Reset, Unverified = true,
+        }));
+    }
+
     static string NotifyText(ResetEvent ev)
     {
+        if (ev.Unverified)
+            return ev.LimitLabel + " limit reset - quota unverified until the next report";
         return ev.LockedByWeekly
             ? ev.LimitLabel + " limit reset - still 0% usable, locked by a longer window"
             : ev.LimitLabel + " limit reset - " + ev.NewRemaining + "% remaining";
@@ -78,6 +99,21 @@ public static class ResetLock
     static void DetectResets(AccountData cur, AccountData prev)
     {
         if (!cur.Ok || prev == null || !prev.Ok) return;
+        // W2-003: an unverified reset announces through the reset STAMP — the
+        // previous sweep was blocked at 0% on this exact reset, this sweep
+        // says the stamp passed. No percentage is claimed.
+        if (cur.ResetUnverified)
+        {
+            foreach (WindowData w in cur.Windows)
+            {
+                if (string.IsNullOrEmpty(w.Reset)) continue;
+                WindowData pw = prev.Find(w.Key);
+                if (pw == null || string.IsNullOrEmpty(pw.Reset) || pw.Reset != w.Reset) continue;
+                if (pw.Available && pw.Rem > 0) continue;   // not a blocked card
+                CheckUnverifiedReset(cur, w);
+            }
+            return;
+        }
         foreach (WindowData w in cur.Windows)
         {
             WindowData pw = prev.Find(w.Key);
@@ -88,16 +124,24 @@ public static class ResetLock
 
     static int fails = 0;
 
-    static AccountData Acc(WindowData[] windows)
+    static AccountData Acc(WindowData[] windows) { return Acc(windows, false); }
+
+    static AccountData Acc(WindowData[] windows, bool unverified)
     {
         var a = new AccountData();
         a.Windows.AddRange(windows);
+        a.ResetUnverified = unverified;
         return a;
     }
 
     static WindowData W(string key, string label, int rem, string reset, string gatedBy)
     {
-        return new WindowData { Key = key, Label = label, Rem = rem, Reset = reset, GatedBy = gatedBy };
+        return new WindowData { Key = key, Label = label, Rem = rem, Reset = reset, GatedBy = gatedBy, Available = true };
+    }
+
+    static WindowData UW(string key, string label, string reset)
+    {
+        return new WindowData { Key = key, Label = label, Reset = reset, Available = false };
     }
 
     static void Case(string name, AccountData prev, AccountData cur, string[] want)
@@ -173,9 +217,38 @@ public static class ResetLock
 
         // a window that vanished from the snapshot cannot fire
         Case("window missing in the previous snapshot stays silent",
-             Acc(new[] { W("weekly", "week", 0, "W1", null) }),
-             Acc(new[] { W("five_hour", "5h", 100, "T2", null) }),
-             new string[] { });
+              Acc(new[] { W("weekly", "week", 0, "W1", null) }),
+              Acc(new[] { W("five_hour", "5h", 100, "T2", null) }),
+              new string[] { });
+
+        // ── W2-003: an elapsed Antigravity refusal is an EVENT, not a free quota ──
+        // The old fabrication: a blocked card (0%, reset T1) whose reset then
+        // passed reached CheckReset as 100% and the balloon promised "100%
+        // remaining". The unverified branch exists so the announcement says
+        // what is true: the block ended, nothing has measured the quota since.
+        Case("elapsed unverified reset announces UNVERIFIED, never 100%",
+              Acc(new[] { W("quota", "5h", 0, "T1", null) }),
+              Acc(new[] { UW("quota", "5h", "T1") }, true),
+              new[] { "5h limit reset - quota unverified until the next report" });
+
+        // Repeated-fire suppression is CheckReset's own once-per-event key list
+        // (verified there); the unverified branch uses the same list with an
+        // "_unverified" suffix, so it cannot collide with the ordinary reset
+        // for the same stamp and fire twice for one event.
+
+        // A previous card that was NOT blocked (55% left) is not a reset the
+        // user was waiting for, so nothing is announced.
+        Case("a non-blocked previous card stays silent on the unverified path",
+              Acc(new[] { W("quota", "5h", 55, "T1", null) }),
+              Acc(new[] { UW("quota", "5h", "T1") }, true),
+              new string[] { });
+
+        // A DIFFERENT reset stamp is a different window, not the same event
+        // ending — the stamps must agree or it is not this reset.
+        Case("a different reset stamp is not this event",
+              Acc(new[] { W("quota", "5h", 0, "T1", null) }),
+              Acc(new[] { UW("quota", "5h", "T2") }, true),
+              new string[] { });
 
         Console.WriteLine();
         Console.WriteLine(fails == 0 ? "PASS (0 failures)" : "FAILED (" + fails + " failures)");

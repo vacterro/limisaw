@@ -67,7 +67,13 @@ public static class SettingsUx
 
     static Frame Paint(Type formType, object form, int width)
     {
-        ((Form)form).ClientSize = new Size(width, ((Form)form).ClientSize.Height);
+        // T-43: the Settings page grew (six tray layouts, the gauge/rows rows)
+        // and the window is user-owned since the responsive wave — a default
+        // 620px window scrolls the APP block out of the viewport, and clipped
+        // controls register nothing. Paint at a height that reaches the whole
+        // page: the parity question is "does every control explain itself",
+        // not "does the page fit a laptop".
+        ((Form)form).ClientSize = new Size(width, 820);
         formType.GetMethod("FitWindow", NP).Invoke(form, null);
         var f = (Form)form;
         using (var bmp = new Bitmap(Math.Max(1, f.Width), Math.Max(1, f.Height)))
@@ -280,8 +286,8 @@ public static class SettingsUx
         mode.SetValue(settings, savedMode);
 
         string[] needles = {
-            "one number", "two numbers", "one vertical bar", "one cell",
-            "halves", "quarters", "eighths", "exact",
+            "one number", "two numbers", "narrow vertical column", "block per reading",
+            "eighths", "exact",
             "time until", "percent left", "no number at all",
             "balloon:", "chime:", "threshold", "count down", "count up",
             "nothing real changes", "start LIMISAW with Windows",
@@ -305,11 +311,11 @@ public static class SettingsUx
         Check("hovering a row explains the row", layoutRow != Rectangle.Empty
             && HintAt(formType, form, new Point(layoutRow.X + 4, layoutRow.Y + 4)).Length > 0,
             layoutRow.ToString());
-        Rectangle barsBtn = HintZoneFor(f, "one vertical bar");
+        Rectangle barsBtn = HintZoneFor(f, "narrow vertical column");
         Check("hovering a control beats its row — the specific answer wins",
             barsBtn != Rectangle.Empty
             && HintAt(formType, form, new Point(barsBtn.X + barsBtn.Width / 2, barsBtn.Y + barsBtn.Height / 2))
-                .IndexOf("one vertical bar", StringComparison.Ordinal) >= 0,
+                .IndexOf("narrow vertical column", StringComparison.Ordinal) >= 0,
             HintAt(formType, form, new Point(barsBtn.X + barsBtn.Width / 2, barsBtn.Y + barsBtn.Height / 2)));
         Check("empty space explains nothing rather than something wrong",
             HintAt(formType, form, new Point(0, 0)) == "", "");
@@ -329,7 +335,7 @@ public static class SettingsUx
 
         mode.SetValue(settings, "single");
         Frame f = Paint(formType, form, 560);
-        Rectangle fill = HintZoneFor(f, "only bars and cells have a fill");
+        Rectangle fill = HintZoneFor(f, "only Gauge, Bars, Rows and Cells fill");
         Check("Number layout: the fill row says why it is dead",
             fill != Rectangle.Empty, "");
         Check("...and none of its buttons is clickable",
@@ -347,7 +353,7 @@ public static class SettingsUx
             !Clickable(f, new Rectangle(shows.X + 100, shows.Y, shows.Width - 100, shows.Height)),
             "");
         Check("...while the fill row is live again",
-            HintZoneFor(f, "only bars and cells have a fill") == Rectangle.Empty, "");
+            HintZoneFor(f, "only Gauge, Bars, Rows and Cells fill") == Rectangle.Empty, "");
 
         // The volume belongs to the CHIMES. With both muted it controls nothing.
         // CORE-005: the low alert's chime is its own switch now, so the low half
@@ -415,7 +421,8 @@ public static class SettingsUx
         Console.WriteLine("== the preview shows a level you choose, not the account's ==");
         FieldInfo previewPct = st.GetField("PreviewPct");
         FieldInfo mode = st.GetField("TrayMode");
-        MethodInfo render = formType.GetMethod("RenderPreviewBitmap", NP);
+        MethodInfo render = formType.GetMethod("RenderPreviewBitmap", NP, null, Type.EmptyTypes, null);
+        MethodInfo real = formType.GetMethod("RenderTrayBitmap", NP, null, Type.EmptyTypes, null);
         FieldInfo live = formType.GetField("PreviewPct", NP);
 
         Check("the pretend level is a saved setting, so it survives a restart",
@@ -443,8 +450,37 @@ public static class SettingsUx
         }
         finally { if (high != null) high.Dispose(); if (low != null) low.Dispose(); }
 
-        Check("the preview flag is cleared afterwards, so the real tray is real again",
-            (int)live.GetValue(form) == -1, "PreviewPct=" + live.GetValue(form));
+        // The old implementation parked the pretend level in a mutable FORM
+        // field (set / render / finally -1), which made the real tray's data
+        // depend on who was rendering. The preview now renders its own model,
+        // and the field is gone: its absence is the contract.
+        Check("the preview carries no mutable form flag — its model is its own data",
+            live == null, live == null ? "no PreviewPct field on the form" : "PreviewPct=" + live.GetValue(form));
+
+        // ...and the real tray's own render is untouched by a preview pass.
+        Bitmap before = (Bitmap)real.Invoke(form, null);
+        previewPct.SetValue(settings, 34);
+        Bitmap fake = (Bitmap)render.Invoke(form, null);
+        Bitmap after = (Bitmap)real.Invoke(form, null);
+        bool same = before != null && after != null && before.Width == after.Width;
+        if (same)
+            for (int y = 0; y < before.Height && same; y++)
+                for (int x = 0; x < before.Width && same; x++)
+                    if (before.GetPixel(x, y).ToArgb() != after.GetPixel(x, y).ToArgb()) same = false;
+        bool fakeChanged = fake != null && before != null && fake.Width == before.Width;
+        if (fakeChanged)
+        {
+            bool equal = true;
+            for (int y = 0; y < before.Height && equal; y++)
+                for (int x = 0; x < before.Width && equal; x++)
+                    if (fake.GetPixel(x, y).ToArgb() != before.GetPixel(x, y).ToArgb()) equal = false;
+            fakeChanged = !equal;
+        }
+        before.Dispose(); after.Dispose(); if (fake != null) fake.Dispose();
+        Check("rendering a preview leaves the real tray render identical",
+            same, same ? "bit-identical around a 34% preview" : "the real picture moved");
+        Check("the preview picture itself follows the pretend level",
+            fakeChanged, fakeChanged ? "34% preview differs from the live picture" : "preview is a copy of the live picture");
 
         // Rendering through the real path is the point: a mock-up can agree with
         // the icon today and drift tomorrow. Every layout must survive it.
