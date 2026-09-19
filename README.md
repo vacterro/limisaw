@@ -1,6 +1,17 @@
+<img width="1600" height="560" alt="LIMISAW_HEADER1" src="https://github.com/user-attachments/assets/ff5571e3-f4d1-44e5-a017-5a3430e67360" />
+
 # LIMISAW
 
+**LIMISAW = LIMIT SAW.**
+
 **One file. No runtime. Every AI agent limit in your tray.**
+
+[![Latest release](https://img.shields.io/github/v/release/vacterro/limisaw?label=release&color=2ea44f)](https://github.com/vacterro/limisaw/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![Platform: Windows 10/11 x64](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078d4)
+![Runtime: none](https://img.shields.io/badge/runtime-none-brightgreen)
+
+**English** · [Eesti](README.ee.md) · [Eesti (lihtne)](README.ded.md) · [日本語](README.ja.md)
 
 LIMISAW is a Windows tray monitor for how much quota you have left across
 **Codex, Claude Code, Antigravity and Zcode** — every account each of them
@@ -23,7 +34,7 @@ LIMISAW.ini          <- written on first launch, next to the exe
 | Vendor | Source | Windows |
 | --- | --- | --- |
 | **Codex** | `codex app-server` JSON-RPC `account/rateLimits/read`, one call per `CODEX_HOME` | 5-hour, weekly, monthly (Free plan), plus any reserve pool the plan carries |
-| **Claude Code** | `claude -p "/usage"` (0 turns, $0.00), plus a status-line cache, Claude Desktop's own usage sampler and Claude Code's refusal journal as fallbacks | 5-hour, weekly, per-model weeklies |
+| **Claude Code** | `claude -p "/usage"` (0 turns, $0.00) once per `CLAUDE_CONFIG_DIR`, plus a status-line cache, Claude Desktop's own usage sampler and Claude Code's refusal journal as fallbacks | 5-hour, weekly, per-model weeklies |
 | **Antigravity** | `agy -p "/usage" --output-format json`, plus the IDE's 429 journal | weekly **and** 5-hour **per model pool** (Gemini / Claude & GPT) |
 | **Zcode** | `GET /api/monitor/usage/quota/limit` — the same monitor endpoint the app itself uses, on `api.z.ai` or `open.bigmodel.cn` | 5-hour, weekly (GLM Coding Plan) |
 
@@ -44,9 +55,20 @@ implicitly.
 
 **Discovered, not hardcoded.** Every account each vendor exposes becomes a card,
 a tray reading and a menu row — a new login needs no code change. `~/.codex`,
-`~/.codex-account2`, `~/.codex-whatever`: all of them, automatically. A plan with
-a reserve pool gets its own rows for it, labelled with the vendor's name for that
-pool.
+`~/.codex-account2`, `~/.codex-whatever`: all of them, automatically. Claude Code
+works the same way, because a Claude account IS its config directory: `~/.claude`,
+`~/.claude-work`, any `~/.claude-*`, and whatever `CLAUDE_CONFIG_DIR` names (`;`
+separates several). Two subscriptions are two cards, each probed with its own
+`CLAUDE_CONFIG_DIR` and identified by the directory, never by the label — two
+homes may both be called "Claude".
+
+**Adding the second one is a button**, not folklore: Connections → Claude Code →
+`Details` → `Add account` makes `~/.claude-account2` and starts Claude's own
+`auth login` inside it. The account you already use is untouched — which is the
+point, because signing in again the obvious way REPLACES it and the first card
+vanishes. Abandon the login and you get no card and no litter: the empty
+directory is reused by the next click. A plan with a reserve pool gets its own rows
+for it, labelled with the vendor's name for that pool.
 
 **Pool-aware gating.** A spent long window zeroes the shorter ones *in its own
 quota pool only*, so an exhausted Claude/GPT weekly never fakes a dead Gemini
@@ -65,35 +87,41 @@ own words, so "Not logged in" reads as something you can fix.
 
 ---
 
-## Zcode needs one line of permission
+## Zcode: install it, or just point LIMISAW at your key
 
-Zcode is the only vendor here with no CLI: it is an Electron desktop app and puts
-nothing on PATH. Its quota needs an API key, and **a key sitting in another
-application's config file is not LIMISAW's to take**. So there are exactly two
-ways in:
+Zcode is the only vendor here with no CLI — it is an Electron desktop app and
+puts nothing on PATH. So its quota needs an API key.
 
-```powershell
-$env:ZAI_API_KEY = "..."        # works immediately, no switch
-```
+LIMISAW keeps two ways in — **one of them right in Settings, no file editing**.
+Open the `Settings` tab, find the `Zcode` row (the same shape as every other
+switch), and turn `Config access` on. LIMISAW reads the key once out of Zcode's
+own `%USERPROFILE%\.zcode\v2\config.json`, only the single chosen provider's
+field, over the same local file read — and one `GET` later the Zcode card is
+live. Turn it off again and LIMISAW stops looking in the config.
 
-```ini
-; LIMISAW.ini — lets LIMISAW read the key out of Zcode's own config
-ZcodeReadConfig=1
-```
+That is discoverable because Settings is where users already go; hand-editing
+`LIMISAW.ini` remains an allowed advanced/manual path.
 
-With neither, the Zcode card stays idle and says which two options exist —
-nothing is read. With either, LIMISAW makes **one GET** to one of two constant
-hosts, refuses redirects so the key cannot be forwarded elsewhere, reads exactly
-one field out of one file, and redacts the key out of any message that could
-reach a card or a log.
+### The five things you might actually see there
+
+- `using ZAI_API_KEY` — an environment key you supplied is in charge; the Settings toggle is irrelevant.
+- `detected · config access off` — LIMISAW sees Zcode's config but you have not allowed the file read.
+- `config access on` — LIMISAW is allowed and no probed account has a Zcode window yet.
+- `config allowed · no Z.ai / BigModel plan key` — LIMISAW may read the config but the file has no Z.ai/BigModel credential inside it (for example, an account authenticated another way that LIMISAW deliberately cannot use).
+- `not detected` — install Zcode, enable config access in Settings, or set `ZAI_API_KEY`.
 
 ---
 
 ## The tray
 
-- **Four layouts** — one number, two stacked numbers (worst short over worst
-  long), one bar per reading, one cell per reading in a 1x1/2x2/3x3 grid — times
-  **four fill granularities** (halves, quarters, eighths, exact per pixel).
+- **Six layouts, one truth** — `Number` (the single reading you pin), `Two`
+  (worst short window over worst long one), `Gauge` (one thin horizontal meter
+  of the picked reading, no digits), `Bars` (a narrow vertical column per
+  selected reading, bottom-up), `Rows` (one horizontal mini-bar per selected
+  reading, top to bottom), `Cells` (one block per reading in a 1x1/2x2/3x3
+  grid, filled from the opposite edge) — times **two fill granularities**
+  (`1/8` steps, or `Exact` per pixel). Old `TrayFill=2/4` values keep working:
+  they load as `1/8` without rewriting your ini.
 - **You choose what it shows.** A dozen windows across four vendors do not fit a
   16-pixel icon, so the `Tray` tab lists every discovered reading with its live
   value and lets you reorder it (**drag a row** or use the arrows), hide it, and
@@ -135,47 +163,99 @@ and keeping the other is a real preference:
 
 ## The window
 
-Four tabs (`Accounts`, `Tray`, `Settings`, `CLIs`; keys `1`-`4`) carry every
-setting the tray menu has, in three labelled groups: `TRAY ICON`, `ALERTS`, `APP`.
+Four tabs (`Accounts`, `Tray`, `Settings`, `Connections`; keys `1`-`4`) carry every
+setting the tray menu has, in four compact blocks: `TRAY`, `ACCOUNTS`, `ALERTS`,
+`APP`. **The window is resizable** — drag any edge or corner — and the **body
+scrolls** (wheel, `PgDn`/`PgUp`, `Home`/`End`, a themed scrollbar) whenever a
+tab's content is taller than the window, so switching tabs or refreshing data
+never moves your window. Position **and size** persist; a size saved on a big
+monitor reopens safely inside a small laptop's working area, and the compact
+default (about 420x620) fits a 1366x768 desktop outright.
 
 - **Everything explains itself.** Hover any control and the footer says what it
-  does — the footer rather than a floating tooltip, because a tooltip over the
-  preview would hide the thing you are judging.
+  does immediately; hold still and the same sentence appears as a themed popup
+  near the pointer after a short dwell — inside the window, in the active
+  palette, never a white system tooltip.
 - **A control that cannot matter is visibly dead.** Fill granularity greys out
   while the icon draws a bare number; the number readout greys out for bars and
   cells; the volume greys out with both chimes off; an alert's WAV picker only
   appears while its chime is on, and the low threshold greys out only when both
   low channels are off. Each one says why.
-- **The preview is deliberately fake**, with its own quota slider: judge any
-  layout at 5% and at 90% without waiting for the account to get there. It renders
-  through the real tray path, so it cannot disagree with the icon.
+- **The Settings page stays compact.** The account list is one row with a
+  `Visibility...` menu (every discovered account, shown or hidden — same hide
+  state as the cards' `x`), and the theme wall is one selector: `[<] name [>]
+  All...` with every palette reachable. Above ~620px of width the blocks flow
+  into two columns; below the minimum width controls wrap instead of
+  disappearing. Two display filters stay in place: `Hide spent` hides accounts
+  whose every window reads 0%, `Only 5h` keeps accounts whose 5h window is
+  usable right now — both **display-only**: the sweep probes every account
+  regardless, so a hidden or filtered account comes back on its own the moment
+  quota returns — a monitor that stops monitoring is not a monitor.
+- **The preview is deliberately fake**, with its own quota slider in one
+  compact row: judge any layout at 5% and at 90% without waiting for the
+  account to get there. It renders through the real tray path, so it cannot
+  disagree with the icon.
 - **Drag to reorder** — tray readings on the `Tray` tab, account cards on
-  `Accounts`.
+  `Accounts` (the full logical order is what drags commit against, scroll
+  changes only what you see).
+- **Right-drag moves the window** (the left button owns every control), and
+  `Alt+A` pins it **always on top** — persisted, so a monitor floated over your
+  work area stays floated after a restart.
 - **Used/Left**: one button (or `U`) flips every percentage between remaining and
   spent — **and the bars fill the other way too**, so an exhausted account reads
   as a full bar at `100%` used instead of an empty one. Colours always warn on
   what is *left*.
 - **Themes**: 16 Wintage palettes are built in; `T` cycles them.
-- `F5` refresh, `U` used/left, `T` theme, `1`-`4` tabs, `Esc` hide. The window
-  **grows to fit its content** — no scrollbar hiding rows behind a gesture.
+- `F5` refresh, wheel scroll, `PgDn`/`PgUp`, drag edges resize, right-hold
+  move, `Esc` hide. No horizontal scrollbar — the minimum width is the width
+  everything reflows inside.
 - **Start with Windows** launches it silently in the tray; a second launch
   activates the existing instance instead of adding a second icon.
-- **Install CLIs** shows each vendor's own published install command, its
-  publisher and its target path, and runs it only after an explicit confirmation,
-  in a visible console. Piping a remote script into a shell is never implicit.
+- **Connections** shows every supported vendor (Codex, Claude Code, Antigravity, ZCode) — even on a clean machine — with its structured connection state, recommended action and troubleshooting. A successful periodic quota read now converges the card to **Connected** (or **Connected · quota unavailable** when the vendor authenticates but exposes no window), and an explicit verification failure survives a repaint until a newer result supersedes it. `Install CLIs` actions remain reachable inside vendor cards, each with confirmation in a visible console; ZCode has `Allow & connect` after permission. Piping a remote script into a shell is never implicit.
 
 ---
 
-## Customising without a rebuild
+## Customising
 
 A file next to the exe **wins** over the embedded copy:
 
+- `LIMISAW.ini` holds every setting in plain text. **Tip:** `ZcodeReadConfig=1`
+  is the advanced/manual twin of the `Settings` toggle — hand editing still
+  works, Settings persists the durable truth.
 - `Themes\mine.json` adds a palette; `Themes\goldendefault.json` replaces the
   built-in one.
 - `Sounds\` next to the exe becomes the sound library (the shipped WAVs still
   resolve by name).
-- `heh.ico` next to the exe replaces the app icon.
-- `LIMISAW.ini` holds every setting in plain text.
+- `LIMISAW.ico` next to the exe replaces the app icon; legacy `heh.ico` still
+  works as a fallback.
+- The shipped icon is embedded in the exe itself — PNG-compressed frames for
+  `16/24/32/48/64/128/256` — and is the executable, taskbar and Alt-Tab picture. The
+  dynamic quota icon in the tray stays the quota itself and is not the same thing.
+- **Tray truth:** the single-number icon reads the chosen window until it is
+  unavailable, then falls back to the lowest *selected* one instead of rendering
+  "`--`". "`--`" means no readable eligible tray metric — a reading you hid from
+  the tray never leaks back into it, and emptying the selection shows "`--`"
+  rather than resurrecting a hidden metric. A readable explicit pin stays
+  authoritative even when hidden, because the pin itself is the explicit choice.
+  **Bars/Rows/Cells** support every reading up to the legal cap the same way the
+  grid already did; `--` and real `0%` look different, one selected `Bars`
+  reading stays a narrow centred column instead of owning all 14 interior
+  columns, and every reading keeps its own distinct slot at any count 1..9.
+
+## The files
+
+| File | What it is |
+| --- | --- |
+| `LIMISAW.cs` | the whole app: window, tabs, tray painting, alerts, ini binding |
+| `Probe.cs` | the sweep: source discovery, per-provider budgets, carry-forward |
+| `ProbeClaude.cs`, `ProbeAntigravity.cs`, `ProbeZcode.cs`, `ProbeFreebuff.cs` | one file per vendor's read-only call |
+| `Connections.cs` | the Connections surface: discovery, state model, guided onboarding |
+| `Assets.cs` | the embedded palettes, sounds and icon frame set |
+| `ChildSweeper.cs` | the job object that kills vendor CLI children when LIMISAW exits |
+| `build.ps1` | `csc` build and the `-Tests` runner — no runtime, no package manager |
+| `tests/` | the harness suite; one `-Tests` run exercises all of it |
+| `tools/make_ico.cs` | the canonical PNG -> ICO icon pipeline |
+| `Themes/`, `Sounds/` | the shipped palettes and the two alert WAVs |
 
 ## Building
 
@@ -186,16 +266,56 @@ pwsh .\build.ps1            # -> LIMISAW.exe
 pwsh .\build.ps1 -Tests     # build + run the whole suite
 ```
 
-`tests\` is 27 harnesses / ~5900 assertions: the quota rules and the
-costs-nothing-to-read contract (`limits.cs`), the settings panel's own rules
-(`settings_ux.cs`), the one-file claim (`standalone.cs`), tray rendering pixel
-purity, window layout, alert timing, carry-forward, gating, tooltips and the tray
-item picker, plus the per-source read budgets — the Codex app-server session pool,
-the Antigravity and Claude journal scans, the INI read/write paths, and the paint
-paths' native-resource lifetime (`gdi_paint.cs`).
+`tests\` is the whole suite — the last verified full `-Tests` run executed **65
+harnesses, 0 failures** on one unchanged tree (every harness prints its own
+exact check count each run, so the totals are read from the build log rather
+than quoted here): the quota rules and
+the costs-nothing-to-read contract (`limits.cs`), the settings panel's own rules
+(`settings_ux.cs`), the one-file claim plus the PNG -> ICO generator
+(`standalone.cs`), tray rendering pixel purity, window layout, alert timing,
+carry-forward, gating, tooltips and the tray item picker, stable reading identity
+(`metric_identity.cs`), unknown-vs-zero quota (`unknown_quota.cs`),
+spawned-process containment with real process trees (`child_job.cs`),
+batch-shim CLI launching (`cmd_shim.cs`), account visibility filters and window
+controls (`accounts_visibility.cs`), the singleton launch protocol
+(`single_instance.cs`), the settings durability contract — structured save
+results, dirty recovery and the verified autostart reconciler with the
+rebinding tray menu (`settings_recovery.cs`, `settings_consistency.cs`), the
+Connections foundation — tab, discovery, state model and ZCode vertical
+(`connections_foundation.cs`) — plus
+the per-source read budgets: the Codex app-server session pool, the Antigravity
+and Claude journal scans, the INI read/write paths, the Connections
+discovery/auth/onboarding/concurrency harnesses and the CLI launch paths
+(`connections_concurrency.cs`, `connections_onboarding.cs`, `cli_connections.cs`),
+and the paint paths'
+native-resource lifetime (`gdi_paint.cs`). The performance wave added its own
+deterministic cost harnesses: viable cold-start scheduling for Codex homes
+(`codex_scheduling.cs`), lazy deadline-bounded journal discovery
+(`lazy_discovery.cs`), the bounded Antigravity body cache (`body_cache.cs`),
+viewport-bounded paint work with one per-paint layout snapshot
+(`viewport_paint.cs`), and the tray popup content cache
+(`hover_cache.cs`). The newest waves added theirs: the external-audit repairs
+(`core002_progress_ownership.cs`, `core003_settings_revision.cs`,
+`core004_dispatch_failure.cs`), stable Codex account identity
+(`codex_remote_identity.cs`), bounded wire payloads (`payload_bounds.cs`), the
+reset-credit lock (`reset_lock.cs`), the audio pipeline (`audio_pipeline.cs`),
+the tray render modes and the popup (`tray_render_modes.cs`, `tray_popup.cs`),
+and per-paint cost guards (`settings_paint_cost.cs`, `sound_paint_cost.cs`).
 
-`tools\make_ico.cs` regenerates `heh.ico` with one point-sampled frame per size
-the shell asks for, when the artwork changes.
+`tools\make_ico.cs` is the canonical icon pipeline:
+`assets\branding\LIMISAW1.png` -> `tools\make_ico.cs` -> `LIMISAW.ico`, one
+point-sampled frame per size the shell asks for (16/24/32/48/64/128/256), run
+whenever the artwork changes. `build.ps1` regenerates `LIMISAW.ico` from the
+brand PNG if it is ever missing. `heh.ico` is not a build input; only a legacy
+external override file beside the exe is still honoured at runtime.
+
+---
+
+## Issues and feedback
+
+Vendor quirks and bugs are welcome as [issues](https://github.com/vacterro/limisaw/issues).
+A report that names the vendor, the account directory and the exact line LIMISAW
+printed is reproducible; "it shows nothing" is not.
 
 ---
 
