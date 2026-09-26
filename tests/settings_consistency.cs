@@ -137,6 +137,9 @@ public static class SettingsConsistencyTest
         string root = Directory.GetCurrentDirectory();
         string temp = Path.Combine(Path.GetTempPath(), "limisaw_setcon_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(temp);
+        var savedGetUserPath = ExecutableDiscovery.GetUserPath;
+        var savedGetMachinePath = ExecutableDiscovery.GetMachinePath;
+        var savedFallbackFor = ExecutableDiscovery.FallbackFor;
         try
         {
             // No vendor home, no CLI, no Zcode key: the constructor's own sweep
@@ -178,9 +181,11 @@ public static class SettingsConsistencyTest
         finally
         {
             UnwireStore();
-            ExecutableDiscovery.GetUserPath = null;
-            ExecutableDiscovery.GetMachinePath = null;
-            ExecutableDiscovery.FallbackFor = null;
+            // Restore the PRODUCTION delegates, not null: null disables the
+            // registry PATH read instead of restoring it.
+            ExecutableDiscovery.GetUserPath = savedGetUserPath;
+            ExecutableDiscovery.GetMachinePath = savedGetMachinePath;
+            ExecutableDiscovery.FallbackFor = savedFallbackFor;
             try { Directory.Delete(temp, true); } catch { }
         }
 

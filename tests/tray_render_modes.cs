@@ -1095,13 +1095,18 @@ public static class TrayRenderModesTest
                 Check("20a. any available picks a usable reading",
                     any1.Available && any1.Value > 0,
                     "value=" + any1.Value + " available=" + any1.Available);
-                // Simulate refresh (same reading still usable) — set CurrentMetricId to what any1 picked
+                // The pinned reading must NOT be the one a bare "first usable"
+                // would pick, or ignoring CurrentMetricId would still pass.
                 TrayModel am2 = form.BuildModel();
-                am2.CurrentMetricId = any1.MetricId;
+                string pinnedId = null;
+                foreach (Metric m in am2.Eligible)
+                    if (m.Available && m.Value > 0 && m.Id != any1.MetricId) { pinnedId = m.Id; break; }
+                am2.CurrentMetricId = pinnedId ?? any1.MetricId;
                 TrayReading any2 = form.ResolveReading(am2);
-                Check("20b. any available keeps same reading on refresh",
-                    any1.MetricId == any2.MetricId,
-                    "same id=" + any1.MetricId + " vs " + any2.MetricId);
+                Check("20b. any available honours the pinned reading, not merely the first usable",
+                    pinnedId != null && any2.MetricId == pinnedId && any2.Available,
+                    "pinned=" + (pinnedId ?? "none") + " got=" + any2.MetricId
+                    + " first=" + any1.MetricId);
 
                 // ── 21. Any available switches when current becomes unusable ─────
                 // Simulate the previously-picked reading now having 0% (unusable)
@@ -1118,14 +1123,16 @@ public static class TrayRenderModesTest
                 // Put a reading beyond the TrayMax cap and verify lowest finds it
                 Install(
                     Acc("codex", "A1", Available5h(55), AvailableWeek(37)),
-                    Acc("zcode", "Z", Available5h(99), AvailableWeek(1)));
+                    Acc("zcode", "Z", Available5h(99), AvailableWeek(1)),
+                    Acc("antigravity", "AG", Available5h(60)));
                 settings.TrayMax = 4;
                 settings.TrayMetric = "lowest";
-                settings.TrayItems = "codex/A1/five_hour|codex/A1/weekly|zcode/Z/five_hour|zcode/Z/weekly";
+                settings.TrayItems = "codex/A1/five_hour|codex/A1/weekly|zcode/Z/five_hour|zcode/Z/weekly|antigravity/AG/five_hour";
                 bm = form.BuildModel();
-                // Eligible should include all non-hidden (all 4 here, none hidden)
+                // Five readings under a cap of four: a capped pool would report
+                // 4 here, so this check can fail where a 4-of-4 pool could not.
                 Check("22a. Eligible pool includes all non-hidden readings, not capped by TrayMax",
-                    bm.Eligible.Count >= 4, "eligible count=" + bm.Eligible.Count);
+                    bm.Eligible.Count >= 5, "eligible count=" + bm.Eligible.Count);
                 TrayReading lowestGlobal = form.ResolveReading(bm);
                 // Lowest positive remaining = 1% (zcode/Z/weekly) or 37% (codex/A1/weekly)
                 int expectedMin = int.MaxValue;
@@ -1523,9 +1530,6 @@ public static class TrayRenderModesTest
                     carried.CarriedNote.IndexOf("401", StringComparison.Ordinal) >= 0
                     && carried.CarriedNote.IndexOf("authentication required", StringComparison.Ordinal) >= 0,
                     "note=" + carried.CarriedNote);
-                Check("35i. the carried auth-rejected reading is still skipped by any available",
-                    !carried.Ok && carried.AuthFailed,
-                    "ok=" + carried.Ok + " authFailed=" + carried.AuthFailed);
 
                 // ── 36. SRC-028: Lowest may keep history, but must label it ──
                 // The defect this prevents: a successful overall refresh can

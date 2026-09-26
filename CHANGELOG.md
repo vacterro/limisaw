@@ -1,6 +1,6 @@
-# LIMISAW 0.0.10 (2026-09-26)
+# LIMISAW 0.0.11 (2026-09-26)
 
-## 0.0.10
+## 0.0.11
 
 **Shipped as 0.0.9, the wave that landed after the 0.0.8 release (0.0.10 adds the three audit fixes below):** the window is now
 genuinely **resizable** (drag any edge or corner), every tab gets a **scrollable
@@ -161,6 +161,27 @@ against an incomplete download.
   `git checkout -- LIMISAW.exe`. The exe has been untracked since 0.0.7, so that
   command cannot work; a `-Tests` run leaves `git status` clean, which means a
   dirty tree is a real source change.
+
+## Fixed — the checks that could not fail (0.0.11)
+
+The self-audit kept reading the suite's own coverage claim instead of taking it,
+and six checks did not survive that:
+
+- **`any` mode now has to honour the pinned reading.** The refresh check pinned
+  the reading a bare "first usable" would pick anyway, so ignoring the pin
+  entirely still passed. It now pins a different one.
+- **The uncapped-eligible check runs above the cap.** It installed exactly as
+  many readings as the tray cap allows; a capped pool was indistinguishable.
+  Five readings under a cap of four now separate the two.
+- **Two tautologies are gone.** The post-Adopt seam scenario asserted only the
+  harness's own assignment (the real unwind is scenario C), and a carried
+  reading check re-asserted flags the test had just set (35b already proves the
+  skip through the production resolver).
+- **The unwind guard is scoped to `RpcSession.Start`.** A whole-file grep for
+  `catch { return null; }` was satisfied by three unrelated sites.
+- **The settings harness restores the production discovery delegates** instead
+  of nulling them, which had disabled the registry PATH read for anything
+  running after it.
 
 ## Fixed — findings from the 0.0.9 self-audit (0.0.10)
 

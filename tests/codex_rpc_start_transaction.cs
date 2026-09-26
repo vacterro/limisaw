@@ -48,7 +48,6 @@ public static class CodexRpcStartTransactionTest
         {
             if (!BuildFixtures()) return Report();
             FailureBeforeProcessStartReturns();
-            FailureAfterRealChildStarts();
             FailureAfterAdoptBeforeReader();
             RepeatedFailureNoAccumulation();
             Recovery();
@@ -94,20 +93,9 @@ public static class CodexRpcStartTransactionTest
         }
         finally { CodexSource.RpcSession.TestProcessStarter = null; }
         var probe2 = File.ReadAllText(Path.Combine(Directory.GetCurrentDirectory(), "Probe.cs"));
-        Check("A: Probe.cs contains catch { return null } unwind", probe2.Contains("catch { return null; }"), "");
-    }
-
-    static void FailureAfterRealChildStarts()
-    {
-        // B and C share one seam (post-Adopt). C proves the unwind with a real
-        // child; B asserts the observable B itself depends on: the seam is a
-        // settable/resettable hook, so a forced failure here is revertible and
-        // does not leak into the next scenario.
-        CodexSource.RpcSession.TestHookAfterAdopt = () => { throw new Exception("B seam"); };
-        bool armed = CodexSource.RpcSession.TestHookAfterAdopt != null;
-        CodexSource.RpcSession.TestHookAfterAdopt = null;
-        bool cleared = CodexSource.RpcSession.TestHookAfterAdopt == null;
-        Check("B: post-Adopt seam is settable then clears (armed=" + armed + ")", armed && cleared, "");
+        int startAt = probe2.IndexOf("public static RpcSession Start(", StringComparison.Ordinal);
+        string startBody = startAt >= 0 ? probe2.Substring(startAt, Math.Min(3200, probe2.Length - startAt)) : "";
+        Check("A: RpcSession.Start unwinds with catch { return null }", startBody.Contains("catch { return null; }"), "");
     }
 
     static void FailureAfterAdoptBeforeReader()
