@@ -1,8 +1,8 @@
-# LIMISAW 0.0.9 (2026-09-26)
+# LIMISAW 0.0.10 (2026-09-26)
 
-## 0.0.9
+## 0.0.10
 
-**Shipped as 0.0.9, the wave that landed after the 0.0.8 release:** the window is now
+**Shipped as 0.0.9, the wave that landed after the 0.0.8 release (0.0.10 adds the three audit fixes below):** the window is now
 genuinely **resizable** (drag any edge or corner), every tab gets a **scrollable
 body viewport** (wheel, PgDn/PgUp/Home/End, a themed scrollbar), **Settings is
 reorganized** into compact TRAY/ACCOUNTS/ALERTS/APP blocks that reflow into two
@@ -161,6 +161,21 @@ against an incomplete download.
   `git checkout -- LIMISAW.exe`. The exe has been untracked since 0.0.7, so that
   command cannot work; a `-Tests` run leaves `git status` clean, which means a
   dirty tree is a real source change.
+
+## Fixed — findings from the 0.0.9 self-audit (0.0.10)
+
+- **A stale per-user App Paths entry no longer hides the machine-wide one.**
+  The FreeBuff lookup returned HKCU's value without checking that it still
+  resolved, so a per-user uninstall left discovery blind to the HKLM entry
+  forever. The hive walk now skips a value whose target is gone.
+- **An installed vendor is never reported as "not installed."** The sweep's
+  auth-rejected projection published SignInRequired without `Installed`, so on
+  the first sweep after a cold start the card claimed the vendor was absent
+  when only the sign-in was missing.
+- **A failed exit observer gives its registry slot back.** Raising the exit
+  event happens after the observer registers itself and can throw; the
+  constructor now untracks before rethrowing, so a failed launch no longer
+  leaves an entry nothing can ever remove.
 
 ## Fixed — test integrity and release hygiene (0.0.9)
 

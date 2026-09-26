@@ -1331,6 +1331,12 @@ namespace Limisaw
                 // THEN enable raising, then reconcile.
                 Proc.Exited += OnProcExited;
                 Track(this);
+                // If raising cannot be enabled the constructor throws, and the
+                // caller never receives this observer -- so the registration
+                // has to give itself back here or LiveObservers grows by one per
+                // failed launch, with no owner left to Untrack it.
+                try { Proc.EnableRaisingEvents = true; }
+                catch { Untrack(this); throw; }
                 // W2-003: an EnableRaisingEvents failure is NOT swallowed. If
                 // raising cannot be enabled there is no reliable observation,
                 // and pretending otherwise loses exit signals silently. The
@@ -1338,7 +1344,6 @@ namespace Limisaw
                 // the launch successful, marks the observer unavailable,
                 // disposes the wrapper it no longer owns, and the normal
                 // bounded watcher cadence remains the fallback.
-                Proc.EnableRaisingEvents = true;
                 // Reconcile the HasExited race: the child may already be gone
                 // (or the event already delivered) by the time we get here.
                 bool gone = false;

@@ -5216,6 +5216,11 @@ namespace Limisaw
                         nvc.UserActionRequired = true;
                         nvc.VerificationOk = false;
                         nvc.Stage = ConnectionStage.Quota;
+                        // The vendor answered with a credential verdict, so it is
+                        // installed; only the sign-in is missing. Without this the
+                        // card reported "installation: not installed" on the very
+                        // first sweep, when no snapshot existed to clone.
+                        nvc.Installed = true;
                         nvc.LastVerifiedUtc = Stamp.Now;
                         nvc.Reason = authReason.Length > 0
                             ? authReason

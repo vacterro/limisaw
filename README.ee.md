@@ -6,7 +6,7 @@
 
 LIMISAW on Windowsi süstray monitaor, mis näitab, kui palju kvooti sul on jäänud teenustes **Codex, Claude Code, Antigravity ja Zcode** — iga konto, mille need paljastavad. See küsib igalt hankijalt numbri, mida hankija juba teab, kasutades selle hankija enda kirjutuskaitstud väljakutset, nii et **kvoodi lugemine ei kuluta sellest midagi**. See ei pars'i `auth.json`, ei saada prompte ega installi midagi omal algatusel.
 
-**Laadi alla `LIMISAW.exe` lehelt [Releases](https://github.com/vacterro/limisaw/releases) — see on kogu paigaldus.** Viimane: **v0.0.9**. Iga palett, mõlemad häälestushelid ja ikoon on selles sees. Aseta see tühja kausta ja käivita.
+**Laadi alla `LIMISAW.exe` lehelt [Releases](https://github.com/vacterro/limisaw/releases) — see on kogu paigaldus.** Viimane: **v0.0.10**. Iga palett, mõlemad häälestushelid ja ikoon on selles sees. Aseta see tühja kausta ja käivita.
 
 ```
 LIMISAW.exe          <- Releases'ist, see on kogu paigaldus

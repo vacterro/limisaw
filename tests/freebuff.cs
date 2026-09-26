@@ -124,6 +124,7 @@ public static class FreebuffTest
         FreebuffSource.Poster savedTransport = FreebuffSource.Transport;
         Func<bool> savedFound = FreebuffDiscovery.HasExecutableImpl;
         Func<string> savedAppPaths = FreebuffDiscovery.AppPathsTarget;
+        Func<int, string, string> savedHiveAppPath = FreebuffDiscovery.HiveAppPathValue;
         Func<string, string> savedResolveLnk = FreebuffDiscovery.ResolveLnk;
         Func<string, bool> savedLauncherExists = FreebuffDiscovery.FileExists;
         Func<string[]> savedStartDirs = FreebuffDiscovery.StartMenuDirs;
@@ -203,6 +204,24 @@ public static class FreebuffTest
                 rediscovered == nextAppTarget && appPathReads == 3,
                 rediscovered ?? "null");
 
+            // The hive loop itself: a stale HKCU App Paths value must fall
+            // through to the machine-wide entry instead of ending the search.
+            ResetLauncherCache();
+            FreebuffDiscovery.AppPathsTarget = savedAppPaths;   // the production resolver, not the stub above
+            string staleUser = @"C:\gonereebuff.exe";
+            string liveMachine = @"C:\Program Files\FreeBuffreebuff.exe";
+            FreebuffDiscovery.HiveAppPathValue = (hive, leaf) => hive == 0 ? staleUser : liveMachine;
+            FreebuffDiscovery.FileExists = path => path == liveMachine;
+            FreebuffDiscovery.StartMenuDirs = () => new string[0];
+            string hiveWinner = FreebuffDiscovery.DesktopLauncherTarget();
+            Check("1i. a stale HKCU App Paths value falls through to the HKLM entry",
+                hiveWinner == liveMachine, hiveWinner ?? "null");
+            ResetLauncherCache();   // drop 1i's positive cache: 1j re-reads the hives
+            FreebuffDiscovery.HiveAppPathValue = (hive, leaf) => hive == 0 ? staleUser : null;
+            string hiveEmpty = FreebuffDiscovery.DesktopLauncherTarget();
+            Check("1j. with no live entry in either hive the answer is null, not the stale one",
+                hiveEmpty == null, hiveEmpty ?? "null");
+
             string sourcePath = Environment.GetEnvironmentVariable("LIMISAW_TEST_SOURCE_FILE");
             if (string.IsNullOrEmpty(sourcePath))
                 sourcePath = Path.Combine(Directory.GetCurrentDirectory(), "ProbeFreebuff.cs");
@@ -216,6 +235,7 @@ public static class FreebuffTest
 
             ResetLauncherCache();
             FreebuffDiscovery.AppPathsTarget = savedAppPaths;
+            FreebuffDiscovery.HiveAppPathValue = savedHiveAppPath;
             FreebuffDiscovery.StartMenuDirs = savedStartDirs;
             FreebuffDiscovery.ResolveLnk = savedResolveLnk;
             FreebuffDiscovery.FileExists = savedLauncherExists;

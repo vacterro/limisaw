@@ -706,25 +706,42 @@ namespace Limisaw
             return null;
         }
 
+        // The App Paths lookup walks HKCU then HKLM and returns the first value
+        // whose target still EXISTS. A per-user uninstall leaves the HKCU value
+        // behind pointing at a removed file, and returning it unchecked hid the
+        // machine-wide entry forever. The hive read is a seam so that exact
+        // shape is testable without a registry.
+        internal static Func<int, string, string> HiveAppPathValue = ReadHiveAppPathValue;
+        static string ReadHiveAppPathValue(int hiveIndex, string leaf)
+        {
+            Microsoft.Win32.RegistryKey hive = hiveIndex == 0
+                ? Microsoft.Win32.Registry.CurrentUser
+                : Microsoft.Win32.Registry.LocalMachine;
+            try
+            {
+                using (var k = hive.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\App Paths\" + leaf, false))
+                {
+                    if (k == null) return null;
+                    return (k.GetValue(null) ?? k.GetValue("Path")) as string;
+                }
+            }
+            catch { return null; }
+        }
+
         static string ReadAppPathsTarget()
         {
             string leaf = BinaryName + ".exe";
-            foreach (Microsoft.Win32.RegistryKey hive in new[] { Microsoft.Win32.Registry.CurrentUser, Microsoft.Win32.Registry.LocalMachine })
+            for (int hive = 0; hive < 2; hive++)
             {
-                try
-                {
-                    using (var k = hive.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\App Paths\" + leaf, false))
-                    {
-                        if (k == null) continue;
-                        string v = (k.GetValue(null) ?? k.GetValue("Path")) as string;
-                        if (string.IsNullOrEmpty(v)) continue;
-                        v = Environment.ExpandEnvironmentVariables(v.Trim().Trim('"'));
-                        // DesktopLauncherTarget is the single existence check
-                        // and positive-cache boundary for this resolved path.
-                        return v;
-                    }
-                }
-                catch { }
+                string raw = HiveAppPathValue != null ? HiveAppPathValue(hive, leaf) : null;
+                if (string.IsNullOrEmpty(raw)) continue;
+                string v = Environment.ExpandEnvironmentVariables(raw.Trim().Trim('"'));
+                // A value that no longer resolves is stale, not an answer: the
+                // next hive still gets its turn.
+                if (FileExists != null && !FileExists(v)) continue;
+                // DesktopLauncherTarget keeps the single positive-cache boundary
+                // for whatever this returns.
+                return v;
             }
             return null;
         }

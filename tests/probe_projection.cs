@@ -316,6 +316,22 @@ public static class ProbeProjection
 
         Observe("zcode", Terminal("zcode", "SignInRequired", "CredentialMissing", "OpenVendor", "no key"));
         BuildConnections();
+        // IMP-002: the sweep's auth-rejected projection must keep Installed set.
+        // A vendor that answered with a credential verdict IS installed, so a
+        // first-sweep card may never read "installation: not installed". Scoped
+        // to the branch itself, not a whole-file grep.
+        {
+            string root = AppDomain.CurrentDomain.BaseDirectory;
+            for (int i = 0; i < 4 && !File.Exists(Path.Combine(root, "LIMISAW.cs")); i++)
+            { var up = Directory.GetParent(root); if (up == null) break; root = up.FullName; }
+            string src = File.ReadAllText(Path.Combine(root, "LIMISAW.cs"));
+            int at = src.IndexOf("nvc.Reason = authReason.Length > 0", StringComparison.Ordinal);
+            string branch = at >= 0 ? src.Substring(Math.Max(0, at - 1200), Math.Min(1600, src.Length - Math.Max(0, at - 1200))) : "";
+            Check("the auth-rejected projection sets Installed before Observe",
+                at >= 0 && branch.Contains("nvc.Installed = true;") && branch.Contains("ConnCoordinator.Observe"),
+                branch.Length == 0 ? "branch not found" : "");
+        }
+
         Check("I: missing credential -> SignInRequired + OpenVendor",
             State("zcode") == "SignInRequired" && ErrorCode("zcode") == "CredentialMissing" && Action("zcode") == "OpenVendor",
             State("zcode") + "/" + ErrorCode("zcode") + "/" + Action("zcode"));

@@ -464,6 +464,13 @@ public static class ConnectionsOnboardingTest
                 ownAt >= 0 && raiseAt > ownAt, "track@" + ownAt + " enable@" + raiseAt);
             Check("...and the subscription precedes ownership, so no exit can be missed",
                 subAt >= 0 && ownAt > subAt, "subscribe@" + subAt + " track@" + ownAt);
+            // IMP-003: raising is enabled AFTER ownership, and that setter can
+            // throw. The constructor then never returns, so the caller holds no
+            // reference and nothing can Untrack -- the registration must give
+            // itself back on the way out.
+            int untrackAt = ctorBody.IndexOf("catch { Untrack(this); throw; }", StringComparison.Ordinal);
+            Check("...a failed EnableRaisingEvents untracks before rethrowing",
+                raiseAt >= 0 && untrackAt > raiseAt, "enable@" + raiseAt + " untrack@" + untrackAt);
 
             // C: observation setup failure must not fail the launch. The seam
             // is driven through StartInteractiveImpl with a child that exists
