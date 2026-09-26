@@ -238,6 +238,8 @@ $testRefs = @{
     'zcode_response'  = @('System.dll')
     'audio_pipeline'  = @('System.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll')
     'payload_bounds'  = @('System.dll', 'System.Web.Extensions.dll')
+    'codex_rpc_start_transaction' = @('System.dll')
+    'codex_rate_limit_auth' = @('System.dll')
 }
 
 # Harness -> its entry-point class, for the ones compiled together WITH the
@@ -274,6 +276,8 @@ $engineLinked = @{
     'zcode_detection' = 'ZcodeDetectionTest'
     'zcode_response' = 'ZcodeResponseTest'
     'payload_bounds' = 'PayloadBoundsTest'
+    'codex_rpc_start_transaction' = 'CodexRpcStartTransactionTest'
+    'codex_rate_limit_auth' = 'CodexRateLimitAuthTest'
 }
 
 $outDir = Join-Path $root 'tests\bin'

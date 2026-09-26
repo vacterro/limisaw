@@ -670,11 +670,27 @@ public static class CoreRefreshOwnership
             && ui.IndexOf("if (ShuttingDown || IsDisposed || Disposing) return;", StringComparison.Ordinal) >= 0
             && ui.IndexOf("if (!IsHandleCreated) return;", StringComparison.Ordinal) >= 0
             && ui.IndexOf("if (InvokeRequired) BeginInvoke((Action)RefreshData);", StringComparison.Ordinal) >= 0, "");
-        Check("OnWatcherAttempt no longer calls the raw WinForms Refresh from the worker",
-            ui.IndexOf("ConnCoordinator.TryProgress(vendorId, gen, ConnectionState.Verifying, \"Verifying...\");\r\n            Refresh();",
-                StringComparison.Ordinal) < 0, "");
-        Check("the FollowUpRefreshDone exactly-once key is preserved",
-            ui.IndexOf("string key = vendorId + \"#\" + gen;", StringComparison.Ordinal) >= 0
-            && ui.IndexOf("if (!FollowUpRefreshDone.Add(key)) return;", StringComparison.Ordinal) >= 0, "");
+        {
+            int a = ui.IndexOf("void OnWatcherAttempt(ConnectionWatcher.Operation op)", StringComparison.Ordinal);
+            int e = ui.IndexOf("void OnWatcherExpire(ConnectionWatcher.Operation op)", StringComparison.Ordinal);
+            string seg = e > a ? ui.Substring(a, e - a) : "";
+            // A bare statement-level Refresh(); call — RequestRefresh(); is
+            // the boundary, not the raw WinForms call, so the match requires
+            // the line start ("RequestRefresh();" never carries it).
+            bool rawRefresh = System.Text.RegularExpressions.Regex.IsMatch(
+                seg, @"(?m)^[ \t]*Refresh\(\);[ \t]*\r?$");
+            Check("OnWatcherAttempt no longer calls the raw WinForms Refresh from the worker",
+                a >= 0 && e > a && !rawRefresh, "a=" + a + " e=" + e + " rawRefresh=" + rawRefresh);
+        }
+        // PERF-006/R014 (audit/7): the lifetime HashSet<string> FollowUpRefreshDone
+        // was replaced by a BOUNDED per-vendor high-water mark
+        // (Dictionary<string,int> FollowUpRefreshGeneration + ClaimFollowUpQuotaRefresh),
+        // so the exactly-once contract now lives in the claim gate. The dedup is
+        // still exactly-once (an old/equal generation is refused) and no longer
+        // grows unbounded. refresh_coalesce.cs owns the behavioural proof.
+        Check("the exactly-once follow-up dedupe is preserved (bounded per-vendor generation)",
+            ui.IndexOf("bool ClaimFollowUpQuotaRefresh(string vendorId, int gen)", StringComparison.Ordinal) >= 0
+            && ui.IndexOf("if (!ClaimFollowUpQuotaRefresh(vendorId, gen)) return;", StringComparison.Ordinal) >= 0
+            && ui.IndexOf("&& gen <= previous) return false;", StringComparison.Ordinal) >= 0, "");
     }
 }

@@ -1,4 +1,4 @@
-<img width="1600" height="560" alt="LIMISAW_HEADER1" src="https://github.com/user-attachments/assets/ff5571e3-f4d1-44e5-a017-5a3430e67360" />
+<img width="1600" height="560" alt="LIMISAW_HEADER1" src="assets/branding/LIMISAW_HEADER1.png" />
 
 # LIMISAW
 
@@ -20,7 +20,7 @@ vendor's own read-only call, so **reading your quota never spends any of it**. I
 does not parse `auth.json`, does not send prompts, and installs nothing on its
 own.
 
-**Download `LIMISAW.exe` from [Releases](https://github.com/vacterro/limisaw/releases) — it is the whole install.** Latest: **v0.0.8**. Every palette, both alert sounds and the icon are inside it. Drop it in an empty folder and run it.
+**Download `LIMISAW.exe` from [Releases](https://github.com/vacterro/limisaw/releases) — it is the whole install.** Latest: **v0.0.9**. Every palette, both alert sounds and the icon are inside it. Drop it in an empty folder and run it.
 
 ```
 LIMISAW.exe          <- from Releases, that's the whole install
@@ -273,7 +273,7 @@ pwsh .\build.ps1            # -> LIMISAW.exe
 pwsh .\build.ps1 -Tests     # build + run the whole suite
 ```
 
-`tests\` is the whole suite — the last verified full `-Tests` run executed **65
+`tests\` is the whole suite — the last verified full `-Tests` run executed **68
 harnesses, 0 failures** on one unchanged tree (every harness prints its own
 exact check count each run, so the totals are read from the build log rather
 than quoted here): the quota rules and

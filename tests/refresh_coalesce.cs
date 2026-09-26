@@ -137,6 +137,44 @@ public static class RefreshCoalesce
         m.Invoke(form, new object[] { outcome });
     }
 
+    static void FollowUpOwnership(object form)
+    {
+        MethodInfo claim = formType.GetMethod("ClaimFollowUpQuotaRefresh",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        FieldInfo ownersField = formType.GetField("FollowUpRefreshGeneration",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        if (claim == null || ownersField == null)
+        {
+            Check("follow-up dedupe has explicit per-vendor generation ownership",
+                false, "claim method or bounded owner map missing");
+            Check("one same-vendor duplicate is suppressed while the next generation is admitted",
+                false, "claim method missing");
+            Check("100,000 generations retain only one entry per vendor",
+                false, "bounded owner map missing");
+            return;
+        }
+
+        Func<string, int, bool> take = (vendor, generation) =>
+            (bool)claim.Invoke(form, new object[] { vendor, generation });
+        bool first = take("synthetic-a", 41);
+        bool duplicate = take("synthetic-a", 41);
+        bool next = take("synthetic-a", 42);
+        bool parallelVendor = take("synthetic-b", 42);
+        bool stale = take("synthetic-a", 41);
+        Check("one same-vendor duplicate is suppressed while the next generation is admitted",
+            first && !duplicate && next && !stale, "");
+        Check("the same numeric generation is independent across vendors",
+            parallelVendor, "");
+
+        bool allNew = true;
+        for (int i = 0; i < 100000; i++)
+            if (!take("synthetic-a", i + 43)) allNew = false;
+        IDictionary owners = (IDictionary)ownersField.GetValue(form);
+        Check("100,000 generations retain only one entry per vendor",
+            allNew && owners.Count == 2
+            && !take("synthetic-a", 100042), "retained vendor keys=" + owners.Count);
+    }
+
     // The remaining percent the form currently shows for the injected account.
     static int Shown(object form)
     {
@@ -213,6 +251,7 @@ public static class RefreshCoalesce
                 bool idle = Wait(() => !Flag(form, "Refreshing"), 60000);
                 Check("the start-up sweep finishes against an empty environment", idle,
                     "Refreshing=" + Flag(form, "Refreshing"));
+                FollowUpOwnership(form);
 
                 // A clean slate: whatever that first sweep found is not this
                 // harness's subject.

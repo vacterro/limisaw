@@ -135,6 +135,18 @@ public static class IniReload
         File.WriteAllText(path, sb.ToString());
     }
 
+    static int ReloadMetric(object result, string name)
+    {
+        return (int)result.GetType().GetField(name,
+            BindingFlags.NonPublic | BindingFlags.Instance).GetValue(result);
+    }
+
+    static bool ReloadFlag(object result, string name)
+    {
+        return (bool)result.GetType().GetField(name,
+            BindingFlags.NonPublic | BindingFlags.Instance).GetValue(result);
+    }
+
     static Dictionary<string, string> Baseline()
     {
         return new Dictionary<string, string>
@@ -238,9 +250,69 @@ public static class IniReload
     {
         Console.WriteLine("== the reader: reload reports change, and refuses to poison itself ==");
         MethodInfo reload = settingsType.GetMethod("Reload");
+        MethodInfo reloadEx = settingsType.GetMethod("ReloadEx");
         FieldInfo refreshSeconds = settingsType.GetField("RefreshSeconds");
         FieldInfo lowPct = settingsType.GetField("LowPct");
         FieldInfo saveFailed = settingsType.GetField("LastSaveFailed");
+
+        // PERF-003: exact accepted bytes are the only unchanged-file fast-path
+        // authority. Prove the hot path does one SHA-256 and no candidate clone
+        // or profile-key reads.
+        object untouched = reloadEx.Invoke(settings, null);
+        Check("an unchanged accepted ini uses one exact revision fingerprint",
+            ReloadFlag(untouched, "AcceptedRevisionFastPath")
+            && ReloadMetric(untouched, "RevisionFingerprints") == 1,
+            "fingerprints=" + ReloadMetric(untouched, "RevisionFingerprints"));
+        Check("the unchanged path does not clone or read candidate keys",
+            ReloadMetric(untouched, "CandidateClones") == 0
+            && ReloadMetric(untouched, "CandidateKeyReads") == 0,
+            "clones=" + ReloadMetric(untouched, "CandidateClones")
+            + " key-reads=" + ReloadMetric(untouched, "CandidateKeyReads"));
+
+        // Same byte count and restored last-write time cannot hide an external
+        // edit. The SHA-256 mismatch must take the full coherent parse path.
+        var sameMetadata = Baseline();
+        byte[] priorBytes = File.ReadAllBytes(ini);
+        DateTime priorWrite = File.GetLastWriteTimeUtc(ini);
+        sameMetadata["RefreshSeconds"] = "600";
+        WriteIni(ini, sameMetadata);
+        File.SetLastWriteTimeUtc(ini, priorWrite);
+        MethodInfo flushProfile = settingsType.GetMethod("WritePrivateProfileString",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        flushProfile.Invoke(null, new object[] { null, null, null, ini });
+        Check("the adversarial ini edit keeps byte length and timestamp",
+            new FileInfo(ini).Length == priorBytes.Length
+            && File.GetLastWriteTimeUtc(ini) == priorWrite, "");
+        object sameMetadataReload = reloadEx.Invoke(settings, null);
+        Check("a same-length same-metadata byte edit is still fully detected",
+            (bool)sameMetadataReload.GetType().GetField("Changed").GetValue(sameMetadataReload)
+            && (int)refreshSeconds.GetValue(settings) == 600
+            && !ReloadFlag(sameMetadataReload, "AcceptedRevisionFastPath"),
+            "RefreshSeconds=" + refreshSeconds.GetValue(settings));
+        Check("a changed accepted ini takes the full before/parse/after path",
+            ReloadMetric(sameMetadataReload, "RevisionFingerprints") == 2
+            && ReloadMetric(sameMetadataReload, "CandidateClones") == 1
+            && ReloadMetric(sameMetadataReload, "CandidateKeyReads") > 0,
+            "fingerprints=" + ReloadMetric(sameMetadataReload, "RevisionFingerprints")
+            + " clones=" + ReloadMetric(sameMetadataReload, "CandidateClones")
+            + " key-reads=" + ReloadMetric(sameMetadataReload, "CandidateKeyReads"));
+
+        // A visible file is not fast-path authority until a coherent startup
+        // Load or accepted ReloadEx has established it. A default-matching ini
+        // still has to be parsed when first observed by an unaccepted instance.
+        string unacceptedDir = Path.Combine(Path.GetDirectoryName(ini), "unaccepted-startup");
+        Directory.CreateDirectory(unacceptedDir);
+        string unacceptedIni = Path.Combine(unacceptedDir, "LIMISAW.ini");
+        WriteIni(unacceptedIni, Baseline());
+        object unaccepted = Activator.CreateInstance(settingsType, new object[] { unacceptedDir });
+        object firstObservation = reloadEx.Invoke(unaccepted, null);
+        Check("an unaccepted startup revision cannot use the fast path",
+            !ReloadFlag(firstObservation, "AcceptedRevisionFastPath")
+            && ReloadMetric(firstObservation, "RevisionFingerprints") == 2
+            && ReloadMetric(firstObservation, "CandidateClones") == 1
+            && ReloadMetric(firstObservation, "CandidateKeyReads") > 0,
+            "fingerprints=" + ReloadMetric(firstObservation, "RevisionFingerprints")
+            + " clones=" + ReloadMetric(firstObservation, "CandidateClones"));
 
         var keys = Baseline();
         keys["RefreshSeconds"] = "900";
@@ -385,7 +457,6 @@ public static class IniReload
         // disagreed with what a restart from the same bytes produces.
         Console.WriteLine();
         Console.WriteLine("== CORE-004: a malformed external reload is never accepted as durable ==");
-        MethodInfo reloadEx = settingsType.GetMethod("ReloadEx");
         FieldInfo invalidField = reloadEx.ReturnType.GetField("Invalid");
         FieldInfo changedField = reloadEx.ReturnType.GetField("Changed");
         FieldInfo acceptedField = reloadEx.ReturnType.GetField("Accepted");
@@ -541,10 +612,16 @@ public static class IniReload
         // Exactly once per actual change: an unchanged file must not re-apply
         // anything, or every periodic sweep would repaint and re-arm alerts.
         note.SetValue(form, "sentinel");
+        FieldInfo applyThread = formType.GetField("SettingsApplyThread",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        applyThread.SetValue(form, -987654321);
         PressRefresh(form);
         PressRefresh(form);
         Check("an unchanged ini re-applies nothing on later refreshes",
             (string)note.GetValue(form) == "sentinel", (string)note.GetValue(form));
+        Check("repeated unchanged refreshes perform zero runtime applications",
+            (int)applyThread.GetValue(form) == -987654321,
+            applyThread.GetValue(form).ToString());
         Check("...while the sweeps themselves still happen",
             SweepCount == 6, "sweeps=" + SweepCount);
 

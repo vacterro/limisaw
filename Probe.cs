@@ -261,6 +261,16 @@ class ProbeAccount
         // not a reading — the window stays unreadable and this flag tells
         // Flatten the quota is unverified rather than carried-forward stale.
         public bool UnverifiedReset;
+        // SRC-028: typed failure provenance for THIS sweep. `Ok == false` alone
+        // cannot tell a transient hiccup (whose carried-forward numbers stay
+        // conservatively selectable, because dropping them would make the tray
+        // look healthier after a failure) from an explicit authentication
+        // rejection, which is much stronger evidence: the vendor refused the
+        // authenticated read, so a carried number is NOT a currently usable
+        // quota. Set by the provider boundary, never inferred from UI strings.
+        public bool AuthFailed;
+        public CodexSource.RateLimitFailure AuthFailureClass;
+        public string AuthFailureReason = "";
         // Banked resets this account holds, or null. Not a window: a count,
         // an expiry and the vendor's own title.
         public ResetCredits Credits;
@@ -658,6 +668,12 @@ class ProbeAccount
             // must not be carried forward as the stale blocked card — the
             // reset EVENT lives on this very snapshot.
             ad.ResetUnverified = acc.UnverifiedReset;
+            // SRC-028: the typed auth provenance rides through unchanged. It is
+            // the ONE thing that lets a consumer tell "the sweep hiccuped" from
+            // "the vendor says you are not signed in".
+            ad.AuthFailed = acc.AuthFailed;
+            ad.AuthFailedClass = acc.AuthFailureClass;
+            ad.AuthFailureReason = acc.AuthFailureReason;
             foreach (ProbeWindow w in Resolve(acc.Windows, now))
             {
                 // CORE-002: a window that cannot state a number is NOT a window
@@ -1463,6 +1479,142 @@ class ProbeAccount
             return s.Length > 160 ? s.Substring(0, 160) : s;
         }
 
+        // ── SRC-028: ONE deterministic classification of a structured Codex
+        // `account/rateLimits/read` error ─────────────────────────────────────
+        // The observed failure is a JSON-RPC error object whose OUTER code is
+        // -32603 and whose nested message reports the rate-limit fetch failing
+        // with HTTP 401 Unauthorized against chatgpt.com/backend-api/wham/usage.
+        // -32603 is only a wrapper — the app-server uses it for quota-unavailable,
+        // transient and auth failures alike — so the outer code is NEVER on its
+        // own evidence of anything. Everything below reads the nested
+        // message/details, which is the only place the actionable half lives.
+        public enum RateLimitFailure
+        {
+            None = 0,         // no structured error at all
+            AuthRejected,     // explicit 401/403, unauthorized, not-logged-in
+            AuthExpired,      // the same, with explicit expiry evidence too
+            QuotaUnavailable, // authenticated and accepted, no quota surface
+            Transient,        // service/network/temporary failure
+            Protocol,         // malformed or unrecognized error shape
+        }
+
+        // Credential shapes that must never reach a Reason, a card or a log.
+        // Sanitizing at the boundary is the only way to be sure: the error text
+        // is vendor-controlled, so no consumer can be trusted to scrub it.
+        static readonly Regex[] CredentialShapes =
+        {
+            new Regex(@"(?i)bearer\s+[A-Za-z0-9._\-]{4,}", RegexOptions.Compiled),
+            new Regex(@"(?i)\b(access_token|refresh_token|id_token|api_key|apikey|authorization|password|secret|credential)\b\s*[""']?\s*[:=]\s*[""']?[^\s""',;]+", RegexOptions.Compiled),
+            new Regex(@"\bsk-[A-Za-z0-9_\-]{4,}", RegexOptions.Compiled),
+            new Regex(@"\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{2,}\.[A-Za-z0-9_\-]{2,}", RegexOptions.Compiled),
+        };
+
+        // Never emits a credential, and never grows unbounded: the sanitized
+        // form is what every downstream Reason, card note and diagnostic gets.
+        public static string SanitizeErrorText(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            string s = text;
+            foreach (Regex shape in CredentialShapes) s = shape.Replace(s, "<redacted>");
+            s = Regex.Replace(s, @"\s+", " ").Trim();
+            return s.Length > 240 ? s.Substring(0, 240) : s;
+        }
+
+        // An HTTP status TOKEN, never a digit run inside an id or a reset stamp:
+        // the word boundaries are what keep "-32603" and "4500003601" out.
+        static readonly Regex AuthStatusShape = new Regex(@"\b(401|403)\b", RegexOptions.Compiled);
+
+        // Ordered, documented, and pure: the same error object always yields the
+        // same class. Expiry is decided BEFORE generic rejection so the more
+        // specific verdict wins, and an expiry marker WITHOUT an auth marker
+        // never becomes an auth verdict (a quota window can "expire" too).
+        public static RateLimitFailure ClassifyRateLimitError(object error)
+        {
+            if (error == null) return RateLimitFailure.None;
+            string text = SanitizeErrorText(J.Write(error));
+            if (text.Length == 0) return RateLimitFailure.Protocol;
+            string t = text.ToLowerInvariant();
+
+            // 1. AUTHENTICATION. An explicit transport refusal of the
+            //    authenticated read. This is the ONLY evidence that may turn a
+            //    carried-forward reading into "not currently usable".
+            bool authEvidence =
+                   AuthStatusShape.IsMatch(t)
+                || t.Contains("unauthorized")
+                || t.Contains("unauthenticated")
+                || t.Contains("not logged in")
+                || t.Contains("not signed in")
+                || t.Contains("login required")
+                || t.Contains("sign in required")
+                || t.Contains("sign-in required")
+                || t.Contains("authentication required")
+                || t.Contains("auth required")
+                || t.Contains("authentication failed")
+                || t.Contains("auth rejected")
+                || t.Contains("reauthenticate")
+                || t.Contains("re-authenticate")
+                || t.Contains("invalid token")
+                || t.Contains("token rejected")
+                || t.Contains("credential rejected")
+                || t.Contains("forbidden");
+            if (authEvidence)
+            {
+                bool expiry = t.Contains("expired") || t.Contains("expiry")
+                    || t.Contains("no longer valid") || t.Contains("revoked")
+                    || t.Contains("has elapsed");
+                return expiry ? RateLimitFailure.AuthExpired : RateLimitFailure.AuthRejected;
+            }
+
+            // 2. QUOTA UNAVAILABLE / UNSUPPORTED. The authenticated request was
+            //    ACCEPTED and simply exposes no quota surface. This is what
+            //    every structured rate-limit error used to be assumed to be,
+            //    and it is still the right answer when there is no auth refusal.
+            if (t.Contains("no quota") || t.Contains("quota not") || t.Contains("quota unavailable")
+                || t.Contains("quota_unavailable") || t.Contains("not exposed")
+                || t.Contains("no subscription") || t.Contains("subscription quota")
+                || t.Contains("unsupported") || t.Contains("not supported")
+                || t.Contains("no rate limits") || t.Contains("rate limits not")
+                || t.Contains("no usage") || t.Contains("usage not"))
+                return RateLimitFailure.QuotaUnavailable;
+
+            // 3. TRANSIENT / SERVICE / NETWORK. Temporary by construction, so a
+            //    caller may retry without changing anything about the account.
+            if (t.Contains("timeout") || t.Contains("timed out") || t.Contains("deadline")
+                || t.Contains("temporarily") || t.Contains("try again")
+                || t.Contains("connection reset") || t.Contains("connection refused")
+                || t.Contains("econnreset") || t.Contains("econnrefused")
+                || t.Contains("etimedout") || t.Contains("enotfound")
+                || t.Contains("socket") || t.Contains("network")
+                || t.Contains("internal error") || t.Contains("internal_server_error")
+                || t.Contains("overloaded") || t.Contains("rate limited")
+                || t.Contains("too many requests") || t.Contains("service unavailable")
+                || t.Contains("bad gateway") || t.Contains("gateway timeout"))
+                return RateLimitFailure.Transient;
+
+            // 4. Anything else is an unrecognized shape. Never guessed into a
+            //    stronger verdict than the evidence supports.
+            return RateLimitFailure.Protocol;
+        }
+
+        public static bool IsAuthFailure(RateLimitFailure cls)
+        {
+            return cls == RateLimitFailure.AuthRejected || cls == RateLimitFailure.AuthExpired;
+        }
+
+        // The sanitized, actionable, human sentence for an auth verdict. Names
+        // the transport status only when the vendor actually supplied one.
+        public static string AuthFailureReason(RateLimitFailure cls, object error)
+        {
+            string text = SanitizeErrorText(J.Write(error));
+            Match m = AuthStatusShape.Match(text ?? "");
+            string status = m.Success ? m.Value : "";
+            string head = cls == RateLimitFailure.AuthExpired
+                ? "authentication expired" : "authentication required";
+            if (status == "401") return head + " (401 Unauthorized)";
+            if (status.Length > 0) return head + " (HTTP " + status + ")";
+            return head;
+        }
+
         static ProbeAccount Probe(string home, string name, string id, double deadline)
         {
             RefreshAuthSession(home);
@@ -1500,11 +1652,26 @@ class ProbeAccount
                     }
                     object rl = entry.Link.Call("account/rateLimits/read", null, deadline);
                     if (rl == null) { lease.Retire(); return Fail(name, id, home, "timeout", "codex app-server did not answer rateLimits"); }
-                    if (J.Get(rl, "error") != null)
+                    object rlErr = J.Get(rl, "error");
+                    if (rlErr != null)
                     {
                         // A structured error is a HEALTHY session answering for an
                         // account in a state we do not like; the child stays warm.
-                        return Fail(name, id, home, "rate_limits_error", J.Write(J.Get(rl, "error")));
+                        // SRC-028: the text is sanitized before it can reach an
+                        // Error, a card or a log, and an explicit authentication
+                        // rejection is carried as TYPED provenance instead of
+                        // being flattened into "the read failed".
+                        RateLimitFailure cls = ClassifyRateLimitError(rlErr);
+                        ProbeAccount failed = Fail(name, id, home, "rate_limits_error",
+                            SanitizeErrorText(J.Write(rlErr)));
+                        if (IsAuthFailure(cls))
+                        {
+                            failed.AuthFailed = true;
+                            failed.AuthFailureClass = cls;
+                            failed.AuthFailureReason = AuthFailureReason(cls, rlErr);
+                            failed.Error = failed.AuthFailureReason;
+                        }
+                        return failed;
                     }
 
                     object result = J.Get(rl, "result") ?? new Dictionary<string, object>();
@@ -2326,19 +2493,37 @@ class ProbeAccount
         // caller's absolute deadline is the only timeout that matters.
         internal class RpcSession : IDisposable
         {
+            internal static Func<ProcessStartInfo, Process> TestProcessStarter = null;
+            internal static Action TestHookAfterAdopt = null;
             Process P;
             // The session's own containment. A pooled app-server lives for the
             // life of the process, so its tree must end when the session is
             // dropped (dead child, eviction, timeout) rather than at app exit —
             // and must end even if the app is killed mid-sweep.
             ChildSweeper.Scope Scope;
-            readonly Dictionary<int, object> Responses = new Dictionary<int, object>();
-            // PERF-001: a request whose caller gave up must never keep a slot.
-            // The reply can still land after the timeout; it is matched here
-            // and discarded, so a slow answer cannot sit in Responses forever
-            // or resurface as the answer to a later, different request.
-            readonly HashSet<int> Abandoned = new HashSet<int>();
+            // PERF-001: explicit pending-request OWNERSHIP instead of a reply
+            // map plus polling plus tombstone set. Exactly one slot per
+            // in-flight Call, registered BEFORE the frame is written and removed
+            // by exactly one of its three owners: the answer, the deadline, or
+            // the session's close. ReadLoop publishes only into a slot that
+            // already exists, so an unsolicited or unmatched id can never grow
+            // this map. There is no tombstone set to age out: a reply for a
+            // request nobody owns is simply dropped. Ids are handed out
+            // monotonically and never reused, so a late reply can only ever be
+            // matched against the slot of the very request that asked for it —
+            // which is exactly what the old Abandoned tombstone was faking.
+            sealed class PendingSlot
+            {
+                internal object Reply;
+                internal bool Done;
+            }
+
+            readonly Dictionary<int, PendingSlot> PendingSlots = new Dictionary<int, PendingSlot>();
             readonly object Gate = new object();
+            // Set once the response pipe is finished (child exited, killed, or
+            // poisoned). Every waiter is pulsed and must stop waiting rather
+            // than burn its whole deadline on a session that can never answer.
+            bool Closed;
             int NextId = 1;
 
             public static RpcSession Start(string exe, string home)
@@ -2358,17 +2543,40 @@ class ProbeAccount
                 // API key that happens to sit in this process's environment.
                 foreach (string k in new[] { "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN" })
                     psi.EnvironmentVariables.Remove(k);
-                ChildSweeper.Scope scope = ChildSweeper.Open();
-                Process proc = Process.Start(psi);
-                if (proc == null) { scope.Dispose(); return null; }
-                scope.Adopt(proc);
-                var session = new RpcSession { P = proc, Scope = scope };
-                proc.ErrorDataReceived += (s, e) => { };
-                proc.BeginErrorReadLine();
-                var reader = new Thread(session.ReadLoop);
-                reader.IsBackground = true;
-                reader.Start();
-                return session;
+                ChildSweeper.Scope scope = null;
+                Process proc = null;
+                RpcSession session = null;
+                bool transferred = false;
+                try
+                {
+                    scope = ChildSweeper.Open();
+                    proc = TestProcessStarter != null ? TestProcessStarter(psi) : Process.Start(psi);
+                    if (proc == null) return null;
+                    scope.Adopt(proc);
+                    if (TestHookAfterAdopt != null) TestHookAfterAdopt();
+                    session = new RpcSession { P = proc, Scope = scope };
+                    proc.ErrorDataReceived += (s, e) => { };
+                    proc.BeginErrorReadLine();
+                    var reader = new Thread(session.ReadLoop);
+                    reader.IsBackground = true;
+                    reader.Start();
+                    transferred = true;
+                    return session;
+                }
+                catch { return null; }
+                finally
+                {
+                    if (!transferred)
+                    {
+                        if (proc != null)
+                        {
+                            try { if (proc.StandardInput != null) proc.StandardInput.Close(); } catch { }
+                            try { if (!proc.HasExited) proc.Kill(); } catch { }
+                            try { proc.Dispose(); } catch { }
+                        }
+                        if (scope != null) try { scope.Dispose(); } catch { }
+                    }
+                }
             }
 
             public bool Alive
@@ -2376,7 +2584,7 @@ class ProbeAccount
                 get { try { return !P.HasExited; } catch { return false; } }
             }
 
-             internal int PendingResponses { get { lock (Gate) return Responses.Count; } }
+            internal int PendingResponses { get { lock (Gate) return PendingSlots.Count; } }
             internal bool Healthy { get { return !Unhealthy; } }
             bool Unhealthy;
             // W2-001 secondary protocol safety: Call and Notify share one
@@ -2401,13 +2609,25 @@ class ProbeAccount
                         if (!id.HasValue) continue;
                         lock (Gate)
                         {
-                            int key = (int)id.Value;
-                            if (Abandoned.Remove(key)) continue; // late reply for a given-up call
-                            Responses[key] = msg;
+                            PendingSlot slot;
+                            // Publish ONLY into an owned slot. An id nobody is
+                            // waiting for (unsolicited push, a reply to a call
+                            // that already timed out, a protocol stray) is
+                            // dropped here instead of being retained until
+                            // shutdown.
+                            if (!PendingSlots.TryGetValue((int)id.Value, out slot)) continue;
+                            slot.Reply = msg;
+                            slot.Done = true;
+                            Monitor.PulseAll(Gate);
                         }
                     }
                 }
                 catch { }
+                // The pipe is finished. Everything the child did send was parsed
+                // and published above, so a finished answer still beats this
+                // close — but nobody may keep waiting on a session that cannot
+                // answer any more.
+                lock (Gate) { Closed = true; Monitor.PulseAll(Gate); }
             }
 
             // PERF-007/R030: ReadBoundedLine — retain only up to the protocol
@@ -2430,9 +2650,12 @@ class ProbeAccount
                     {
                         if (oversized)
                         {
-                            lock (Gate) Unhealthy = true;
-                            lock (Gate) if (Responses != null) Responses.Clear();
-                            P.Kill();
+                            // Poisoned connection: terminate it AND wake the
+                            // in-flight callers, so they fail fast instead of
+                            // waiting out a deadline for a reply that is never
+                            // parsed. Nothing from the oversized line is stored.
+                            lock (Gate) { Unhealthy = true; Closed = true; Monitor.PulseAll(Gate); }
+                            try { P.Kill(); } catch { }
                             return null;
                         }
                         string line = sb.ToString().TrimEnd('\r');
@@ -2455,44 +2678,50 @@ class ProbeAccount
 
             public object Call(string method, object parameters, double deadline)
             {
+                var slot = new PendingSlot();
                 int id;
-                lock (Gate) id = NextId++;
+                lock (Gate)
+                {
+                    id = NextId++;
+                    // Ownership is taken BEFORE the frame is written, so the
+                    // reply can never arrive before the slot that receives it.
+                    PendingSlots[id] = slot;
+                }
                 var req = new Dictionary<string, object> {
                     { "jsonrpc", "2.0" }, { "id", id }, { "method", method },
                 };
                 if (parameters != null) req["params"] = parameters;
-                if (!Send(req)) return null;
-                while (Stamp.Now < deadline)
+                if (!Send(req))
                 {
-                    lock (Gate)
-                    {
-                        object found;
-                        if (Responses.TryGetValue(id, out found)) { Responses.Remove(id); return found; }
-                    }
-                    if (P.HasExited)
-                    {
-                        // One last look: the answer may have landed in the same
-                        // instant the child closed its pipe.
-                        Thread.Sleep(20);
-                        lock (Gate)
-                        {
-                            object found;
-                            if (Responses.TryGetValue(id, out found)) { Responses.Remove(id); return found; }
-                        }
-                        return null;
-                    }
-                    Thread.Sleep(20);
+                    // Nothing was written: release the slot immediately rather
+                    // than leaving it for the deadline to reap.
+                    lock (Gate) PendingSlots.Remove(id);
+                    return null;
                 }
                 lock (Gate)
                 {
-                    object found;
-                    // The reply may have landed between the last poll and this
-                    // abandon: it wins, a deadline is not allowed to eat a
-                    // finished answer.
-                    if (Responses.TryGetValue(id, out found)) { Responses.Remove(id); return found; }
-                    Responses.Remove(id); Abandoned.Add(id);
+                    // Event-driven wait: the reader pulses the answer, the pipe
+                    // close pulses the failure, and the deadline bounds it. No
+                    // 20ms polling and no sleep-and-recheck.
+                    while (!slot.Done)
+                    {
+                        if (Closed) break;
+                        double left = deadline - Stamp.Now;
+                        if (left <= 0) break;
+                        // A pulse is the normal path; this floor only guarantees
+                        // that a missed pulse cannot turn into an unbounded wait.
+                        int ms = (int)Math.Min(250.0, Math.Ceiling(left * 1000.0));
+                        if (ms < 1) ms = 1;
+                        Monitor.Wait(Gate, ms);
+                    }
+                    // The deadline or the close may have raced the answer: a
+                    // finished reply always wins, a deadline never eats it. And
+                    // a call that gives up leaves NO slot behind, so a late
+                    // reply has nowhere to park and cannot resurface as the
+                    // answer to a later request.
+                    PendingSlots.Remove(id);
+                    return slot.Done ? slot.Reply : null;
                 }
-                return null;
             }
 
             public void Notify(string method, object parameters)
@@ -2529,6 +2758,9 @@ class ProbeAccount
 
             public void Dispose()
             {
+                // Wake any in-flight caller first: the session is going away and
+                // nobody may keep waiting on it.
+                lock (Gate) { Closed = true; Monitor.PulseAll(Gate); }
                 try { if (P.StandardInput != null) P.StandardInput.Close(); } catch { }
                 try { if (!P.WaitForExit(2000)) P.Kill(); } catch { }
                 try { P.Dispose(); } catch { }

@@ -150,11 +150,23 @@ public static class SettingsConsistencyTest
             foreach (string key in new[] { "ZAI_API_KEY", "ZCODE_API_KEY", "Z_AI_API_KEY", "ZHIPU_API_KEY" })
                 Environment.SetEnvironmentVariable(key, "");
 
+            // The sweep's CLI discovery also reads the REAL machine: the
+            // registry user/machine PATH and the installer fallbacks. On a
+            // machine with `agy` installed that resolves the real CLI, whose
+            // live quota repopulates NotifiedLow during FormAndMenu's refreshes
+            // — an external-state leak this settings harness must not own. The
+            // seams are the production ones (ExecutableDiscovery), pinned for
+            // this process only; process PATH was already cleared above.
+            ExecutableDiscovery.GetUserPath = () => null;
+            ExecutableDiscovery.GetMachinePath = () => null;
+            ExecutableDiscovery.FallbackFor = delegate { return new string[0]; };
+
             settingsType = typeof(LimisawSettings);
             formType = typeof(LimisawForm);
 
             HealthyAutostart();
             FailedAutostart(temp);
+            ForeignAutostartPresence(temp);
             FormAndMenu(temp, root);
         }
         catch (Exception ex)
@@ -166,6 +178,9 @@ public static class SettingsConsistencyTest
         finally
         {
             UnwireStore();
+            ExecutableDiscovery.GetUserPath = null;
+            ExecutableDiscovery.GetMachinePath = null;
+            ExecutableDiscovery.FallbackFor = null;
             try { Directory.Delete(temp, true); } catch { }
         }
 
@@ -220,6 +235,98 @@ public static class SettingsConsistencyTest
         r = Program.ReconcileAutostart(settings);
         Check("a wrong existing command is repaired and the repair verified",
             r.Verified && Store.Values[Program.AutostartValueName] == ExpectedCommand(), "");
+        UnwireStore();
+    }
+
+    // ── group 3b: SRC-011:R007 (W2-003) presence vs exact-command state ───
+    // The one-boolean readback (`got != null && got == want`) made "a FOREIGN
+    // command is in the Run key" and "nothing is in the Run key" the identical
+    // observation whenever the desired state was OFF. Both the inspection and
+    // the reconciliation then reported verified success while Windows kept
+    // launching something. These checks pin presence and equality apart.
+    static void ForeignAutostartPresence(string temp)
+    {
+        Console.WriteLine();
+        Console.WriteLine("== autostart: a foreign Run command is NOT an absent one (W2-003) ==");
+        settings = new LimisawSettings(temp);
+        settings.Load();
+        const string foreign = "C:\\somewhere-else\\OtherApp.exe";
+
+        // A. The read-only look, desired OFF, a foreign command present.
+        WireStore(new FakeStore());
+        Store.Values[Program.AutostartValueName] = foreign;
+        settings.AutoStart = false;
+        AutostartResult look = Program.InspectAutostart(settings);
+        Check("A1. inspection: desired-off + a FOREIGN command is NOT verified",
+            !look.Verified && look.Actual == false,
+            "verified=" + look.Verified + " actual=" + look.Actual + " reason=" + look.Reason);
+        Check("A2. inspection reports presence and equality as separate facts",
+            look.Present == true && look.Exact == false,
+            "present=" + look.Present + " exact=" + look.Exact);
+        Check("A3. inspection says a startup entry is still there, not that all is well",
+            look.Reason != null && look.Reason.IndexOf("present", StringComparison.Ordinal) >= 0,
+            look.Reason);
+        Check("A4. the read-only look still wrote nothing",
+            Store.Mutations == 0 && Store.Sets == 0 && Store.Deletes == 0,
+            "mutations=" + Store.Mutations);
+        UnwireStore();
+
+        // B. Reconciliation, desired OFF, a foreign command that survives the
+        //    delete: the sharpest form of the defect, and the RED control.
+        WireStore(new FakeStore { Sticky = true, WrongValue = foreign });
+        Store.Values[Program.AutostartValueName] = ExpectedCommand();
+        settings.AutoStart = false;
+        AutostartResult rForeign = Program.ReconcileAutostart(settings);
+        Check("B1. reconcile: a surviving FOREIGN command is a mismatch, never a success",
+            !rForeign.Verified && rForeign.Actual == false,
+            "verified=" + rForeign.Verified + " actual=" + rForeign.Actual + " reason=" + rForeign.Reason);
+        Check("B2. reconcile keeps presence and equality separate too",
+            rForeign.Present == true && rForeign.Exact == false,
+            "present=" + rForeign.Present + " exact=" + rForeign.Exact);
+        Check("B3. the reason distinguishes a foreign entry from our own",
+            rForeign.Reason.IndexOf("still present", StringComparison.Ordinal) >= 0
+            && rForeign.Reason.IndexOf("different", StringComparison.Ordinal) >= 0,
+            rForeign.Reason);
+        UnwireStore();
+
+        // C. Our own command surviving its delete stays the "still present" case,
+        //    and must NOT be relabelled as a foreign entry.
+        WireStore(new FakeStore { Sticky = true });
+        Store.Values[Program.AutostartValueName] = ExpectedCommand();
+        settings.AutoStart = false;
+        AutostartResult rOurs = Program.ReconcileAutostart(settings);
+        Check("C1. our own surviving command is still present AND exact, and still unverified",
+            !rOurs.Verified && rOurs.Present == true && rOurs.Exact == true,
+            "present=" + rOurs.Present + " exact=" + rOurs.Exact + " reason=" + rOurs.Reason);
+        Check("C2. our own entry is not described as a different one",
+            rOurs.Reason.IndexOf("still present", StringComparison.Ordinal) >= 0
+            && rOurs.Reason.IndexOf("different", StringComparison.Ordinal) < 0,
+            rOurs.Reason);
+        UnwireStore();
+
+        // D. Desired ON, absent — the read-only look never writes, so this is
+        //    the only path where "desired on and nothing there" is observable.
+        //    Presence false, equality false, reason names the missing entry.
+        WireStore(new FakeStore());
+        settings.AutoStart = true;
+        AutostartResult lookOn = Program.InspectAutostart(settings);
+        Check("D1. inspection: desired-on with nothing present is unverified with an honest reason",
+            !lookOn.Verified && lookOn.Present == false && lookOn.Exact == false
+            && lookOn.Reason.IndexOf("not applied", StringComparison.Ordinal) >= 0,
+            "present=" + lookOn.Present + " exact=" + lookOn.Exact + " reason=" + lookOn.Reason);
+        Check("D2. and the inspection still wrote nothing",
+            Store.Mutations == 0, "mutations=" + Store.Mutations);
+        UnwireStore();
+
+        // E. The unreadable read is still "nothing may be claimed": both facts
+        //    stay null rather than defaulting to false.
+        WireStore(new FakeStore { FailRead = true });
+        settings.AutoStart = false;
+        AutostartResult rUnreadable = Program.ReconcileAutostart(settings);
+        Check("E1. an unreadable Run key claims neither presence nor absence",
+            !rUnreadable.Verified && rUnreadable.Present == null && rUnreadable.Exact == null
+            && rUnreadable.Actual == null,
+            "present=" + rUnreadable.Present + " exact=" + rUnreadable.Exact + " actual=" + rUnreadable.Actual);
         UnwireStore();
     }
 
@@ -368,6 +475,13 @@ public static class SettingsConsistencyTest
 
     static string Note() { return (string)F("Note"); }
 
+    static string Keys(System.Collections.IDictionary d)
+    {
+        var names = new List<string>();
+        foreach (object k in d.Keys) names.Add(k.ToString());
+        return string.Join(",", names.ToArray());
+    }
+
     // ── groups 5-7: form, external reload, menu projection ────────────────
     static void FormAndMenu(string temp, string root)
     {
@@ -438,7 +552,8 @@ public static class SettingsConsistencyTest
             Check("...TopMost follows AlwaysOnTop",
                 form.TopMost, "");
             Check("...an externally moved low threshold re-arms fired alerts",
-                notified.Count == 0, notified.Count + " remembered");
+                notified.Count == 0,
+                notified.Count + " remembered: " + string.Join(",", Keys(notified)));
             Check("...ShowUsed flipped the readout (10% left renders as 90 used)",
                 FCallShownRem(10) == 90, FCallShownRem(10).ToString());
 

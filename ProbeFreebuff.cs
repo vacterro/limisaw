@@ -620,6 +620,18 @@ namespace Limisaw
         internal static Func<string, bool> FileExists = path => File.Exists(path);
         internal static Func<string> AppPathsTarget = ReadAppPathsTarget;
         internal static Func<string, string> ResolveLnk = ZcodeLauncherDiscovery.ResolveLnk;
+        static readonly object DesktopTargetGate = new object();
+        static string CachedDesktopTarget;
+
+        // Test seam for isolating positive-cache lifetime cases.
+        internal static void ResetDesktopTargetCacheForTests()
+        { lock (DesktopTargetGate) CachedDesktopTarget = null; }
+
+        static string CacheDesktopTarget(string target)
+        {
+            lock (DesktopTargetGate) CachedDesktopTarget = target;
+            return target;
+        }
         // The one "is it installed" seam. Production reads the real filesystem
         // and registry; a harness drives both without touching this machine.
         internal static Func<bool> HasExecutableImpl = DefaultHasExecutable;
@@ -654,22 +666,42 @@ namespace Limisaw
         // target can be PROVEN to exist. Returns the target path or null.
         public static string DesktopLauncherTarget()
         {
+            string cached;
+            lock (DesktopTargetGate) cached = CachedDesktopTarget;
+            if (!string.IsNullOrEmpty(cached))
+            {
+                bool exists = false;
+                try { exists = FileExists != null && FileExists(cached); } catch { }
+                if (exists) return cached;
+                lock (DesktopTargetGate)
+                    if (CachedDesktopTarget == cached) CachedDesktopTarget = null;
+            }
+
             string app = AppPathsTarget != null ? AppPathsTarget() : null;
-            if (!string.IsNullOrEmpty(app)) return app;
+            if (!string.IsNullOrEmpty(app))
+            {
+                bool exists = false;
+                try { exists = FileExists != null && FileExists(app); } catch { }
+                if (exists) return CacheDesktopTarget(app);
+            }
             foreach (string raw in (StartMenuDirs != null ? StartMenuDirs() : new string[0]))
             {
                 string dir;
                 try { dir = Environment.ExpandEnvironmentVariables(raw); } catch { continue; }
                 if (!Directory.Exists(dir)) continue;
-                string[] links;
-                try { links = Directory.GetFiles(dir, "*.lnk", SearchOption.AllDirectories); }
-                catch { continue; }
-                foreach (string link in links)
+                try
                 {
-                    if (Path.GetFileName(link).IndexOf("freebuff", StringComparison.OrdinalIgnoreCase) < 0) continue;
-                    string target = ResolveLnk != null ? ResolveLnk(link) : ZcodeLauncherDiscovery.ResolveLnk(link);
-                    if (!string.IsNullOrEmpty(target) && FileExists(target)) return target;
+                    // Enumerate lazily and stop on the first matching shortcut
+                    // whose resolved target still exists.
+                    foreach (string link in Directory.EnumerateFiles(dir, "*.lnk", SearchOption.AllDirectories))
+                    {
+                        if (Path.GetFileName(link).IndexOf("freebuff", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        string target = ResolveLnk != null ? ResolveLnk(link) : ZcodeLauncherDiscovery.ResolveLnk(link);
+                        if (!string.IsNullOrEmpty(target) && FileExists != null && FileExists(target))
+                            return CacheDesktopTarget(target);
+                    }
                 }
+                catch { }
             }
             return null;
         }
@@ -687,7 +719,9 @@ namespace Limisaw
                         string v = (k.GetValue(null) ?? k.GetValue("Path")) as string;
                         if (string.IsNullOrEmpty(v)) continue;
                         v = Environment.ExpandEnvironmentVariables(v.Trim().Trim('"'));
-                        if (FileExists(v)) return v;
+                        // DesktopLauncherTarget is the single existence check
+                        // and positive-cache boundary for this resolved path.
+                        return v;
                     }
                 }
                 catch { }

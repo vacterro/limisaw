@@ -68,8 +68,23 @@ public static class TrayTip
     static string BuildTip(List<Account> accounts, bool stale, string metricLabel,
                            int value, bool available, bool showUsed)
     {
-        string head = "LIMISAW | " + (showUsed ? "highest used " : "lowest remaining ");
-        string tip = head + (available ? ShownRem(value, showUsed) + "% (" + ShortText(metricLabel, 28) + ")" : "--");
+        return BuildTip(accounts, stale, metricLabel, value, available, showUsed, false);
+    }
+
+    // Mirrors LIMISAW.cs BuildTip exactly. SRC-027: the head names the SELECTOR,
+    // then the reading. "any available" is a stable-order selector, not a
+    // minimiser, so it must keep its own name when Show Used flips the
+    // percentage to the spent share — only the "lowest remaining" window is
+    // also truthfully "highest used", because it is the same window read the
+    // other way round.
+    static string BuildTip(List<Account> accounts, bool stale, string metricLabel,
+                           int value, bool available, bool showUsed, bool anyMode)
+    {
+        string head = "LIMISAW | ";
+        if (anyMode) head += showUsed ? "any available \u00B7 " : "any available ";
+        else head += showUsed ? "highest used " : "lowest remaining ";
+        string suffix = anyMode && showUsed ? " used" : "";
+        string tip = head + (available ? ShownRem(value, showUsed) + "%" + suffix + " (" + ShortText(metricLabel, 28) + ")" : "--");
         foreach (Account a in accounts)
         {
             if (!a.Ok) continue;
@@ -167,6 +182,21 @@ public static class TrayTip
             Check("stale is never dropped by the account loop",
                 BuildTip(Fleet(5), true, "Codex \u00B7 5h", 100, true, false).EndsWith("| stale"),
                 BuildTip(Fleet(5), true, "Codex \u00B7 5h", 100, true, false));
+            Check("Any available keeps its own name when Show Used flips the reading",
+                BuildTip(one, false, "Codex \u00B7 5h", 25, true, true, true)
+                    == "LIMISAW | any available \u00B7 75% used (Codex \u00B7 5h)",
+                BuildTip(one, false, "Codex \u00B7 5h", 25, true, true, true));
+            Check("Any available + remaining states the selector, never 'highest used'",
+                BuildTip(one, false, "Codex \u00B7 5h", 25, true, false, true)
+                    == "LIMISAW | any available 25% (Codex \u00B7 5h)",
+                BuildTip(one, false, "Codex \u00B7 5h", 25, true, false, true));
+            Check("the any-mode tip still fits the shell's 63-char budget with a full fleet",
+                BuildTip(Fleet(5), false, "Antigravity \u00B7 Antigravity \u00B7 week (Claude and GPT models)",
+                         25, true, true, true).Length <= TrayTipMax
+                && !BuildTip(Fleet(5), false, "Antigravity \u00B7 Antigravity \u00B7 week (Claude and GPT models)",
+                         0, false, true, true).Contains("used"),
+                BuildTip(Fleet(5), false, "Antigravity \u00B7 Antigravity \u00B7 week (Claude and GPT models)",
+                         25, true, true, true));
             Check("short tooltip is not truncated",
                 !BuildTip(one, false, "Codex \u00B7 5h", 40, true, false).EndsWith("..."),
                 BuildTip(one, false, "Codex \u00B7 5h", 40, true, false));

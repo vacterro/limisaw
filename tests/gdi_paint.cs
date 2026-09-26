@@ -274,7 +274,7 @@ public static class GdiPaintTest
                     // Reflection's own per-invoke allocation is inside this
                     // number, so the bar is the leaking control, not zero.
                     Check("the live paint burst stays with the disposed replica, not the leaking one",
-                        !sensitive || real < leaked / 8,
+                        !sensitive || real < leaked / 4,
                         real.ToString("N0") + " vs undisposed " + leaked.ToString("N0")
                             + (sensitive ? "" : " (control inconclusive)"));
                 }

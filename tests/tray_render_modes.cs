@@ -29,6 +29,12 @@ using Limisaw;
 // the horizontal fill arithmetic: the fill unit of Gauge/Rows is WIDTH, so
 // 47% of a 14px bar is exactly 6px, never the old area-as-width overflow.
 // Section 10 pins the legacy TrayFill 2/4 -> 8 settings migration.
+// Sections 19-26 pin the SRC-027 decoupling of the tray NUMBER from TrayMax,
+// and sections 30-34 pin the two automatic selectors apart: "lowest
+// remaining" minimises over the complete eligible pool, while "any
+// available" is a STABLE-ORDER selector that keeps its current usable reading
+// and never compares percentages — including the 0%-is-not-usable rule and the
+// truthful labelling of both modes under Show Used.
 //
 // The engine sources are LINKED (not reflected), so every private seam is
 // reachable and what runs here is the same code the shell gets. Nothing here
@@ -94,6 +100,12 @@ public static class TrayRenderModesTest
         FSet("Accounts", list);
         FSet("PrevAccounts", new List<AccountData>());
         FSet("Stale", false);
+    }
+
+    static WindowData WinOf(AccountData a, string key)
+    {
+        foreach (WindowData w in a.Windows) if (w.Key == key) return w;
+        return null;
     }
 
     static void Select(params string[] ids)
@@ -219,6 +231,13 @@ public static class TrayRenderModesTest
         return w;
     }
 
+    static TrayModel BuildTrayModel(LimisawForm form, string pin)
+    {
+        TrayModel m = form.BuildModel();
+        m.Pin = pin;
+        return m;
+    }
+
     static Bitmap Scratch()
     {
         var bmp = new Bitmap(16, 16);
@@ -277,8 +296,8 @@ public static class TrayRenderModesTest
                 Check("1. pinned-unavailable + a healthy selected 37% -> the tray answers 37",
                     (int)outs[0] == 37 && (bool)outs[1] && ((string)outs[2]).Contains("Account2"),
                     "value=" + outs[0] + " available=" + outs[1] + " label=" + outs[2]);
-                TrayModel model = new TrayModel
-                { All = form.AllMetrics(), Items = form.TrayMetrics(), Pin = settings.TrayMetric, Stale = false };
+                TrayModel model = form.BuildModel();
+                model.Pin = settings.TrayMetric;
                 TrayReading r = form.ResolveReading(model);
                 Check("1b. the fallback is real and disclosed",
                     r.Fallback && r.Note.Contains("pinned") && r.NoteShort.Length > 0,
@@ -301,8 +320,8 @@ public static class TrayRenderModesTest
 
                 // ── 2. PINNED + READABLE is authoritative ───────────────────
                 settings.TrayMetric = "codex/Account2/weekly";
-                model = new TrayModel
-                { All = form.AllMetrics(), Items = form.TrayMetrics(), Pin = settings.TrayMetric, Stale = false };
+                model = form.BuildModel();
+                model.Pin = settings.TrayMetric;
                 r = form.ResolveReading(model);
                 Check("2. a readable pin answers exactly, with no fallback",
                     !r.Fallback && r.Value == 37 && r.MetricId == "codex/Account2/weekly",
@@ -945,13 +964,8 @@ public static class TrayRenderModesTest
                 Check("16a. all readings hidden + all readable -> '--', never a hidden metric",
                     !(bool)outs16[1] && (int)outs16[0] == 0,
                     "value=" + outs16[0] + " available=" + outs16[1]);
-                TrayModel hidden = new TrayModel
-                {
-                    All = form.AllMetrics(),
-                    Items = form.TrayMetrics(),
-                    Pin = "lowest",
-                    Stale = false,
-                };
+                TrayModel hidden = form.BuildModel();
+                hidden.Pin = "lowest";
                 Check("16b. the eligible set is really empty while All still reads",
                     form.TrayMetrics().Count == 0 && form.AllMetrics().Count == 2,
                     "items=" + form.TrayMetrics().Count + " all=" + form.AllMetrics().Count);
@@ -981,8 +995,7 @@ public static class TrayRenderModesTest
                     Acc("zcode", "Z", Dead5h(), DeadWeek()));
                 settings.TrayMetric = "zcode/Z/five_hour";
                 Select();  // everything eligible again
-                TrayReading pinnedOk = form.ResolveReading(new TrayModel
-                { All = form.AllMetrics(), Items = form.TrayMetrics(), Pin = settings.TrayMetric, Stale = false });
+                TrayReading pinnedOk = form.ResolveReading(BuildTrayModel(form, settings.TrayMetric));
                 Check("17a. an unavailable pin falls back to the selected healthy reading",
                     pinnedOk.Available && pinnedOk.Value == 37 && pinnedOk.Fallback,
                     "value=" + pinnedOk.Value + " fallback=" + pinnedOk.Fallback);
@@ -995,8 +1008,7 @@ public static class TrayRenderModesTest
                 foreach (Metric m in form.AllMetrics()) hideIds.Add(m.Id);
                 settings.TrayItems = string.Join("|", hideIds.ToArray());
                 settings.TrayHidden = string.Join("|", hideIds.ToArray());
-                TrayReading pinDead = form.ResolveReading(new TrayModel
-                { All = form.AllMetrics(), Items = form.TrayMetrics(), Pin = settings.TrayMetric, Stale = false });
+                TrayReading pinDead = form.ResolveReading(BuildTrayModel(form, settings.TrayMetric));
                 Check("17b. unavailable hidden pin + no eligible readings -> '--', not a hidden 37",
                     !pinDead.Available && form.TrayMetrics().Count == 0,
                     "available=" + pinDead.Available + " items=" + form.TrayMetrics().Count);
@@ -1020,8 +1032,7 @@ public static class TrayRenderModesTest
                 settings.TrayMetric = "zcode/Z/five_hour";
                 settings.TrayItems = "codex/A1/weekly";
                 settings.TrayHidden = "codex/A1/five_hour|zcode/Z/five_hour|zcode/Z/weekly";
-                TrayReading pinOne = form.ResolveReading(new TrayModel
-                { All = form.AllMetrics(), Items = form.TrayMetrics(), Pin = settings.TrayMetric, Stale = false });
+                TrayReading pinOne = form.ResolveReading(BuildTrayModel(form, settings.TrayMetric));
                 Check("17e. the fallback uses the one eligible healthy reading",
                     pinOne.Available && pinOne.Value == 37 && pinOne.MetricId == "codex/A1/weekly",
                     "value=" + pinOne.Value + " id=" + pinOne.MetricId);
@@ -1030,8 +1041,7 @@ public static class TrayRenderModesTest
                 settings.TrayItems = "codex/A1/weekly";
                 settings.TrayHidden = "codex/A1/weekly";
                 settings.TrayMetric = "codex/A1/weekly";
-                TrayReading pinHidden = form.ResolveReading(new TrayModel
-                { All = form.AllMetrics(), Items = form.TrayMetrics(), Pin = settings.TrayMetric, Stale = false });
+                TrayReading pinHidden = form.ResolveReading(BuildTrayModel(form, settings.TrayMetric));
                 Check("17f. a READABLE hidden pin stays authoritative (explicit choice)",
                     pinHidden.Available && pinHidden.Value == 37 && !pinHidden.Fallback,
                     "value=" + pinHidden.Value + " fallback=" + pinHidden.Fallback);
@@ -1055,6 +1065,562 @@ public static class TrayRenderModesTest
                     res == 1, "resolutions=" + res);
                 Check("18c. the snapshot update left no tray error",
                     (string)F("TrayError") == "", (string)F("TrayError"));
+
+                // ── 19. TrayMax=4 does not hide an eligible fifth reading from lowest ─────
+                // Install 5 readings, set TrayMax=4, verify lowest still picks from beyond TrayMax
+                Install(
+                    Acc("codex", "A1", Available5h(80), AvailableWeek(70)),
+                    Acc("claude", "Claude", Available5h(60), AvailableWeek(50)),
+                    Acc("antigravity", "Ag", Available5h(40), AvailableWeek(30)),
+                    Acc("zcode", "Z", Available5h(20), AvailableWeek(10)),
+                    Acc("gpt4", "GPT4", Available5h(5), AvailableWeek(1)));  // 5th account, weekly=1%
+                settings.TrayMax = 4;
+                settings.TrayMetric = "lowest";
+                settings.TrayItems = "";  // discovery order
+                // BuildModel populates both Items (capped) and Eligible (uncapped)
+                TrayModel bm = form.BuildModel();
+                TrayReading lowest5 = form.ResolveReading(bm);
+                Check("19a. TrayMax=4 still picks from beyond cap (gpt4 weekly=1%)",
+                    lowest5.Available && lowest5.Value == 1,
+                    "value=" + lowest5.Value + " id=" + lowest5.MetricId);
+                // But tray items are capped at 4
+                Check("19b. TrayMetrics() still returns only 4 items (TrayMax applied)",
+                    form.TrayMetrics().Count == 4, "count=" + form.TrayMetrics().Count);
+
+                // ── 20. Any available prefers current usable reading ─────
+                // Set to "any" mode, verify it picks a reading, then "refresh" with it still usable
+                settings.TrayMetric = "any";
+                TrayModel am = form.BuildModel();
+                TrayReading any1 = form.ResolveReading(am);
+                Check("20a. any available picks a usable reading",
+                    any1.Available && any1.Value > 0,
+                    "value=" + any1.Value + " available=" + any1.Available);
+                // Simulate refresh (same reading still usable) — set CurrentMetricId to what any1 picked
+                TrayModel am2 = form.BuildModel();
+                am2.CurrentMetricId = any1.MetricId;
+                TrayReading any2 = form.ResolveReading(am2);
+                Check("20b. any available keeps same reading on refresh",
+                    any1.MetricId == any2.MetricId,
+                    "same id=" + any1.MetricId + " vs " + any2.MetricId);
+
+                // ── 21. Any available switches when current becomes unusable ─────
+                // Simulate the previously-picked reading now having 0% (unusable)
+                TrayModel am3 = form.BuildModel();
+                am3.CurrentMetricId = any1.MetricId;
+                foreach (Metric m in am3.Eligible)
+                    if (m.Id == any1.MetricId) { m.Value = 0; m.Available = false; break; }
+                TrayReading any3 = form.ResolveReading(am3);
+                Check("21a. any available switches to a different reading when current hits 0%",
+                    any3.MetricId != any1.MetricId && any3.Available,
+                    "switched from " + any1.MetricId + " to " + any3.MetricId);
+
+                // ── 22. Lowest remaining selects global positive minimum, not capped ─────
+                // Put a reading beyond the TrayMax cap and verify lowest finds it
+                Install(
+                    Acc("codex", "A1", Available5h(55), AvailableWeek(37)),
+                    Acc("zcode", "Z", Available5h(99), AvailableWeek(1)));
+                settings.TrayMax = 4;
+                settings.TrayMetric = "lowest";
+                settings.TrayItems = "codex/A1/five_hour|codex/A1/weekly|zcode/Z/five_hour|zcode/Z/weekly";
+                bm = form.BuildModel();
+                // Eligible should include all non-hidden (all 4 here, none hidden)
+                Check("22a. Eligible pool includes all non-hidden readings, not capped by TrayMax",
+                    bm.Eligible.Count >= 4, "eligible count=" + bm.Eligible.Count);
+                TrayReading lowestGlobal = form.ResolveReading(bm);
+                // Lowest positive remaining = 1% (zcode/Z/weekly) or 37% (codex/A1/weekly)
+                int expectedMin = int.MaxValue;
+                foreach (Metric m in bm.Eligible)
+                    if (m.Available && m.Value > 0 && m.Value < expectedMin) expectedMin = m.Value;
+                Check("22b. lowest remaining picks the global minimum positive reading (not capped)",
+                    lowestGlobal.Available && lowestGlobal.Value == expectedMin,
+                    "value=" + lowestGlobal.Value + " expectedMin=" + expectedMin);
+
+                // ── 23. Manual pin behavior unchanged ─────
+                settings.TrayMetric = "zcode/Z/five_hour";
+                settings.TrayItems = "";
+                bm = form.BuildModel();
+                TrayReading pinned = form.ResolveReading(bm);
+                Check("23a. explicit pin picks exact reading",
+                    pinned.MetricId == "zcode/Z/five_hour" && pinned.Available,
+                    "id=" + pinned.MetricId);
+
+                // ── 24. Any available switches on UNAVAILABLE (not just zero) ─────
+                // Start held A1 five_hour. Refresh with it Available=false, B readable.
+                settings.TrayMetric = "any";
+                Install(
+                    Acc("codex", "A1", Available5h(40), AvailableWeek(10)),
+                    Acc("claude", "Claude", Available5h(30), AvailableWeek(20)));
+                settings.TrayMax = 4;
+                settings.TrayItems = "";
+                bm = form.BuildModel();
+                TrayReading anyFirst = form.ResolveReading(bm);
+                Check("24a. any available initially picks a usable reading",
+                    anyFirst.Available, "available=" + anyFirst.Available);
+                // Simulate refresh: the held reading becomes unavailable
+                TrayModel am24 = form.BuildModel();
+                am24.CurrentMetricId = anyFirst.MetricId;
+                foreach (Metric m in am24.Eligible)
+                    if (m.Id == anyFirst.MetricId) { m.Available = false; break; }
+                TrayReading any24 = form.ResolveReading(am24);
+                Check("24b. any available switches when current becomes unavailable",
+                    any24.Available && any24.MetricId != anyFirst.MetricId,
+                    "switched from " + anyFirst.MetricId + " to " + any24.MetricId);
+
+                // ── 25. Any available does NOT report a 0% reading as usable ─────
+                // SRC-027:R003: usable is a conjunction — readable AND remaining
+                // > 0. Every eligible reading here is 0%-and-readable or simply
+                // unavailable, so "any available" has nothing to offer and must
+                // say so instead of handing back a 0% reading as usable. The two
+                // modes must NOT share this fallback: see 26a below.
+                Install(
+                    Acc("codex", "A1", Available5h(0), AvailableWeek(0)),
+                    Acc("claude", "Claude", Dead5h(), DeadWeek()));
+                settings.TrayMax = 4;
+                settings.TrayItems = "";
+                settings.TrayMetric = "any";
+                FSet("AnyAvailableMetricId", "");
+                TrayModel zeroModel = form.BuildModel();
+                Check("25a. any available with no usable reading reports unavailable, not 0%",
+                    !form.ResolveReading(zeroModel).Available,
+                    "available=" + form.ResolveReading(zeroModel).Available);
+
+                // ── 26. Lowest remaining keeps a 0% reading as its LAST RESORT ─────
+                // SRC-027:R005: lowest may report 0% because a spent-but-readable
+                // window is still a truthful "you have nothing left". This block
+                // used to re-resolve the SAME model with the Pin still captured as
+                // "any", so it silently re-tested Any — a TrayModel carries its
+                // own Pin, so the model has to be rebuilt under the lowest pin.
+                settings.TrayMetric = "lowest";
+                TrayModel zeroLowModel = form.BuildModel();
+                Check("26a. the lowest path really runs under the lowest pin",
+                    zeroLowModel.Pin == "lowest", "pin=" + zeroLowModel.Pin);
+                TrayReading low26 = form.ResolveReading(zeroLowModel);
+                Check("26b. lowest remaining may report 0% when no positive usable reading exists",
+                    low26.Available && low26.Value == 0,
+                    "available=" + low26.Available + " value=" + low26.Value);
+                Check("26c. the lowest zero reading is a readable 0% window, not an unreadable one",
+                    low26.MetricId == "codex/A1/five_hour", "id=" + low26.MetricId);
+
+                // ── 27. Hidden reading stays ineligible even after TrayMax decouple ─────
+                // Claude's 10/5 are the numerically LOWEST readings in the whole
+                // fleet, so any path that leaked a hidden reading back into the
+                // candidate pool would select one of them. Eligible order is
+                // codex/A1/five_hour (40) then codex/A1/weekly (30), so:
+                //   lowest -> 30 (the global positive minimum of the VISIBLE pool)
+                //   any    -> 40 (the FIRST usable reading in stable order)
+                // Asserting the exact id on both proves hidden exclusion AND
+                // that the two automatic modes are genuinely different.
+                Install(
+                    Acc("codex", "A1", Available5h(40), AvailableWeek(30)),
+                    Acc("claude", "Claude", Available5h(10), AvailableWeek(5)));
+                settings.TrayMax = 9;
+                settings.TrayItems = "";
+                settings.TrayHidden = "claude/Claude/five_hour|claude/Claude/weekly";
+                settings.TrayMetric = "lowest";
+                bm = form.BuildModel();
+                TrayReading low27 = form.ResolveReading(bm);
+                Check("27a. lowest remaining does not resurrect a hidden reading",
+                    low27.Available && low27.MetricId == "codex/A1/weekly" && low27.Value == 30,
+                    "id=" + low27.MetricId + " value=" + low27.Value);
+                settings.TrayMetric = "any";
+                bm = form.BuildModel();
+                TrayReading any27 = form.ResolveReading(bm);
+                Check("27b. any available does not resurrect a hidden reading",
+                    any27.Available && any27.MetricId == "codex/A1/five_hour" && any27.Value == 40,
+                    "id=" + any27.MetricId + " value=" + any27.Value);
+                Check("27c. hidden metrics stay out of the ELIGIBLE pool (All still carries them)",
+                    !bm.Eligible.Exists(delegate(Metric m) { return m.Id.StartsWith("claude/", StringComparison.Ordinal); })
+                    && bm.All.Exists(delegate(Metric m) { return m.Id.StartsWith("claude/", StringComparison.Ordinal); }),
+                    "eligible=" + bm.Eligible.Count + " all=" + bm.All.Count);
+
+                // ── 28. Stable lowest tie: first in eligible order wins ─────
+                Install(
+                    Acc("codex", "A1", Available5h(15), AvailableWeek(40)),
+                    Acc("claude", "Claude", Available5h(15), AvailableWeek(50)));
+                settings.TrayHidden = "";
+                settings.TrayItems = "";
+                settings.TrayMetric = "lowest";
+                bm = form.BuildModel();
+                TrayReading low28 = form.ResolveReading(bm);
+                Check("28a. lowest remaining breaks ties by stable eligible order",
+                    low28.MetricId == "codex/A1/five_hour",
+                    "id=" + low28.MetricId);
+
+                // ── 29. Preview does not steal Any available sticky state ─────
+                // Live Any holds A1. Rendering a Settings preview must not move it.
+                settings.TrayMetric = "any";
+                Install(
+                    Acc("codex", "A1", Available5h(55), AvailableWeek(10)),
+                    Acc("claude", "Claude", Available5h(30), AvailableWeek(20)));
+                settings.TrayMax = 4;
+                settings.TrayItems = "";
+                // Live resolution: commit A1 as the sticky any metric
+                form.UpdateTray();
+                // Check the live sticky field was committed (via UpdateTray)
+                string sticky = (string)formType.GetField("AnyAvailableMetricId", NP).GetValue(form);
+                Check("29a. live UpdateTray commits the any sticky metric",
+                    sticky.Length > 0, "sticky=" + sticky);
+                string heldBefore = sticky;
+                // Render a Settings preview with fake metrics — must not steal sticky state
+                MethodInfo prev29 = formType.GetMethod("RenderPreviewBitmap", NP, null, Type.EmptyTypes, null);
+                Bitmap prevBmp29 = (Bitmap)prev29.Invoke(form, null);
+                prevBmp29.Dispose();
+                string stickyAfter = (string)formType.GetField("AnyAvailableMetricId", NP).GetValue(form);
+                Check("29b. preview render does not mutate the any sticky metric",
+                    stickyAfter == heldBefore,
+                    "before=" + heldBefore + " after=" + stickyAfter);
+                // Re-render the live tray and confirm it stays on the same reading
+                form.UpdateTray();
+                string stickyLive = (string)formType.GetField("AnyAvailableMetricId", NP).GetValue(form);
+                Check("29c. re-rendering the live tray keeps the same any sticky metric",
+                    stickyLive == heldBefore,
+                    "held=" + heldBefore + " live=" + stickyLive);
+
+                // ── 30. Any available takes the FIRST usable, not the LOWEST ─────
+                // SRC-027:R002/R003/R004. This is the red control for the
+                // selector's core semantics: the old implementation minimised the
+                // percentage and answered weekly=15 here. "Any available" promises
+                // a USABLE reading, not the worst one, so it must answer the first
+                // usable entry of stable eligible order: five_hour=80.
+                settings.TrayHidden = "";
+                settings.TrayMax = 9;
+                settings.TrayItems = "";
+                settings.TrayMetric = "any";
+                FSet("AnyAvailableMetricId", "");
+                Install(Acc("codex", "A1", Available5h(80), AvailableWeek(15)));
+                TrayModel anyInit = form.BuildModel();
+                Check("30a. stable eligible order puts the 80 ahead of the 15",
+                    anyInit.Eligible.Count == 2
+                    && anyInit.Eligible[0].Id == "codex/A1/five_hour"
+                    && anyInit.Eligible[1].Id == "codex/A1/weekly",
+                    "first=" + (anyInit.Eligible.Count > 0 ? anyInit.Eligible[0].Id : "-")
+                    + " second=" + (anyInit.Eligible.Count > 1 ? anyInit.Eligible[1].Id : "-"));
+                TrayReading anyInitR = form.ResolveReading(anyInit);
+                Check("30b. any available initial pick is the first usable in stable order, not the lowest positive",
+                    anyInitR.Available && anyInitR.MetricId == "codex/A1/five_hour" && anyInitR.Value == 80,
+                    "id=" + anyInitR.MetricId + " value=" + anyInitR.Value
+                    + " (a minimiser would answer codex/A1/weekly=15)");
+
+                // ── 31. Any available REPLACEMENT walks stable order, never the minimum ───
+                // SRC-027:R004. The held reading disappears while two numerically
+                // LOWER readings sit further down the pool. Stable order says
+                // codex/A1/weekly=90; a minimiser says claude/Claude/weekly=5.
+                // This is the strongest red control in the file.
+                Install(
+                    Acc("codex", "A1", Available5h(80), AvailableWeek(90)),
+                    Acc("claude", "Claude", Available5h(10), AvailableWeek(5)));
+                settings.TrayMax = 9;
+                settings.TrayItems = "";
+                settings.TrayHidden = "";
+                settings.TrayMetric = "any";
+                TrayModel anyRep = form.BuildModel();
+                anyRep.CurrentMetricId = "codex/A1/five_hour";
+                foreach (Metric m in anyRep.Eligible)
+                    if (m.Id == "codex/A1/five_hour") { m.Value = 0; m.Available = false; break; }
+                TrayReading anyRepR = form.ResolveReading(anyRep);
+                Check("31a. any available replacement is the first usable in stable order, not the lowest positive",
+                    anyRepR.Available && anyRepR.MetricId == "codex/A1/weekly" && anyRepR.Value == 90,
+                    "id=" + anyRepR.MetricId + " value=" + anyRepR.Value
+                    + " (a minimiser would answer claude/Claude/weekly=5)");
+                Check("31b. the switch is disclosed as a stable-order switch, not a minimisation",
+                    anyRepR.Note.IndexOf("first usable reading in stable eligible order", StringComparison.Ordinal) >= 0
+                    && anyRepR.Note.IndexOf("lowest", StringComparison.Ordinal) < 0,
+                    "note=" + anyRepR.Note);
+
+                // ── 32. Any available is sticky while the held reading stays usable ───
+                // SRC-027:R004/R008: the numbers may move, but selection churn is
+                // what the sticky id exists to prevent.
+                Install(Acc("codex", "A1", Available5h(80), AvailableWeek(15)));
+                settings.TrayMetric = "any";
+                settings.TrayItems = "";
+                TrayModel stick1 = form.BuildModel();
+                stick1.CurrentMetricId = "codex/A1/five_hour";
+                TrayReading stick1R = form.ResolveReading(stick1);
+                Check("32a. any available initially holds the usable current reading",
+                    stick1R.MetricId == "codex/A1/five_hour" && stick1R.Value == 80,
+                    "id=" + stick1R.MetricId + " value=" + stick1R.Value);
+                Install(Acc("codex", "A1", Available5h(70), AvailableWeek(5)));
+                TrayModel stick2 = form.BuildModel();
+                stick2.CurrentMetricId = "codex/A1/five_hour";
+                TrayReading stick2R = form.ResolveReading(stick2);
+                Check("32b. any available stays on the held reading across a refresh",
+                    stick2R.MetricId == "codex/A1/five_hour" && stick2R.Value == 70,
+                    "id=" + stick2R.MetricId + " value=" + stick2R.Value
+                    + " (the 5 is lower, and that is exactly why it must not win)");
+                Check("32c. keeping the current reading is silent — no churn note",
+                    stick2R.Note.Length == 0, "note=" + stick2R.Note);
+
+                // ── 33. TrayMax caps the PICTURE, never the candidate pool ─────
+                // SRC-027:R002/R007/R010 with the two selectors on one fixture so
+                // their difference is visible: slots 1-4 carry a readable 0% (not
+                // usable), slot 5 is 42%, slot 6 is 7%. Both must reach past the
+                // TrayMax=4 cap — and they must still disagree.
+                Install(
+                    Acc("codex", "A1", Available5h(0)),
+                    Acc("codex", "A2", Available5h(0)),
+                    Acc("codex", "A3", Available5h(0)),
+                    Acc("codex", "A4", Available5h(0)),
+                    Acc("codex", "A5", Available5h(42)),
+                    Acc("codex", "A6", Available5h(7)));
+                settings.TrayMax = 4;
+                settings.TrayItems = "";
+                settings.TrayHidden = "";
+                settings.TrayMetric = "any";
+                FSet("AnyAvailableMetricId", "");
+                TrayModel capAny = form.BuildModel();
+                Check("33a. the drawn item list still respects TrayMax=4",
+                    form.TrayMetrics().Count == 4, "items=" + form.TrayMetrics().Count);
+                Check("33b. the eligible pool ignores TrayMax entirely",
+                    capAny.Eligible.Count == 6, "eligible=" + capAny.Eligible.Count);
+                TrayReading capAnyR = form.ResolveReading(capAny);
+                Check("33c. any available reaches past TrayMax to the first usable reading",
+                    capAnyR.Available && capAnyR.MetricId == "codex/A5/five_hour" && capAnyR.Value == 42,
+                    "id=" + capAnyR.MetricId + " value=" + capAnyR.Value);
+                settings.TrayMetric = "lowest";
+                TrayModel capLow = form.BuildModel();
+                TrayReading capLowR = form.ResolveReading(capLow);
+                Check("33d. lowest remaining reaches past TrayMax to the global positive minimum",
+                    capLowR.Available && capLowR.MetricId == "codex/A6/five_hour" && capLowR.Value == 7,
+                    "id=" + capLowR.MetricId + " value=" + capLowR.Value);
+
+                // ── 34. Show Used changes the presentation, never the selection ───
+                // SRC-027 Milestone 5: "any available" must keep its own name when
+                // the percentage flips to the spent share. The old head replaced it
+                // with "highest used", which claimed a minimisation that the ANY
+                // selector does not perform. 25% remaining is chosen so the spent
+                // reading is the 75% used in the contract's own example.
+                Install(
+                    Acc("codex", "A1", Available5h(25), AvailableWeek(90)),
+                    Acc("claude", "Claude", Available5h(10), AvailableWeek(5)));
+                settings.TrayMax = 9;
+                settings.TrayItems = "";
+                settings.TrayHidden = "";
+                settings.TrayMetric = "any";
+                FSet("AnyAvailableMetricId", "codex/A1/five_hour");
+                settings.ShowUsed = false;
+                TrayReading showRem = form.ResolveReading(form.BuildModel());
+                string titleRem = form.PopupTitle();
+                string tipRem = (string)tip.Invoke(form, new object[] { showRem });
+                settings.ShowUsed = true;
+                TrayReading showUsedR = form.ResolveReading(form.BuildModel());
+                string titleUsed = form.PopupTitle();
+                string tipUsed = (string)tip.Invoke(form, new object[] { showUsedR });
+                Check("34a. any + remaining is labelled 'any available', not 'highest used'",
+                    titleRem.IndexOf("any available", StringComparison.Ordinal) >= 0
+                    && titleRem.IndexOf("highest used", StringComparison.Ordinal) < 0,
+                    titleRem);
+                Check("34b. any + used keeps the 'any available' name and marks the share as used",
+                    titleUsed.IndexOf("any available", StringComparison.Ordinal) >= 0
+                    && titleUsed.IndexOf("highest used", StringComparison.Ordinal) < 0
+                    && titleUsed.IndexOf("75% used", StringComparison.Ordinal) >= 0,
+                    titleUsed);
+                Check("34c. the tooltip follows the same rule inside its 63-char budget",
+                    tipUsed.IndexOf("any available", StringComparison.Ordinal) >= 0
+                    && tipUsed.IndexOf("highest used", StringComparison.Ordinal) < 0
+                    && tipRem.IndexOf("any available", StringComparison.Ordinal) >= 0
+                    && tipUsed.Length <= 63,
+                    "rem='" + tipRem + "' used='" + tipUsed + "'");
+                Check("34d. flipping the display never moves the selected reading",
+                    showRem.MetricId == "codex/A1/five_hour" && showUsedR.MetricId == showRem.MetricId
+                    && showRem.Value == 25 && showUsedR.Value == 25,
+                    "rem=" + showRem.MetricId + "/" + showRem.Value
+                    + " used=" + showUsedR.MetricId + "/" + showUsedR.Value);
+                settings.TrayMetric = "lowest";
+                settings.ShowUsed = false;
+                string titleLowRem = form.PopupTitle();
+                settings.ShowUsed = true;
+                string titleLowUsed = form.PopupTitle();
+                Check("34e. lowest + remaining keeps 'lowest remaining'",
+                    titleLowRem.IndexOf("lowest remaining", StringComparison.Ordinal) >= 0, titleLowRem);
+                Check("34f. lowest + used keeps 'highest used' (same window, other reading)",
+                    titleLowUsed.IndexOf("highest used", StringComparison.Ordinal) >= 0, titleLowUsed);
+                settings.ShowUsed = false;
+                settings.TrayMetric = "any";
+
+                // ── 35. SRC-028: an auth-rejected carried reading is NOT usable ───
+                // The minimal safe model: a GENERIC carried reading stays
+                // conservatively selectable (dropping every carried number on a
+                // hiccup would make the tray look healthier after a failure, the
+                // one direction it must never lie in), but an EXPLICIT
+                // authentication rejection is stronger evidence — the vendor
+                // REFUSED the authenticated read — so "Any available" must skip
+                // it while "Lowest remaining" keeps reporting it, because hiding
+                // a real worst window under-reports how bad things are.
+                var authDead = Acc("codex", "A1", Available5h(3), AvailableWeek(90));
+                authDead.Ok = false;
+                authDead.Status = "ERROR";
+                authDead.Error = "authentication required (401 Unauthorized)";
+                authDead.Carried = true;
+                authDead.CarriedAt = "12:00:00";
+                authDead.CarriedNote = authDead.Error;
+                authDead.AuthFailed = true;
+                authDead.AuthFailedClass = CodexSource.RateLimitFailure.AuthRejected;
+                authDead.AuthFailureReason = authDead.Error;
+                Install(authDead, Acc("claude", "Claude", Available5h(60), AvailableWeek(50)));
+                settings.TrayMetric = "any";
+                FSet("AnyAvailableMetricId", "");
+                TrayModel authAny = form.BuildModel();
+                Check("35a. the auth-rejected reading is still a real, readable reading",
+                    authAny.Eligible.Count > 0 && authAny.Eligible[0].Id == "codex/A1/five_hour"
+                    && authAny.Eligible[0].Value == 3 && authAny.Eligible[0].AuthFailed,
+                    "eligible0=" + (authAny.Eligible.Count > 0
+                        ? authAny.Eligible[0].Id + "/" + authAny.Eligible[0].Value + "/authFail=" + authAny.Eligible[0].AuthFailed
+                        : "-"));
+                TrayReading authAnyR = form.ResolveReading(authAny);
+                Check("35b. any available does NOT select an auth-rejected carried reading",
+                    authAnyR.Available && authAnyR.MetricId == "claude/Claude/five_hour" && authAnyR.Value == 60,
+                    "id=" + authAnyR.MetricId + " value=" + authAnyR.Value
+                    + " (the 3 is both lower AND auth-rejected; a minimiser would report it)");
+                TrayModel authLow = form.BuildModel();
+                authLow.Pin = "lowest";
+                TrayReading authLowR = form.ResolveReading(authLow);
+                Check("35c. lowest remaining still reports the auth-rejected worst window",
+                    authLowR.Available && authLowR.MetricId == "codex/A1/five_hour" && authLowR.Value == 3,
+                    "id=" + authLowR.MetricId + " value=" + authLowR.Value);
+
+                // ── 35d. a GENERIC carried reading stays selectable for any ─────
+                // Proves the exclusion is typed, not "all carried numbers are
+                // now invalid": only a current auth rejection disqualifies.
+                var softStale = Acc("codex", "A1", Available5h(3), AvailableWeek(90));
+                softStale.Ok = false;
+                softStale.Status = "ERROR";
+                softStale.Error = "codex app-server did not answer rateLimits";
+                softStale.Carried = true;
+                softStale.CarriedAt = "12:00:00";
+                softStale.CarriedNote = softStale.Error;
+                Install(softStale, Acc("claude", "Claude", Available5h(60), AvailableWeek(50)));
+                settings.TrayMetric = "any";
+                FSet("AnyAvailableMetricId", "");
+                TrayReading softAnyR = form.ResolveReading(form.BuildModel());
+                Check("35d. any available still accepts a generically carried reading",
+                    softAnyR.Available && softAnyR.MetricId == "codex/A1/five_hour" && softAnyR.Value == 3,
+                    "id=" + softAnyR.MetricId + " value=" + softAnyR.Value);
+
+                // ── 35e. the failure must not rewrite history as a fresh 0% ─────
+                // Driven through the REAL CarryForward: last-good windows stay
+                // visible as stale history carrying the sanitized 401 reason, and
+                // the account is NOT Ok — never a fresh reading, never a fresh 0%.
+                var prevGood = Acc("codex", "A1", Available5h(44), AvailableWeek(88));
+                var freshFail = Acc("codex", "A1", Dead5h(), DeadWeek());
+                freshFail.Ok = false;
+                freshFail.Status = "ERROR";
+                freshFail.Error = "authentication required (401 Unauthorized)";
+                freshFail.AuthFailed = true;
+                freshFail.AuthFailedClass = CodexSource.RateLimitFailure.AuthRejected;
+                freshFail.AuthFailureReason = freshFail.Error;
+                var failedList = new List<AccountData> { freshFail };
+                Call("CarryForward", failedList, new List<AccountData> { prevGood });
+                AccountData carried = failedList[0];
+                Check("35f. the auth-rejected sweep keeps the last good windows as stale history",
+                    carried.Carried && WinOf(carried, "five_hour") != null
+                    && WinOf(carried, "five_hour").Rem == 44 && WinOf(carried, "five_hour").Available,
+                    "carried=" + carried.Carried + " rem="
+                    + (WinOf(carried, "five_hour") != null ? WinOf(carried, "five_hour").Rem.ToString() : "-"));
+                Check("35g. the stale history is not rewritten as a fresh 0% and is never fresh",
+                    WinOf(carried, "five_hour").Rem != 0 && !carried.Ok,
+                    "ok=" + carried.Ok + " rem=" + WinOf(carried, "five_hour").Rem);
+                Check("35h. the sanitized auth reason survives as the stale note",
+                    carried.CarriedNote.IndexOf("401", StringComparison.Ordinal) >= 0
+                    && carried.CarriedNote.IndexOf("authentication required", StringComparison.Ordinal) >= 0,
+                    "note=" + carried.CarriedNote);
+                Check("35i. the carried auth-rejected reading is still skipped by any available",
+                    !carried.Ok && carried.AuthFailed,
+                    "ok=" + carried.Ok + " authFailed=" + carried.AuthFailed);
+
+                // ── 36. SRC-028: Lowest may keep history, but must label it ──
+                // The defect this prevents: a successful overall refresh can
+                // carry one account's last-good quota after a typed 401 while
+                // global Stale stays false. Lowest deliberately keeps that
+                // conservative value; every surface that presents it must say
+                // it is historical, not current spendable quota.
+                var lowestOldGood = Acc("codex", "C1", Available5h(44), AvailableWeek(88));
+                var lowestAuthFail = Acc("codex", "C1", Dead5h(), DeadWeek());
+                lowestAuthFail.Ok = false;
+                lowestAuthFail.Status = "ERROR";
+                lowestAuthFail.Error = "authentication required (401 Unauthorized)";
+                lowestAuthFail.AuthFailed = true;
+                lowestAuthFail.AuthFailedClass = CodexSource.RateLimitFailure.AuthRejected;
+                lowestAuthFail.AuthFailureReason = lowestAuthFail.Error;
+                var lowestFailedList = new List<AccountData> { lowestAuthFail };
+                FSet("LastFetch", "12:00:00");
+                Call("CarryForward", lowestFailedList, new List<AccountData> { lowestOldGood });
+                AccountData lowestCarried = lowestFailedList[0];
+                Install(lowestCarried, Acc("claude", "Claude", Available5h(60), AvailableWeek(70)));
+                settings.TrayMetric = "lowest";
+                settings.TrayShow = "pct";
+                settings.TrayMode = "single";
+                Select();
+                TrayReading authHistory = form.ResolveReading(form.BuildModel());
+                FieldInfo readingCarriedField = typeof(TrayReading).GetField("Carried");
+                FieldInfo readingAuthField = typeof(TrayReading).GetField("AuthFailed");
+                bool readingIsHistory = readingCarriedField != null && (bool)readingCarriedField.GetValue(authHistory);
+                bool readingAuthRejected = readingAuthField != null && (bool)readingAuthField.GetValue(authHistory);
+                Check("36a. the actual lowest reading carries typed stale/auth provenance",
+                    authHistory.MetricId == "codex/C1/five_hour" && authHistory.Value == 44
+                    && readingIsHistory && readingAuthRejected,
+                    "id=" + authHistory.MetricId + " value=" + authHistory.Value
+                    + " carried=" + readingIsHistory + " authFailed=" + readingAuthRejected);
+                string historyTitle = form.PopupTitle();
+                string historyTip = (string)tip.Invoke(form, new object[] { authHistory });
+                Check("36b. popup title identifies the selected number as last-good history",
+                    historyTitle.Contains("44%") && historyTitle.IndexOf("last good", StringComparison.OrdinalIgnoreCase) >= 0,
+                    historyTitle);
+                Check("36c. shell tooltip labels last-good history beside the number within 63 chars",
+                    historyTip.Contains("44%") && historyTip.IndexOf("last good", StringComparison.OrdinalIgnoreCase) >= 0
+                    && historyTip.Length <= 63,
+                    historyTip);
+                using (Bitmap bmp = LiveRender())
+                {
+                    bool muted = false, historyBadge = false;
+                    var mutedInk = new List<Point>();
+                    for (int y = 1; y <= 14; y++)
+                        for (int x = 1; x <= 14; x++)
+                        {
+                            int pixel = bmp.GetPixel(x, y).ToArgb();
+                            if (pixel == Palette.MUTED.ToArgb())
+                            {
+                                muted = true;
+                                mutedInk.Add(new Point(x, y));
+                            }
+                            if (pixel == Palette.WARNING.ToArgb()) historyBadge = true;
+                        }
+                    Check("36d. the bitmap mutes the carried number and draws its history badge",
+                        muted && historyBadge, "muted=" + muted + " history badge=" + historyBadge);
+                    Check("36d2. the complete 44 glyph remains readable beside the history badge",
+                        SameInk(mutedInk, ExpectedInk("44", new Rectangle(4, 1, 11, 14), 0)),
+                        "muted glyph pixels=" + mutedInk.Count);
+                }
+                settings.TrayShow = "off";
+                using (Bitmap bmp = LiveRender())
+                {
+                    bool badge = false, number = false;
+                    for (int y = 1; y <= 14; y++)
+                        for (int x = 1; x <= 14; x++)
+                        {
+                            int pixel = bmp.GetPixel(x, y).ToArgb();
+                            if (pixel == Palette.WARNING.ToArgb()) badge = true;
+                            if (pixel == Palette.MUTED.ToArgb()) number = true;
+                        }
+                    Check("36d3. the history badge remains visible when tray number is hidden",
+                        badge && !number, "badge=" + badge + " number=" + number);
+                }
+                settings.TrayShow = "pct";
+                List<TrayPopup.Row> historyRows = form.PopupRows();
+                bool popupHeaderHistory = historyRows.Exists(row => row.Header
+                    && row.Right.IndexOf("last good", StringComparison.OrdinalIgnoreCase) >= 0);
+                bool popupReason = historyRows.Exists(row => row.Left.IndexOf("stale:", StringComparison.OrdinalIgnoreCase) >= 0
+                    && row.Left.IndexOf("401", StringComparison.Ordinal) >= 0);
+                bool popupValueDim = historyRows.Exists(row => row.Gauge && row.Pct == 44 && row.Dim);
+                Check("36e. popup account row labels, explains, and dims the carried value",
+                    popupHeaderHistory && popupReason && popupValueDim,
+                    "header=" + popupHeaderHistory + " reason=" + popupReason + " dim=" + popupValueDim);
+                bool accountBad;
+                string accountCardNote = LimisawForm.CardNote(lowestCarried, out accountBad);
+                Check("36f. account card labels its carried reading and keeps its auth reason",
+                    accountCardNote != null && accountCardNote.IndexOf("stale:", StringComparison.OrdinalIgnoreCase) >= 0
+                    && accountCardNote.IndexOf("401", StringComparison.Ordinal) >= 0
+                    && lowestCarried.Carried && lowestCarried.CarriedAt.Length > 0,
+                    "tag=last good " + lowestCarried.CarriedAt + " note=" + accountCardNote);
 
                 form.Close();
             }

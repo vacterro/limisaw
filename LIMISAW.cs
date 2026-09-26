@@ -208,6 +208,11 @@ namespace Limisaw
     {
         public bool Accepted, Changed, Recovered, DirtyRetained, Unreadable, Invalid;
         public string Note;
+        // Per-attempt counters make the unchanged-file path directly auditable
+        // without retaining process-lifetime history. They are not used to make
+        // reload decisions.
+        internal int RevisionFingerprints, CandidateClones, CandidateKeyReads;
+        internal bool AcceptedRevisionFastPath;
     }
 
     class LimisawSettings
@@ -356,11 +361,16 @@ namespace Limisaw
         // restart. Grow until the value fits: the read is the only place that
         // knows how long the value actually is.
         internal int ReadGrowths;
+        // Set only on a ReloadEx candidate. The candidate and result are both
+        // per-attempt objects, so this observes key reads without a lifetime
+        // counter on the live settings object.
+        SettingsReloadResult ReloadDiagnostics;
         string Read(string key, string def)
         {
             int size = 2048;
             while (true)
             {
+                if (ReloadDiagnostics != null) ReloadDiagnostics.CandidateKeyReads++;
                 var sb = new System.Text.StringBuilder(size);
                 int n = GetPrivateProfileString("limisaw", key, def, sb, sb.Capacity, IniPath);
                 // n == size-1 is the API's only truncation signal; a value that
@@ -1085,34 +1095,43 @@ namespace Limisaw
         {
             var r = new SettingsReloadResult();
             if (!File.Exists(IniPath)) return r;
-            // GetPrivateProfileString cannot report "I could not read the file":
-            // against a locked ini it hands back the DEFAULT for every key, which
-            // Load would then accept as the user's new choices and silently reset
-            // the whole settings object. So the file is opened first, and a read
-            // we cannot perform is not a reload.
-            try { using (File.Open(IniPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) { } }
+            // The byte fingerprint itself opens and reads the file. It is also
+            // the exact authority used by CORE-001, so a separate readability
+            // open would duplicate I/O on the common unchanged path.
+            string revisionBefore;
+            try { r.RevisionFingerprints++; revisionBefore = FileFingerprint(IniPath); }
             catch { r.Unreadable = true; return r; }
+
+            // PERF-003: only a previously accepted, present byte revision can
+            // bypass parsing. Time and length are not authority. Dirty live
+            // edits remain untouched; the accepted disk is still the baseline.
+            if (AcceptedDiskAuthority && !AcceptedDiskAbsent
+                && !string.IsNullOrEmpty(AcceptedDiskFingerprint)
+                && revisionBefore == AcceptedDiskFingerprint)
+            {
+                r.AcceptedRevisionFastPath = true;
+                r.DirtyRetained = Dirty;
+                return r;
+            }
 
             // CORE-004 (audit/6): the reload must prove it parsed ONE stable
             // file revision. The candidate is parsed through many independent
             // GetPrivateProfileString calls; an editor writing between them
             // could otherwise produce a candidate that never existed as bytes.
-            // The revision is fingerprinted before and after the parse; a
+            // revisionBefore above is fingerprinted before parsing; a
             // file that moved underneath is not reloaded — the next Refresh
             // will see whichever revision won and judge it then.
-            string revisionBefore;
-            try { revisionBefore = FileFingerprint(IniPath); }
-            catch { r.Unreadable = true; return r; }
-
             // The candidate: the disk's values parsed by the production reader
             // with the LIVE settings standing behind every malformed value, so
             // accepting it can never do worse than the old in-place Load did.
+            r.CandidateClones++;
             LimisawSettings candidate = Clone();
+            candidate.ReloadDiagnostics = r;
             candidate.ParsePersisted();
             string candFp = candidate.Fingerprint();
 
             string revisionAfter;
-            try { revisionAfter = FileFingerprint(IniPath); }
+            try { r.RevisionFingerprints++; revisionAfter = FileFingerprint(IniPath); }
             catch { r.Unreadable = true; return r; }
             if (revisionAfter != revisionBefore)
             {
@@ -1162,14 +1181,25 @@ namespace Limisaw
                     r.Accepted = true; r.Recovered = true;
                     r.Note = "LIMISAW.ini now matches the unsaved choice — conflict resolved";
                 }
+                else if (!Dirty)
+                {
+                    // The stable parse matched live semantics. Record its exact
+                    // byte revision too, so harmless formatting/order edits do
+                    // not force the same complete parse on every refresh.
+                    AcceptDiskPresent(revisionAfter);
+                    invalidObservedDiskFingerprint = null;
+                }
                 return r;
             }
 
             if (Dirty && DurableFingerprint != null && candFp == DurableFingerprint)
             {
                 // Same stale bytes as before the failed save: no external edit,
-                // nothing to accept, the dirty choice outranks the file. Say
-                // NOTHING — a refused reload must never wear a reload's clothes.
+                // the dirty choice outranks the file. The candidate was parsed
+                // coherently, so remember this exact byte revision while leaving
+                // the live choice and durable baseline untouched.
+                AcceptDiskPresent(revisionAfter);
+                invalidObservedDiskFingerprint = null;
                 r.DirtyRetained = true;
                 return r;
             }
@@ -1263,6 +1293,17 @@ namespace Limisaw
         // last known numbers (dimmed, with the reason) instead of going blank on
         // a transient CLI hiccup.
         public bool Carried; public string CarriedAt = "", CarriedNote = "";
+        // SRC-028: typed, provider-supplied failure provenance for the sweep that
+        // could not read this account. `Carried` says "the last good numbers are
+        // still on screen"; these say WHY, which is the difference between a
+        // harmless hiccup (carried numbers stay conservatively selectable — the
+        // tray must never look HEALTHIER after a failure) and an explicit
+        // authentication rejection (the vendor refused the authenticated read,
+        // so a carried number is not a currently usable quota). Set at the probe
+        // boundary; never inferred from UI text.
+        public bool AuthFailed;
+        public CodexSource.RateLimitFailure AuthFailedClass;
+        public string AuthFailureReason = "";
         // Banked resets: a one-off credit that refills a spent window on demand.
         // Zero for every vendor that does not grant them. Not a window — there is
         // no percentage to draw — so it rides on the account, not in Windows.
@@ -1355,6 +1396,16 @@ namespace Limisaw
         // the same instant the alert logic keys on. CORE-013: the EPOCH is what
         // rides here, not a rendering of it.
         public double? ResetEpoch;
+        // SRC-028: the sweep behind this number ended in an explicit
+        // authentication rejection. The number may still be a perfectly honest
+        // CARRIED reading — it is just not a CURRENTLY USABLE quota. Typed state
+        // that flows from the provider boundary; no selector may re-derive it
+        // by parsing a label.
+        public bool AuthFailed;
+        // Lowest may keep a carried value to remain conservative, so freshness
+        // must travel with each metric into the resolved tray reading.
+        public bool Carried;
+        public string CarriedAt = "", CarriedNote = "";
     }
 
     // Verdana at a fixed pixel height, never antialiased (UI.md). One font per
@@ -1482,19 +1533,25 @@ namespace Limisaw
         // characters): rides right behind the percentage.
         public string NoteShort = "";
         public double? ResetEpoch;
+        // Provenance of the selected number, independent of global refresh
+        // health. A partial sweep can leave Stale=false while this is history.
+        public bool Carried, AuthFailed;
+        public string CarriedAt = "", CarriedNote = "";
     }
 
     // One immutable snapshot of everything the tray renderers need. Building it
     // for the live tray and for the Settings preview replaces the old mutable
     // PreviewPct field: a render now receives its data instead of reading the
     // form's mutable state, so a preview can never leak into the real tray.
-    internal class TrayModel
-    {
-        public List<Metric> All = new List<Metric>();    // every live reading
-        public List<Metric> Items = new List<Metric>();  // selected, ordered, capped
-        public string Pin = "lowest";
-        public bool Stale;
-    }
+     internal class TrayModel
+     {
+         public List<Metric> All = new List<Metric>();    // every live reading
+         public List<Metric> Items = new List<Metric>();  // selected, ordered, capped
+         public List<Metric> Eligible = new List<Metric>(); // selected, ordered, uncapped (TrayMax does not apply)
+         public string Pin = "lowest";
+         public string CurrentMetricId = ""; // for "any" mode: the currently-displayed metric id to prefer
+         public bool Stale;
+     }
 
     // Shared drawing rules, so the window, the hover popup and the tray icon
     // cannot disagree about what a percentage looks like.
@@ -4022,6 +4079,15 @@ namespace Limisaw
                         // i.e. report more quota than the user has — the one
                         // direction that must never happen silently.
                         Value = w.Rem, Available = (a.Ok || a.Carried) && w.Available,
+                        // SRC-028: carried-forward numbers still COUNT for the
+                        // tray and the alerts (dropping them would report more
+                        // quota than the user has), but an explicitly
+                        // auth-rejected account is not a CURRENTLY USABLE quota,
+                        // and "Any available" promises exactly that.
+                        AuthFailed = a.AuthFailed,
+                        Carried = a.Carried,
+                        CarriedAt = a.CarriedAt,
+                        CarriedNote = a.CarriedNote,
                         IsShort = w.DurationMinutes > 0 ? w.DurationMinutes <= 300 : w.Base == "five_hour",
                         ResetEpoch = w.ResetEpoch,
                     });
@@ -4038,7 +4104,7 @@ namespace Limisaw
         }
 
         // One immutable snapshot of the live state.
-        TrayModel BuildModel()
+        internal TrayModel BuildModel()
         {
             TraySnapshots++;
             // PERF-004: the snapshot reuse. When a paint pass is building its
@@ -4050,7 +4116,9 @@ namespace Limisaw
             {
                 All = all,
                 Items = SelectedMetrics(all),
+                Eligible = SelectedUncapped(all),
                 Pin = Settings.TrayMetric,
+                CurrentMetricId = AnyAvailableMetricId,
                 Stale = Stale,
             };
         }
@@ -4082,7 +4150,7 @@ namespace Limisaw
                         Value = pct, Available = true, IsShort = i % 2 == 0,
                         ResetEpoch = PreviewResetEpoch(pct),
                     });
-                return new TrayModel { All = picked, Items = picked, Pin = "lowest", Stale = Stale };
+                return new TrayModel { All = picked, Items = picked, Eligible = picked, Pin = "lowest", Stale = Stale };
             }
             var faked = new List<Metric>();
             foreach (Metric m in picked)
@@ -4092,7 +4160,7 @@ namespace Limisaw
                     Value = pct, Available = true, IsShort = m.IsShort,
                     ResetEpoch = PreviewResetEpoch(pct),
                 });
-            return new TrayModel { All = faked, Items = faked, Pin = Settings.TrayMetric, Stale = Stale };
+            return new TrayModel { All = faked, Items = faked, Eligible = faked, Pin = Settings.TrayMetric, Stale = Stale };
         }
 
         // CORE-001 backward compatibility: a saved tray id or card key from
@@ -4151,28 +4219,36 @@ namespace Limisaw
         // PERF-004: the derivation from an ALL list the caller already owns —
         // the only allocation here is the picked list. One HashSet owns the
         // hidden/picked membership instead of the old nested Contains scans.
-        List<Metric> SelectedMetrics(List<Metric> all)
-        {
-            List<string> hidden = HiddenMetricIds();
-            var hiddenSet = new HashSet<string>(hidden);
-            var pickedSet = new HashSet<Metric>();
-            var byId = new Dictionary<string, Metric>();
-            foreach (Metric m in all) if (!byId.ContainsKey(m.Id)) byId[m.Id] = m;
-            var picked = new List<Metric>();
-            foreach (string id in Settings.ItemOrder())
-            {
-                string want = MigrateMetricId(id);
-                if (hiddenSet.Contains(want)) continue;
-                Metric m;
-                if (byId.TryGetValue(want, out m) && pickedSet.Add(m)) picked.Add(m);
-            }
-            // A reading the user has never seen is shown by default: silently
-            // hiding a brand-new account would look like the vendor broke.
-            foreach (Metric m in all)
-                if (!hiddenSet.Contains(m.Id) && pickedSet.Add(m)) picked.Add(m);
-            if (picked.Count > Settings.TrayMax) picked.RemoveRange(Settings.TrayMax, picked.Count - Settings.TrayMax);
-            return picked;
-        }
+         // Shared core: user's configured order first, then newly discovered,
+         // minus hidden. Returns the uncapped list — callers cap as needed.
+         List<Metric> SelectedUncapped(List<Metric> all)
+         {
+             List<string> hidden = HiddenMetricIds();
+             var hiddenSet = new HashSet<string>(hidden);
+             var pickedSet = new HashSet<Metric>();
+             var byId = new Dictionary<string, Metric>();
+             foreach (Metric m in all) if (!byId.ContainsKey(m.Id)) byId[m.Id] = m;
+             var picked = new List<Metric>();
+             foreach (string id in Settings.ItemOrder())
+             {
+                 string want = MigrateMetricId(id);
+                 if (hiddenSet.Contains(want)) continue;
+                 Metric m;
+                 if (byId.TryGetValue(want, out m) && pickedSet.Add(m)) picked.Add(m);
+             }
+             // A reading the user has never seen is shown by default: silently
+             // hiding a brand-new account would look like the vendor broke.
+             foreach (Metric m in all)
+                 if (!hiddenSet.Contains(m.Id) && pickedSet.Add(m)) picked.Add(m);
+             return picked;
+         }
+
+         List<Metric> SelectedMetrics(List<Metric> all)
+         {
+             List<Metric> picked = SelectedUncapped(all);
+             if (picked.Count > Settings.TrayMax) picked.RemoveRange(Settings.TrayMax, picked.Count - Settings.TrayMax);
+             return picked;
+         }
 
         // ── the one tray reading resolution ──────────────────────────────────
         // The single answer to "what does the number show", shared by the icon,
@@ -4186,8 +4262,14 @@ namespace Limisaw
         //                          DISCLOSED — "--" is the case where no
         //                          ELIGIBLE selected reading is readable;
         //   PINNED + VANISHED   -> the same fallback;
-        //   LOWEST              -> the lowest selected reading with quota left,
-        //                          else the lowest available one;
+        //   LOWEST              -> the lowest reading with quota left across the
+        //                          complete eligible pool (not capped by TrayMax),
+        //                          else the lowest available one; 0% only when
+        //                          no positive usable reading exists;
+        //   ANY AVAILABLE       -> keep the reading already shown while it is
+        //                          still usable, else the FIRST usable reading in
+        //                          stable eligible order (never a percentage
+        //                          comparison) over the full eligible pool;
         //   NOTHING READABLE    -> available=false: "--" is finally correct.
         //
         // CORE-013: the reset rides as the window's own epoch.
@@ -4197,7 +4279,7 @@ namespace Limisaw
             var reading = new TrayReading { Requested = model.Pin ?? "lowest" };
             string pin = MigrateMetricId(model.Pin ?? "lowest");
             Metric pinned = null;
-            if (model.Pin != "lowest")
+            if (model.Pin != "lowest" && model.Pin != "any")
             {
                 // A pin is an explicit choice, so it is looked up in the FULL
                 // list: hiding a reading from a bars/grid picture must not
@@ -4211,6 +4293,10 @@ namespace Limisaw
                     reading.Value = pinned.Value;
                     reading.Available = true;
                     reading.ResetEpoch = pinned.ResetEpoch;
+                    reading.Carried = pinned.Carried;
+                    reading.CarriedAt = pinned.CarriedAt;
+                    reading.CarriedNote = pinned.CarriedNote;
+                    reading.AuthFailed = pinned.AuthFailed;
                     return reading;
                 }
                 // The pin could not answer: it is temporarily unreadable (a
@@ -4223,25 +4309,65 @@ namespace Limisaw
                     : "pinned reading gone — showing the lowest selected";
                 reading.NoteShort = "pin unavailable";
             }
-            // The lowest policy over the SELECTED readings — the same set the
-            // tray picture draws. "What stops me first" answers over positive
-            // readings first, so a spent-but-reported window does not mask a
-            // healthy one; with none positive, the lowest available one. The
-            // scope is ONLY model.Items: a reading the user hid from the tray
-            // is hidden from every tray surface, so an emptied selection
-            // answers "--" rather than resurrecting a hidden metric. ("--"
-            // here means "no readable eligible tray metric", not "no provider
-            // anywhere in the application".)
-            List<Metric> scope = model.Items;
+
+            // SRC-027: the eligible pool is every reading except the ones the
+            // user hid, NOT capped by TrayMax. The tray NUMBER selects from this
+            // complete pool while the tray PICTURE still honours TrayMax — the
+            // cap is a drawing budget, not a selection budget.
+            // "Usable" is a conjunction: readable (Available, i.e. not
+            // locked/unavailable) AND quota left (Value > 0).
+            List<Metric> scope = model.Eligible;
+
+            // For "any available": prefer the reading already shown if it is
+            // still usable, else take the FIRST usable reading in stable
+            // configured order. This is a stable-order selector, not a
+            // minimiser: it must never compare percentages while choosing a
+            // replacement.
+            if (model.Pin == "any" && model.CurrentMetricId != "")
+            {
+                foreach (Metric m in model.Eligible)
+                    if (m.Id == model.CurrentMetricId) { pinned = m; break; }
+            }
+
             int minAny = int.MaxValue, minPos = int.MaxValue;
-            Metric pickAny = null, pickPos = null;
+            Metric pickAny = null, pickPos = null, pickCurrent = null, pickFirstUsable = null;
             foreach (Metric m in scope)
             {
                 if (!m.Available) continue;
                 if (m.Value < minAny) { minAny = m.Value; pickAny = m; }
+                // "Lowest remaining" minimises over EVERY available reading, an
+                // auth-rejected one included: a worst-window selector that hid a
+                // real reading would under-report how bad things are, which is
+                // the one direction the tray must never lie in.
                 if (m.Value > 0 && m.Value < minPos) { minPos = m.Value; pickPos = m; }
+                // SRC-028: "Any available" promises a CURRENTLY USABLE quota, so
+                // an explicitly auth-rejected reading is excluded HERE, and only
+                // here. The asymmetry is deliberate: one selector answers "how
+                // bad is the worst case" and the other "is there quota I can
+                // spend right now".
+                bool usableAny = m.Value > 0 && !m.AuthFailed;
+                // Stable order: the first usable reading wins the ANY tie by
+                // construction, so no comparison is needed for it.
+                if (usableAny && pickFirstUsable == null) pickFirstUsable = m;
+                if (pinned != null && m.Id == pinned.Id && usableAny)
+                    pickCurrent = m;
             }
-            Metric pick = pickPos ?? pickAny;
+
+            // The two automatic modes answer DIFFERENT questions and are kept
+            // as separate paths on purpose, so a later refactor cannot collapse
+            // them back into one fallback:
+            //   lowest -> global minimum positive remainder; the lowest-zero
+            //             reading is a last resort, shown only when nothing
+            //             positive is usable at all;
+            //   any    -> the first usable reading in stable order, with NO
+            //             zero fallback: "any available" with nothing positive
+            //             reports no usable quota rather than a 0% reading.
+            Metric pick;
+            if (model.Pin == "any")
+                pick = pickCurrent ?? pickFirstUsable;
+            else
+                pick = pickPos ?? pickAny;
+
             if (pick != null)
             {
                 reading.MetricId = pick.Id;
@@ -4249,12 +4375,20 @@ namespace Limisaw
                 reading.Value = pick.Value;
                 reading.Available = true;
                 reading.ResetEpoch = pick.ResetEpoch;
+                reading.Carried = pick.Carried;
+                reading.CarriedAt = pick.CarriedAt;
+                reading.CarriedNote = pick.CarriedNote;
+                reading.AuthFailed = pick.AuthFailed;
+                if (model.Pin == "any" && pinned != null && pickCurrent == null)
+                    reading.Note = "previous reading unavailable — switched to first usable reading in stable eligible order";
+                // Note: AnyAvailableMetricId is committed by UpdateTray after a live resolution
+                // to prevent preview renders from mutating live state.
             }
             else if (reading.Fallback)
             {
                 // The pin fell back and nothing readable exists either: the
                 // note explains both facts.
-                reading.Note = "pinned reading unavailable — no readable reading at all";
+                reading.Note = "pinned reading unavailable — no usable reading at all";
                 reading.NoteShort = "pin unavailable";
             }
             return reading;
@@ -5034,14 +5168,62 @@ namespace Limisaw
         {
             foreach (var vd in VendorRegistry.Present())
             {
-                bool anyOk = false, anyReading = false;
+                bool anyOk = false, anyReading = false, anyAuthRejected = false;
+                string authReason = "";
+                CodexSource.RateLimitFailure authClass = CodexSource.RateLimitFailure.None;
                 foreach (AccountData a in Accounts)
                 {
-                    if (a.Provider != vd.Id || !a.Ok) continue;
+                    if (a.Provider != vd.Id) continue;
+                    if (a.AuthFailed && !anyAuthRejected)
+                    {
+                        anyAuthRejected = true;
+                        authClass = a.AuthFailedClass;
+                        authReason = a.AuthFailureReason;
+                    }
+                    if (!a.Ok) continue;
                     anyOk = true;
                     if (a.HasReading) anyReading = true;
                 }
-                if (!anyOk) continue;
+                if (!anyOk)
+                {
+                    // SRC-028: the ONE strong-negative exception to the
+                    // positive-only rule above. An explicit authentication
+                    // rejection is stronger evidence than a generic failed read:
+                    // the vendor REFUSED the authenticated request, so an older
+                    // Connected card is now known to be wrong and the user needs
+                    // a sign-in, not a retry. Three guards keep this narrow —
+                    // (a) only a TYPED auth verdict sets it, never a timeout, a
+                    // cold-start-underfunded sweep or a network hiccup; (b) only
+                    // when NO account of the vendor produced a fresh reading
+                    // this sweep, so one rejected home can never downgrade a
+                    // vendor another home still reads; (c) ConnCoordinator.Observe
+                    // itself refuses while a verification is in flight.
+                    if (anyAuthRejected)
+                    {
+                        VendorConnection previous = ConnCoordinator.Latest(vd.Id);
+                        var nvc = previous != null
+                            ? previous.Clone()
+                            : new VendorConnection { VendorId = vd.Id, Stage = ConnectionStage.Discovery };
+                        nvc.VendorId = vd.Id;
+                        nvc.State = ConnectionState.SignInRequired;
+                        nvc.ErrorCode = authClass == CodexSource.RateLimitFailure.AuthExpired
+                            ? ConnectionErrorCode.AuthExpired
+                            : ConnectionErrorCode.AuthRejected;
+                        nvc.RecommendedAction = ConnectionErrorPriority.RecommendedAction(nvc.ErrorCode, nvc.State);
+                        nvc.AuthKnown = true;
+                        nvc.Authenticated = false;
+                        nvc.Monitorable = false;
+                        nvc.UserActionRequired = true;
+                        nvc.VerificationOk = false;
+                        nvc.Stage = ConnectionStage.Quota;
+                        nvc.LastVerifiedUtc = Stamp.Now;
+                        nvc.Reason = authReason.Length > 0
+                            ? authReason
+                            : "authentication required";
+                        ConnCoordinator.Observe(vd.Id, nvc);
+                    }
+                    continue;
+                }
 
                 VendorConnection baseConn = ConnCoordinator.Latest(vd.Id);
                 if (baseConn == null)
@@ -5205,7 +5387,7 @@ namespace Limisaw
                         string dup = "Duplicates: " + string.Join("; ", conn.DuplicatePaths.ToArray());
                         DrawTextFit(g, dup, 14, innerY, cw - 20, Palette.MUTED, 10, false, dup);
                         innerY += RowH;
-                    }                    if (conn.LastVerifiedUtc.HasValue)
+                    }                    if (conn.VerificationOk && conn.LastVerifiedUtc.HasValue)
                     {
                         DrawText(g, "Verified: " + FriendlyTime(conn.LastVerifiedUtc), 14, innerY, Palette.MUTED, 10);
                         innerY += RowH;
@@ -5842,26 +6024,36 @@ namespace Limisaw
                 || s == ConnectionState.UnsupportedConfiguration;
         }
 
-        // R084/R031: exactly one follow-up request per (vendor, generation).
-        // Called only from terminal-success watcher completions and their
-        // equivalents in RunConnectionAttempt; repeated/duplicate signals for
-        // the same operation collapse to the single recorded request.
-        readonly HashSet<string> FollowUpRefreshDone = new HashSet<string>();
+        // R084/R031: retain only the greatest completed follow-up generation
+        // for each vendor. ConnectionCoordinator generations increase per
+        // vendor, so an old duplicate can never require lifetime pair history.
+        readonly Dictionary<string, int> FollowUpRefreshGeneration =
+            new Dictionary<string, int>(StringComparer.Ordinal);
+
+        bool ClaimFollowUpQuotaRefresh(string vendorId, int gen)
+        {
+            if (string.IsNullOrEmpty(vendorId) || gen <= 0) return false;
+            lock (FollowUpRefreshGeneration)
+            {
+                int previous;
+                if (FollowUpRefreshGeneration.TryGetValue(vendorId, out previous)
+                    && gen <= previous) return false;
+                FollowUpRefreshGeneration[vendorId] = gen;
+                return true;
+            }
+        }
+
         void RequestFollowUpQuotaRefresh(string vendorId, int gen)
         {
-            string key = vendorId + "#" + gen;
-            lock (FollowUpRefreshDone)
-            {
-                if (!FollowUpRefreshDone.Add(key)) return;   // duplicate signal: still one
-            }
+            if (!ClaimFollowUpQuotaRefresh(vendorId, gen)) return;
             // The existing coalescing owns the rest: if a sweep is running,
             // RefreshData sets PendingRefresh and CompleteSweep runs exactly
             // one follow-up; if not, one sweep starts now. Never a parallel sweep.
             // CORE-001 (audit/7): the callers are terminal-success paths on the
             // connection worker, so the request crosses the UI boundary first —
             // RequestRefresh marshals to the form's thread and otherwise drops,
-            // exactly like MarshalConnectionRepaint. The FollowUpRefreshDone gate
-            // above still makes the request exactly-once per (vendor, generation).
+            // exactly like MarshalConnectionRepaint. The per-vendor high-water
+            // mark makes duplicates and late older generations one-shot.
             RequestRefresh();
         }
 
@@ -7816,12 +8008,15 @@ namespace Limisaw
             if (!dragged)
             {
                 // A click, not a drag: on the Tray tab that PINS the reading as
-                // the tray number (or unpins, back to lowest). The pin used to
+                // the tray number (or unpins, back to lowest or any). The pin used to
                 // live only in the context menu.
                 if (Tab == TabTray && ClickPinCandidate == id)
                 {
-                    if (MigrateMetricId(Settings.TrayMetric) == id)
+                    string current = Settings.TrayMetric;
+                    if (MigrateMetricId(current) == id)
                     {
+                        // Unpin back to the previous automatic mode, or to lowest
+                        // if the current mode is already an explicit pin.
                         Settings.TrayMetric = "lowest"; Settings.Save();
                         NoteAfterSave("Tray number: lowest remaining (recommended)");
                     }
@@ -8060,11 +8255,27 @@ namespace Limisaw
         public string PopupTitle()
         {
             TrayReading r = ResolveReading(BuildModel());
-            string head = "LIMISAW — " + (Settings.ShowUsed ? "highest used " : "lowest remaining ");
-            head += r.Available ? ShownRem(r.Value) + "% (" + r.Label + ")" : "no reading";
+            // SRC-027: the head names the SELECTOR, then the number. "highest
+            // used" used to overwrite the label whenever Show Used was on,
+            // which claimed an optimisation that "any available" does not
+            // perform — it takes the first usable reading in stable order and
+            // never minimises a percentage. Only the two readings of the SAME
+            // window may share the "highest used" wording:
+            //   lowest + remaining -> "lowest remaining 25%"
+            //   lowest + used      -> "highest used 75%"
+            //   any    + remaining -> "any available 25%"
+            //   any    + used      -> "any available · 75% used"
+            bool any = Settings.TrayMetric == "any";
+            string head = "LIMISAW — ";
+            if (any) head += Settings.ShowUsed ? "any available · " : "any available ";
+            else head += Settings.ShowUsed ? "highest used " : "lowest remaining ";
+            head += r.Available
+                ? ShownRem(r.Value) + "%" + (any && Settings.ShowUsed ? " used" : "") + " (" + r.Label + ")"
+                : "no reading";
             // A fallback must be discoverable where the number is shown: 37%
             // next to a Zcode pin must never read as "Zcode is at 37%".
             if (r.Fallback && r.Note.Length > 0) head += " · " + r.Note;
+            if (r.Carried) head += " · last good";
             if (Stale) head += " · stale";
             return head;
         }
@@ -8088,6 +8299,9 @@ namespace Limisaw
         // TraySnapshots/TrayResolutions are the regression seam that proves
         // that per update (tests/tray_render_modes.cs).
         internal int TraySnapshots, TrayResolutions;
+        // "Any available" mode tracks the current reading to avoid churn:
+        // if it stays usable, keep it; switch only when it becomes unusable.
+        string AnyAvailableMetricId = "";
 
         public void UpdateTray()
         {
@@ -8095,6 +8309,10 @@ namespace Limisaw
             {
                 TrayModel model = BuildModel();
                 TrayReading reading = ResolveReading(model);
+                // Commit the sticky "any" metric after a live resolution succeeds.
+                // Preview renders must not mutate this field.
+                if (model.Pin == "any" && reading.Available)
+                    AnyAvailableMetricId = reading.MetricId;
                 Tray.Text = PopupOwnsTooltip ? "" : BuildTip(reading);
 
                 using (Bitmap bmp = RenderBitmap(model, reading))
@@ -8259,22 +8477,30 @@ namespace Limisaw
         {
             // The metric is always picked on REMAINING, so the same window is the
             // lowest-left one and the most-used one: only the wording flips.
-            string head = "LIMISAW | " + (Settings.ShowUsed ? "highest used " : "lowest remaining ");
+            // SRC-027: the SELECTOR keeps its own name even when Show Used
+            // flips the percentage — same rule as PopupTitle, so the icon's
+            // tooltip can never claim an optimisation the selector does not do.
+            bool any = Settings.TrayMetric == "any";
+            string head = "LIMISAW | ";
+            if (any) head += Settings.ShowUsed ? "any available · " : "any available ";
+            else head += Settings.ShowUsed ? "highest used " : "lowest remaining ";
+            string suffix = any && Settings.ShowUsed ? " used" : "";
             string tip;
+            string number = reading.Available ? ShownRem(reading.Value) + "%" + suffix : "--";
             if (reading.Fallback && reading.NoteShort.Length > 0)
             {
                 // The fallback rides INSIDE the budget, right behind the
                 // percentage, and the label yields first: the one fact the
                 // tooltip must carry is that this is not the pinned number.
-                tip = head + (reading.Available ? ShownRem(reading.Value) + "%" : "--")
+                tip = head + number
+                    + (reading.Carried ? " [last good]" : "")
                     + " [" + reading.NoteShort + "]"
                     + " (" + ShortText(reading.Label, 14) + ")";
             }
             else
             {
-                tip = head + (reading.Available
-                    ? ShownRem(reading.Value) + "% (" + ShortText(reading.Label, 28) + ")"
-                    : "--");
+                tip = head + number + (reading.Carried ? " [last good]" : "")
+                    + (reading.Available ? " (" + ShortText(reading.Label, 28) + ")" : "");
             }
             foreach (AccountData a in Accounts)
             {
@@ -8341,9 +8567,22 @@ namespace Limisaw
             else if (Settings.TrayShow == "time") text = CountdownText(
                 reading.ResetEpoch.HasValue ? Stamp.Token(reading.ResetEpoch) : null);
             else text = ShownRem(reading.Value).ToString();
-            if (text.Length == 0) return;
-            Color col = model.Stale ? Palette.MUTED : PctColor(reading.Value);
-            DrawTrayText(g, text, new Rectangle(1, 1, 14, 14), col);
+            Color col = model.Stale || reading.Carried ? Palette.MUTED : PctColor(reading.Value);
+            Rectangle box = reading.Carried ? new Rectangle(4, 1, 11, 14) : new Rectangle(1, 1, 14, 14);
+            if (text.Length > 0) DrawTrayText(g, text, box, col);
+            if (reading.Carried) DrawHistoryBadge(g);
+        }
+
+        // Carried numbers remain visible as conservative history, but a quiet
+        // color alone is not a state label. The H badge means "last good" and
+        // stays visible even when the user hides the tray number.
+        static void DrawHistoryBadge(Graphics g)
+        {
+            string[] rows = { "101", "101", "111", "101", "101" };
+            using (var brush = new SolidBrush(Palette.WARNING))
+                for (int y = 0; y < rows.Length; y++)
+                    for (int x = 0; x < rows[y].Length; x++)
+                        if (rows[y][x] == '1') g.FillRectangle(brush, 1 + x, 1 + y, 1, 1);
         }
 
         // The tray's one text primitive: the bitmap alphabet, exact palette
@@ -8733,6 +8972,32 @@ namespace Limisaw
         // contract — a primary exists ONLY when BOTH channels exist.
         internal static Func<string, System.Threading.EventResetMode, System.Threading.EventWaitHandle> OpenChannelImpl = OpenChannel;
 
+        // W2-002/R006: the final zero-time ownership probe seam. Production
+        // calls mutex.WaitOne(TimeSpan.Zero) with AbandonedMutexException
+        // treated as success. Tests substitute a delegate that records the
+        // probe and decides acquisition without touching the kernel handle,
+        // leaving production semantics unchanged for a genuine release race.
+        internal static Func<System.Threading.Mutex, bool> FinalProbeImpl = FinalProbeDefault;
+        static bool FinalProbeDefault(System.Threading.Mutex mutex)
+        {
+            try { return mutex.WaitOne(TimeSpan.Zero); }
+            catch (System.Threading.AbandonedMutexException) { return true; }
+        }
+
+        // The window-activation probe seam. Production finds the real LIMISAW
+        // window; tests inject a deterministic answer, because a developer's own
+        // running LIMISAW made every no-owner scenario report Activated and
+        // masked the Timeout classification the harness asserts.
+        internal static Func<bool> WindowProbeImpl = WindowProbeDefault;
+        static bool WindowProbeDefault()
+        {
+            IntPtr existing = Native.FindWindow(null, "LIMISAW");
+            if (existing == IntPtr.Zero) return false;
+            Native.ShowWindow(existing, 5);
+            Native.SetForegroundWindow(existing);
+            return true;
+        }
+
         static System.Threading.EventWaitHandle TryOpenChannel(string name, System.Threading.EventResetMode mode)
         {
             return OpenChannelImpl(name, mode);
@@ -8812,7 +9077,25 @@ namespace Limisaw
                     if (which == 0) return Publish(mutex, out role); // takeover: exactly one waiter can win this
                 }
             }
-            if (!activated && (Deliver() || ActivateWindow())) activated = true;
+            // W2-002/R006: the existing final delivery/window activation
+            // opportunity, performed after the deadline loop exits against a
+            // live owner that never published a contactable channel.
+            if (Deliver() || ActivateWindow()) activated = true;
+            // W2-002/R006: before the hard Timeout classification, take one last
+            // nonblocking ownership probe. The owner can release ownership in the
+            // exact window between the final timed wait expiring and here; without
+            // this probe a ready-but-unowned singleton would silently exit with
+            // Timeout and no primary would remain. The acquisition (including an
+            // abandoned mutex, whose owner died) is immediate and never extends
+            // the handoff bound. The seam lets the deterministic regression
+            // prove the probe fires at the boundary without a flaky timing race.
+            bool finalTook = FinalProbeImpl(mutex);
+            // The probe ACQUIRES the mutex when it returns true, so at this point
+            // we own the singleton — Publish it even if an activation also landed
+            // this pass. Skipping the publish on !activated left Acquire to Dispose
+            // an owned-but-never-released mutex (:8966), abandoning the singleton
+            // with no Primary alive.
+            if (finalTook) return Publish(mutex, out role);
             role = activated ? Role.Activated : Role.Timeout;
             return null;
         }
@@ -8838,11 +9121,7 @@ namespace Limisaw
         // upgrade case).
         static bool ActivateWindow()
         {
-            IntPtr existing = Native.FindWindow(null, "LIMISAW");
-            if (existing == IntPtr.Zero) return false;
-            Native.ShowWindow(existing, 5);
-            Native.SetForegroundWindow(existing);
-            return true;
+            return WindowProbeImpl();
         }
 
         static System.Threading.EventWaitHandle OpenChannel(string name, System.Threading.EventResetMode mode)
@@ -8943,9 +9222,20 @@ namespace Limisaw
     internal class AutostartResult
     {
         public bool Desired;
+        // The DESIRED end state is achieved and was readably observed.
+        // null = unreadable, so nothing may be claimed either way.
         public bool? Actual;
         public bool Verified;
         public string Reason;
+        // SRC-011:R007 (W2-003): registry PRESENCE and EXACT-COMMAND EQUALITY
+        // are two different facts and are now carried as two different fields.
+        // Collapsing them into `got != null && got == want` is exactly what let
+        // a WRONG non-null command under desired-off read as "absent": Windows
+        // kept launching something while inspection and reconciliation both
+        // reported verified success. `Present` answers "is the Run value there";
+        // `Exact` answers "is it OUR command".
+        public bool? Present;
+        public bool? Exact;
     }
 
     static class Program
@@ -9107,15 +9397,30 @@ namespace Limisaw
             string got;
             if (!store.TryRead(AutostartValueName, out got))
             { r.Reason = "Windows startup entry could not be verified"; return r; }
-            r.Actual = got != null && got == want;
-            if (s.AutoStart && !(bool)r.Actual)
-                r.Reason = got == null
-                    ? "Windows startup entry was not applied"
-                    : "Windows startup entry does not hold the expected command";
-            else if (!s.AutoStart && (bool)r.Actual)
-                r.Reason = "Windows startup entry is still present";
-            else
-                r.Verified = true;
+            // W2-003: Verified is now defined LITERALLY, because the one-boolean
+            // shape had a hole with no reason to trust it. Separating the two
+            // facts also makes the two success conditions symmetric:
+            //   desired ON  -> verified only when got == want
+            //   desired OFF -> verified only when got == null
+            r.Present = got != null;
+            r.Exact = got != null && got == want;
+            // `Actual` keeps its established meaning — OUR exact command is in
+            // the Run key — because every consumer already reads it that way.
+            // Verified is the field that is now defined literally, per desired
+            // state, which is what closes the hole.
+            r.Actual = r.Exact;
+            r.Verified = s.AutoStart ? r.Exact == true : r.Present == false;
+            if (!r.Verified)
+            {
+                if (s.AutoStart)
+                    r.Reason = r.Present == false
+                        ? "Windows startup entry was not applied"
+                        : "Windows startup entry does not hold the expected command";
+                else
+                    r.Reason = r.Exact == true
+                        ? "Windows startup entry is still present"
+                        : "A different Windows startup entry is still present";
+            }
             return r;
         }
 
@@ -9132,12 +9437,24 @@ namespace Limisaw
                 string got;
                 if (!store.TryRead(AutostartValueName, out got))
                 { r.Reason = "Windows startup entry state is unreadable"; return r; }
-                r.Actual = got != null && got == ExpectedAutostartCommand();
-                r.Verified = r.Actual == s.AutoStart;
+                // W2-003: the same two facts, read the same way as the
+                // reconciler, so the menu's Opening look can never disagree with
+                // what a reconcile would prove. `r.Actual == s.AutoStart` used to
+                // be the whole rule, which made "a foreign command is present"
+                // and "nothing is present" the identical observation for a
+                // desired-off setting.
+                r.Present = got != null;
+                r.Exact = got != null && got == ExpectedAutostartCommand();
+                r.Actual = r.Exact;
+                r.Verified = s.AutoStart ? r.Exact == true : r.Present == false;
                 if (!r.Verified)
                     r.Reason = s.AutoStart
-                        ? "Windows startup entry is not applied"
-                        : "Windows startup entry is still present";
+                        ? (r.Present == true
+                            ? "Windows startup entry does not hold the expected command"
+                            : "Windows startup entry is not applied")
+                        : (r.Exact == true
+                            ? "Windows startup entry is still present"
+                            : "A different Windows startup entry is still present");
             }
             return r;
         }
@@ -9192,6 +9509,11 @@ namespace Limisaw
             { Tag = "lowest", Checked = t.S.TrayMetric == "lowest",
               ToolTipText = "always show the worst window there is right now — never stale, never a guess" };
             t.MetricMenu.DropDownItems.Add(lowest);
+            var any = new ToolStripMenuItem("Any available", null, (o2, e2) =>
+            { t.S.TrayMetric = "any"; t.S.Save(); f.ApplyChoice(); })
+            { Tag = "any", Checked = t.S.TrayMetric == "any",
+              ToolTipText = "show any usable reading; keep the current one while usable, switch when it becomes unavailable" };
+            t.MetricMenu.DropDownItems.Add(any);
             foreach (Metric metric in f.AllMetrics())
             {
                 Metric pick = metric;

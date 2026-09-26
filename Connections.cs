@@ -1321,11 +1321,16 @@ namespace Limisaw
             {
                 Proc = proc;
                 OnExit = onExit;
-                // Subscribe BEFORE enabling: a child that exits between the
-                // two calls still gets the event delivered once raising is
-                // enabled; the HasExited reconcile below covers the reverse
-                // ordering (exited before subscription).
+                // W2-004: REGISTRY OWNERSHIP BEFORE CALLBACK DELIVERY. The order
+                // used to be subscribe -> enable -> reconcile -> Track, so a
+                // child that exited the instant raising was enabled could
+                // complete on a framework callback thread BEFORE the constructor
+                // had registered it: FireOnce's Untrack then removed nothing, the
+                // constructor registered it afterwards, and the finished observer
+                // sat in LiveObservers until shutdown. Subscribe, then OWN it,
+                // THEN enable raising, then reconcile.
                 Proc.Exited += OnProcExited;
+                Track(this);
                 // W2-003: an EnableRaisingEvents failure is NOT swallowed. If
                 // raising cannot be enabled there is no reliable observation,
                 // and pretending otherwise loses exit signals silently. The
@@ -1338,7 +1343,6 @@ namespace Limisaw
                 // (or the event already delivered) by the time we get here.
                 bool gone = false;
                 try { gone = Proc.HasExited; } catch { gone = false; }
-                Track(this);
                 if (gone) FireOnce();
             }
 
@@ -1380,8 +1384,22 @@ namespace Limisaw
         static readonly object ObserverGate = new object();
         static readonly List<ProcessExitObserver> LiveObservers = new List<ProcessExitObserver>();
 
-        static void Track(ProcessExitObserver o)
-        { lock (ObserverGate) LiveObservers.Add(o); }
+        // W2-004: Track is ATOMIC with respect to completion. The membership check
+        // happens under the SAME lock that owns the registry and reads the
+        // once-gate, so no interleaving can leave a completed observer registered:
+        //   * completion wins first  -> CallbackFired is already true here, so
+        //     the late Track is refused and nothing is retained;
+        //   * Track wins first       -> the completion's Untrack removes it.
+        // The constructor ordering above is then belt-and-braces rather than the
+        // only defence, which is what a race needs.
+        internal static void Track(ProcessExitObserver o)
+        {
+            lock (ObserverGate)
+            {
+                if (o == null || o.CallbackFired || LiveObservers.Contains(o)) return;
+                LiveObservers.Add(o);
+            }
+        }
 
         static void Untrack(ProcessExitObserver o)
         { lock (ObserverGate) LiveObservers.Remove(o); }
@@ -1887,6 +1905,23 @@ namespace Limisaw
     //
     // Nothing here reads or moves a credential; the loginId is the vendor's own
     // handle for an unfinished browser flow and is never persisted.
+    // Test observability is deliberately a bounded tail. Production login
+    // decisions never consult these records, and their retained memory cannot
+    // grow with the process lifetime.
+    internal static class BoundedLoginHistory
+    {
+        internal const int Capacity = 64;
+
+        internal static void Record<T>(List<T> history, T item)
+        {
+            lock (history)
+            {
+                if (history.Count >= Capacity) history.RemoveAt(0);
+                history.Add(item);
+            }
+        }
+    }
+
     internal static class CodexManagedLogin
     {
         internal class Attempt
@@ -1914,10 +1949,15 @@ namespace Limisaw
         // Generations whose attempt was retired WITHOUT a completed vendor
         // cancel round trip (the session was already gone, or shutdown won).
         // Diagnostic only: ConnectionCoordinator owns publication authority.
+        internal const int MaxFenceHistory = 256;
         static readonly HashSet<int> Fenced = new HashSet<int>();
+        static readonly Queue<KeyValuePair<int, long>> FencedOrder =
+            new Queue<KeyValuePair<int, long>>();
+        static readonly Dictionary<int, long> FencedSequence = new Dictionary<int, long>();
+        static long NextFenceSequence;
 
         // Observability seams for the regression matrix: how many vendor
-        // cancels actually went out, and for which loginIds. Never a credential.
+        // cancels actually went out. The optional tail contains no credential.
         internal static int CancelCount, FenceCount, CompleteCount;
         internal static readonly List<string> CancelledLoginIds = new List<string>();
 
@@ -1926,14 +1966,19 @@ namespace Limisaw
         // re-leasing the session it is standing on).
         internal static void NoteCancelled(string loginId)
         {
-            lock (Gate) { CancelCount++; CancelledLoginIds.Add(loginId); }
+            lock (Gate)
+            {
+                CancelCount++;
+                BoundedLoginHistory.Record(CancelledLoginIds, loginId);
+            }
         }
 
         internal static void Reset()
         {
             lock (Gate)
             {
-                ByHome.Clear(); Fenced.Clear();
+                ByHome.Clear(); Fenced.Clear(); FencedOrder.Clear(); FencedSequence.Clear();
+                NextFenceSequence = 0;
                 CancelCount = FenceCount = CompleteCount = 0;
                 CancelledLoginIds.Clear();
             }
@@ -1958,6 +2003,7 @@ namespace Limisaw
                 ByHome[homeId] = a;
                 // A generation that starts a login is live again by definition.
                 Fenced.Remove(generation);
+                FencedSequence.Remove(generation);
             }
             return a;
         }
@@ -1979,6 +2025,7 @@ namespace Limisaw
         }
 
         internal static int PendingCount { get { lock (Gate) return ByHome.Count; } }
+        internal static int FencedCount { get { lock (Gate) return Fenced.Count; } }
 
         // Claim the attempt for a terminal transition. Exactly one caller wins:
         // whoever takes it owns what happens next, and every later taker gets
@@ -2032,7 +2079,25 @@ namespace Limisaw
         // publication and remain the single correctness authority.
         internal static void Fence(int generation)
         {
-            lock (Gate) { if (Fenced.Add(generation)) FenceCount++; }
+            lock (Gate)
+            {
+                if (!Fenced.Add(generation)) return;
+                long sequence = ++NextFenceSequence;
+                FencedSequence[generation] = sequence;
+                FencedOrder.Enqueue(new KeyValuePair<int, long>(generation, sequence));
+                while (FencedOrder.Count > MaxFenceHistory)
+                {
+                    KeyValuePair<int, long> oldest = FencedOrder.Dequeue();
+                    long current;
+                    if (FencedSequence.TryGetValue(oldest.Key, out current)
+                        && current == oldest.Value)
+                    {
+                        FencedSequence.Remove(oldest.Key);
+                        Fenced.Remove(oldest.Key);
+                    }
+                }
+                FenceCount++;
+            }
         }
 
         internal static bool IsFenced(int generation)
@@ -2068,7 +2133,11 @@ namespace Limisaw
                 }
                 catch { lease.Retire(); Fence(a.Generation); return false; }
             }
-            lock (Gate) { CancelCount++; CancelledLoginIds.Add(a.LoginId); }
+            lock (Gate)
+            {
+                CancelCount++;
+                BoundedLoginHistory.Record(CancelledLoginIds, a.LoginId);
+            }
             return true;
         }
 
@@ -2130,6 +2199,8 @@ namespace Limisaw
         internal static Func<string, bool> OpenAuthUrl = DefaultOpenAuthUrl;
         internal static int LaunchCount;
         internal static readonly List<LoginLaunch> Launched = new List<LoginLaunch>();
+        internal static void RecordLaunched(LoginLaunch launch)
+        { BoundedLoginHistory.Record(Launched, launch); }
 
         static bool DefaultLaunch(LoginLaunch l)
         {
@@ -2373,7 +2444,7 @@ namespace Limisaw
                 l.EnvValue = home.Path;
             }
             LaunchCount++;
-            lock (Launched) Launched.Add(l);
+            RecordLaunched(l);
             return Launch(l); // fire-and-forget by contract; a false return reports through error
         }
 
@@ -2514,10 +2585,37 @@ namespace Limisaw
                     }
                     object rl = entry.Link.Call("account/rateLimits/read", null, deadline);
                     if (rl == null) { lease.Retire(); outc.DeadSession = true; r.Error = ConnectionErrorCode.DeadlineExceeded; r.Reason = "codex app-server did not answer rateLimits"; return outc; }
-                    if (J.Get(rl, "error") != null)
+                    object rlErr = J.Get(rl, "error");
+                    if (rlErr != null)
                     {
-                        // A structured error is a HEALTHY session answering for an
-                        // account whose quota is not exposed: auth is fine.
+                        // SRC-028: a structured error used to be read as "healthy
+                        // session, account simply has no quota surface" for EVERY
+                        // shape. That is wrong for the observed failure, where the
+                        // JSON-RPC outer -32603 wraps an HTTP 401 Unauthorized:
+                        // a 401 IS explicit evidence that the authenticated
+                        // backend read was REFUSED, which is a sign-in problem,
+                        // not an "authenticated but unavailable" one. The outer
+                        // code is only a wrapper and is never sufficient on its
+                        // own — CodexSource owns the one classification path so
+                        // the periodic probe and this card cannot disagree.
+                        CodexSource.RateLimitFailure cls = CodexSource.ClassifyRateLimitError(rlErr);
+                        if (CodexSource.IsAuthFailure(cls))
+                        {
+                            // The session itself is fine (the child answered), so
+                            // it stays warm: restarting the app-server cannot fix
+                            // a credential, and doing it every sweep would be a
+                            // restart storm against the same 401.
+                            r.State = ConnectionState.SignInRequired;
+                            r.Error = cls == CodexSource.RateLimitFailure.AuthExpired
+                                ? ConnectionErrorCode.AuthExpired
+                                : ConnectionErrorCode.AuthRejected;
+                            r.Authenticated = false;
+                            r.Monitorable = false;
+                            r.Reason = CodexSource.AuthFailureReason(cls, rlErr);
+                            return outc;
+                        }
+                        // No auth evidence: a HEALTHY authenticated session whose
+                        // account exposes no quota surface.
                         r.State = ConnectionState.ConnectedQuotaUnavailable;
                         r.Error = ConnectionErrorCode.QuotaNotAvailable;
                         r.Reason = "authenticated, subscription quota not exposed";
@@ -2682,6 +2780,8 @@ namespace Limisaw
         internal static Func<LoginLaunch, bool> Launch = DefaultLaunch;
         internal static int LaunchCount;
         internal static readonly List<LoginLaunch> Launched = new List<LoginLaunch>();
+        internal static void RecordLaunched(LoginLaunch launch)
+        { BoundedLoginHistory.Record(Launched, launch); }
 
         static bool DefaultLaunch(LoginLaunch l)
         {
@@ -2830,7 +2930,7 @@ namespace Limisaw
                 EnvName = "CLAUDE_CONFIG_DIR", EnvValue = dir,
             };
             LaunchCount++;
-            lock (Launched) Launched.Add(l);
+            RecordLaunched(l);
             return Launch(l);
         }
 
@@ -2841,7 +2941,7 @@ namespace Limisaw
             if (string.IsNullOrEmpty(exe)) { error = "cli_missing"; return false; }
             var l = new LoginLaunch { Program = exe, Arguments = "auth login" };
             LaunchCount++;
-            lock (Launched) Launched.Add(l);
+            RecordLaunched(l);
             // CORE-003 (audit/6): the REAL launch result is the contract —
             // Codex already returned it. A false here means Process.Start
             // failed; the caller cancels the operation and reports the
@@ -2979,6 +3079,8 @@ namespace Limisaw
         internal static Func<LoginLaunch, bool> Launch = DefaultLaunch;
         internal static int LaunchCount;
         internal static readonly List<LoginLaunch> Launched = new List<LoginLaunch>();
+        internal static void RecordLaunched(LoginLaunch launch)
+        { BoundedLoginHistory.Record(Launched, launch); }
 
         static bool DefaultLaunch(LoginLaunch l)
         {
@@ -3052,7 +3154,7 @@ namespace Limisaw
             if (string.IsNullOrEmpty(exe)) { error = "cli_missing"; return false; }
             var l = new LoginLaunch { Program = exe, Arguments = "" };
             LaunchCount++;
-            lock (Launched) Launched.Add(l);
+            RecordLaunched(l);
             // CORE-003 (audit/6): the REAL launch result is the contract —
             // Codex already returned it. A false here means Process.Start
             // failed; the caller cancels the operation and reports the
@@ -3286,6 +3388,9 @@ namespace Limisaw
         static readonly object Gate = new object();
         static readonly List<Operation> Ops = new List<Operation>();
         static System.Threading.Timer Timer;
+        // Timer callbacks carry their registration identity so an already
+        // queued callback from a disposed idle cycle cannot tick a later one.
+        static object TimerToken;
 
         internal static Func<double> Now = () => Stamp.Now;
         // The owner of what an attempt means (publish + repaint). The form
@@ -3336,6 +3441,7 @@ namespace Limisaw
                     removed.Add(Ops[i]);
                     Ops.RemoveAt(i);
                 }
+                StopTimerIfIdle();
             }
             Dispatch(removed, int.MinValue);
         }
@@ -3358,7 +3464,7 @@ namespace Limisaw
             lock (Gate)
             {
                 Ops.Clear();
-                if (Timer != null) { Timer.Dispose(); Timer = null; }
+                StopTimerIfIdle();
             }
         }
 
@@ -3432,7 +3538,20 @@ namespace Limisaw
         static void EnsureTimer()
         {
             if (Timer != null) return;
-            Timer = new System.Threading.Timer(Tick, null, TickPeriodMs, TickPeriodMs);
+            object token = new object();
+            TimerToken = token;
+            Timer = new System.Threading.Timer(Tick, token, TickPeriodMs, TickPeriodMs);
+        }
+
+        // Caller holds Gate. The final operation owns the scheduler's lifetime;
+        // clear identity before disposal so queued callbacks become inert.
+        static void StopTimerIfIdle()
+        {
+            if (Ops.Count != 0 || Timer == null) return;
+            System.Threading.Timer idle = Timer;
+            Timer = null;
+            TimerToken = null;
+            idle.Dispose();
         }
 
         // The tick period the timer restarts with after Shutdown. Tests may
@@ -3441,11 +3560,14 @@ namespace Limisaw
 
         static void Tick(object _)
         {
-            List<Operation> due = new List<Operation>();
-            List<Operation> expired = new List<Operation>();
+            List<Operation> due;
+            List<Operation> expired;
             lock (Gate)
             {
-                if (Ops.Count == 0) return;
+                if (_ != null && !Object.ReferenceEquals(_, TimerToken)) return;
+                if (Ops.Count == 0) { StopTimerIfIdle(); return; }
+                due = new List<Operation>();
+                expired = new List<Operation>();
                 double now = Now();
                 for (int i = Ops.Count - 1; i >= 0; i--)
                 {
@@ -3468,6 +3590,7 @@ namespace Limisaw
                         due.Add(op);
                     }
                 }
+                StopTimerIfIdle();
             }
             foreach (var op in expired)
             {

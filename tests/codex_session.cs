@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using Limisaw;
@@ -1081,6 +1082,71 @@ public static class CodexSessionTest
                     "pending=" + session.PendingResponses);
                 object again = session.Call("fast2", null, Stamp.Now + 5);
                 Check("...and the session still answers new requests", again != null, "");
+                Check("...late reply has not restored pending state",
+                    session.PendingResponses == 0, "pending=" + session.PendingResponses);
+
+                object never = session.Call("never", null, Stamp.Now + 0.15);
+                Check("a never-reply call expires at its absolute deadline", never == null,
+                    "reply=" + (never == null ? "null" : "present"));
+                Check("...expiry releases its pending slot immediately",
+                    session.PendingResponses == 0, "pending=" + session.PendingResponses);
+                int successfulAfterTimeout = 0;
+                for (int i = 0; i < 100; i++)
+                    if (session.Call("fast" + i, null, Stamp.Now + 5) != null) successfulAfterTimeout++;
+                Check("100 successful calls after a never-reply timeout all complete",
+                    successfulAfterTimeout == 100, "successes=" + successfulAfterTimeout);
+                Check("...the response/pending map drains after the call train",
+                    session.PendingResponses == 0, "pending=" + session.PendingResponses);
+
+                Type rpcType = typeof(CodexSource.RpcSession);
+                bool noHistoryMaps = rpcType.GetField("Responses", BindingFlags.Instance | BindingFlags.NonPublic) == null
+                    && rpcType.GetField("Abandoned", BindingFlags.Instance | BindingFlags.NonPublic) == null;
+                Check("unknown reply ids have no lifetime response or tombstone maps",
+                    noHistoryMaps, "Responses/Abandoned absent=" + noHistoryMaps);
+                object noisy = session.Call("noise", null, Stamp.Now + 10);
+                Check("4096 unsolicited numeric ids are discarded while a real request completes",
+                    noisy != null && session.PendingResponses == 0,
+                    "reply=" + (noisy != null) + " pending=" + session.PendingResponses);
+
+                object reverseA = null, reverseB = null;
+                var a = new Thread(() => reverseA = session.Call("reverseA", null, Stamp.Now + 10));
+                var b = new Thread(() => reverseB = session.Call("reverseB", null, Stamp.Now + 10));
+                a.IsBackground = b.IsBackground = true;
+                a.Start(); b.Start();
+                bool aDone = a.Join(10000), bDone = b.Join(10000);
+                string aMethod = reverseA == null ? "" : Convert.ToString(J.Get(J.Get(reverseA, "result"), "method"));
+                string bMethod = reverseB == null ? "" : Convert.ToString(J.Get(J.Get(reverseB, "result"), "method"));
+                Check("concurrent reverse-order replies route to their owning requests",
+                    aDone && bDone && aMethod == "reverseA" && bMethod == "reverseB"
+                    && session.PendingResponses == 0,
+                    "A=" + aMethod + " B=" + bMethod + " pending=" + session.PendingResponses);
+
+                string sourceText = File.ReadAllText(Path.Combine(SourceRoot(), "Probe.cs"));
+                int callStart = sourceText.IndexOf("public object Call(string method, object parameters, double deadline)", StringComparison.Ordinal);
+                int callEnd = callStart < 0 ? -1 : sourceText.IndexOf("public void Notify(string method, object parameters)", callStart, StringComparison.Ordinal);
+                string callSource = callStart >= 0 && callEnd > callStart
+                    ? sourceText.Substring(callStart, callEnd - callStart) : "";
+                Check("response wait is event-driven and contains no sleep/poll loop",
+                    callSource.Contains("Monitor.Wait(Gate, ms)")
+                    && callSource.IndexOf("Thread.Sleep", StringComparison.Ordinal) < 0
+                    && callSource.IndexOf("Thread.SpinWait", StringComparison.Ordinal) < 0,
+                    callSource.Length == 0 ? "Call source not found" : "Monitor.Wait present; sleep/spin absent");
+
+                object deathReply = new object();
+                var deathCall = new Thread(() => deathReply = session.Call("never", null, Stamp.Now + 30));
+                deathCall.IsBackground = true;
+                deathCall.Start();
+                var waitForPending = Stopwatch.StartNew();
+                while (session.PendingResponses != 1 && waitForPending.ElapsedMilliseconds < 5000) Thread.Sleep(1);
+                Thread.Sleep(100); // let the fake child consume the no-reply request
+                Process child = (Process)rpcType.GetField("P", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(session);
+                try { if (!child.HasExited) child.Kill(); } catch { }
+                var deathWait = Stopwatch.StartNew();
+                bool deathWoke = deathCall.Join(3000);
+                long deathMs = deathWait.ElapsedMilliseconds;
+                Check("child death wakes a pending caller promptly instead of burning its deadline",
+                    deathWoke && deathReply == null && deathMs < 3000 && session.PendingResponses == 0,
+                    "joined=" + deathWoke + " ms=" + deathMs + " pending=" + session.PendingResponses);
             }
             finally { session.Dispose(); }
         }

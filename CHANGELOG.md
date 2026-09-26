@@ -1,8 +1,8 @@
-# LIMISAW 0.0.8 (2026-09-05)
+# LIMISAW 0.0.9 (2026-09-26)
 
-## 0.0.8
+## 0.0.9
 
-**In the working tree since the 0.0.8 release build:** the window is now
+**Shipped as 0.0.9, the wave that landed after the 0.0.8 release:** the window is now
 genuinely **resizable** (drag any edge or corner), every tab gets a **scrollable
 body viewport** (wheel, PgDn/PgUp/Home/End, a themed scrollbar), **Settings is
 reorganized** into compact TRAY/ACCOUNTS/ALERTS/APP blocks that reflow into two
@@ -161,6 +161,29 @@ against an incomplete download.
   `git checkout -- LIMISAW.exe`. The exe has been untracked since 0.0.7, so that
   command cannot work; a `-Tests` run leaves `git status` clean, which means a
   dirty tree is a real source change.
+
+## Fixed — test integrity and release hygiene (0.0.9)
+
+- **The final zero-time ownership probe publishes Primary even when window
+  activation already succeeded.** The old branch discarded a taken mutex, so an
+  activating instance owned the singleton forever with no Primary alive.
+- **Verified rows mean something.** The Connections card no longer prints
+  `Verified: just now` beside `Authentication: not authenticated`; the draw gate
+  carries `VerificationOk`, and a scoped source guard in
+  `tests/connections_foundation.cs` fails if that gate is ever weakened.
+- **No vacuous PASS rows.** `tests/codex_rpc_start_transaction.cs` asserts real
+  observables: the post-Adopt failure is held until the wrapper has really
+  spawned a live child, and that liveness is recorded at setup time, so the
+  unwind assertion can no longer pass without a child.
+- **Hermetic singleton tests.** The window-activation probe is a seam
+  (`WindowProbeImpl`); the harness and its player fixture pin it, so a
+  developer's own running LIMISAW can no longer turn a Timeout expectation into
+  `Activated`.
+- **Build outputs stay ignored.** Root `*.exe`, `LIMISAW.dll` and
+  `.codebase-memory/` are ignored, each with the reason recorded in
+  `.gitignore`.
+- **New coverage wired in.** `tests/codex_rate_limit_auth.cs` and
+  `tests/codex_rpc_start_transaction.cs` are tracked and run by `build.ps1`.
 
 # LIMISAW 0.0.7 (2026-09-04)
 

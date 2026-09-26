@@ -753,6 +753,21 @@ public static class ConnectionsFoundationTest
 
             try { Directory.Delete(tmpDir, true); } catch { }
 
+            // IMP-004: the card's "Verified" row must not render beside
+            // "Authentication: not authenticated", so the draw gate carries
+            // VerificationOk and not a bare HasValue test. Scoped to the draw
+            // site itself: a whole-file grep would pass on any other mention.
+            {
+                string root = AppDomain.CurrentDomain.BaseDirectory;
+                for (int i = 0; i < 4 && !File.Exists(Path.Combine(root, "LIMISAW.cs")); i++)
+                { var up = Directory.GetParent(root); if (up == null) break; root = up.FullName; }
+                string src = File.ReadAllText(Path.Combine(root, "LIMISAW.cs"));
+                int at = src.IndexOf("\"Verified: \"", StringComparison.Ordinal);
+                string gate = at >= 0 ? src.Substring(Math.Max(0, at - 320), Math.Min(320, at)) : "";
+                Check("the Verified row is gated on VerificationOk, not a bare HasValue test",
+                    at >= 0 && gate.Contains("VerificationOk") && gate.Contains("LastVerifiedUtc.HasValue"), gate);
+            }
+
             Console.WriteLine();
             Console.WriteLine(checks + " checks");
             Console.WriteLine(fails == 0 ? "PASS (0 failures)" : "FAILED (" + fails + " failures)");

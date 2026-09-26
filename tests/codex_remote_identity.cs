@@ -461,6 +461,25 @@ public static class CodexRemoteIdentityTest
         }
     }
 
+    static void BoundedObservabilityHistory()
+    {
+        CodexManagedLogin.Reset();
+        for (int i = 0; i < 100000; i++)
+        {
+            CodexManagedLogin.NoteCancelled("synthetic-login-" + i);
+            CodexManagedLogin.Fence(i);
+        }
+        Check("100,000 cancelled login observations retain only the bounded tail",
+            CodexManagedLogin.CancelledLoginIds.Count == BoundedLoginHistory.Capacity
+            && CodexManagedLogin.CancelledLoginIds[BoundedLoginHistory.Capacity - 1]
+                == "synthetic-login-99999");
+        Check("100,000 fenced generations retain a bounded recent diagnostic tail",
+            CodexManagedLogin.FencedCount == CodexManagedLogin.MaxFenceHistory
+            && CodexManagedLogin.IsFenced(99999)
+            && !CodexManagedLogin.IsFenced(0));
+        CodexManagedLogin.Reset();
+    }
+
     public static int Main(string[] args)
     {
         if (args.Length > 0 && args[0] == "--live") return Live();
@@ -898,6 +917,8 @@ public static class CodexRemoteIdentityTest
                 identity.Length > 32 && !identity.Contains(email) && !report.Contains(email)
                 && !report.Contains("ACCESS_SENTINEL") && !report.Contains("REFRESH_SENTINEL")
                 && !report.Contains("auth.json"));
+
+            BoundedObservabilityHistory();
         }
         catch (Exception ex)
         {

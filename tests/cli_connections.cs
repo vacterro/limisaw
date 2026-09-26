@@ -33,6 +33,33 @@ public static class CliConnectionsTest
         else { fails++; Console.WriteLine("FAIL  " + name + "  -> " + detail); }
     }
 
+    static void BoundedLaunchHistories()
+    {
+        CodexConnectionAdapter.Launched.Clear();
+        ClaudeConnectionAdapter.Launched.Clear();
+        AntigravityConnectionAdapter.Launched.Clear();
+        for (int i = 0; i < 100000; i++)
+        {
+            string marker = "synthetic-launch-" + i;
+            CodexConnectionAdapter.RecordLaunched(new CodexConnectionAdapter.LoginLaunch
+                { Program = marker, Arguments = "login" });
+            ClaudeConnectionAdapter.RecordLaunched(new ClaudeConnectionAdapter.LoginLaunch
+                { Program = marker, Arguments = "auth login" });
+            AntigravityConnectionAdapter.RecordLaunched(new AntigravityConnectionAdapter.LoginLaunch
+                { Program = marker, Arguments = "" });
+        }
+        int cap = BoundedLoginHistory.Capacity;
+        Check("100,000 Codex login observations retain only the bounded tail",
+            CodexConnectionAdapter.Launched.Count == cap
+            && CodexConnectionAdapter.Launched[cap - 1].Program == "synthetic-launch-99999", "");
+        Check("100,000 Claude login observations retain only the bounded tail",
+            ClaudeConnectionAdapter.Launched.Count == cap
+            && ClaudeConnectionAdapter.Launched[cap - 1].Program == "synthetic-launch-99999", "");
+        Check("100,000 Antigravity login observations retain only the bounded tail",
+            AntigravityConnectionAdapter.Launched.Count == cap
+            && AntigravityConnectionAdapter.Launched[cap - 1].Program == "synthetic-launch-99999", "");
+    }
+
     static string profile;
     static Func<string, bool> savedCodexDirExists, savedCodexFileExists;
     static Func<string, string> savedCodexGetEnv;
@@ -575,6 +602,7 @@ public static class CliConnectionsTest
                 expiredConnection.State == ConnectionState.Degraded
                 && (expiredConnection.RecommendedAction == ConnectionAction.CheckAgain || expiredConnection.RecommendedAction == ConnectionAction.Troubleshoot),
                 expiredConnection.State + "/" + expiredConnection.RecommendedAction);
+            BoundedLaunchHistories();
         }
         catch (Exception ex)
         {

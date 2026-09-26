@@ -383,6 +383,17 @@ public static class ConnectionsOnboardingTest
                 try { launchA.Observer.Dispose(); launchA.Observer.Dispose(); }
                 catch (Exception ex) { disposeThrew = true; Check("repeated Dispose after completion threw", false, ex.GetType().Name); }
                 Check("...repeated Dispose after completion is safe and idempotent", !disposeThrew, "");
+
+                // W2-004: the once-gate and the registry share ONE lock, so a
+                // completion that wins the race can never be registered
+                // afterwards. Re-offering this finished observer is exactly what
+                // the old constructor's late Track did — it must be refused.
+                int regBefore = ConnectionProcessLauncher.LiveObserverCount;
+                ConnectionProcessLauncher.Track(launchA.Observer);
+                Check("...a completed observer can never be (re-)registered (atomic Track)",
+                    !ConnectionProcessLauncher.Tracks(launchA.Observer) &&
+                    ConnectionProcessLauncher.LiveObserverCount == regBefore,
+                    "count=" + ConnectionProcessLauncher.LiveObserverCount);
             }
 
             // B: long-lived child — zero blocked observer workers. The old
@@ -433,6 +444,27 @@ public static class ConnectionsOnboardingTest
             Check("...EnableRaisingEvents failure is never swallowed (no try/catch around it)",
                 startBody.IndexOf("try { Proc.EnableRaisingEvents", StringComparison.Ordinal) < 0, "");
 
+            // W2-004: REGISTRY OWNERSHIP BEFORE CALLBACK DELIVERY. The old
+            // constructor registered LAST (subscribe -> enable -> reconcile ->
+            // Track), so a child exiting the instant raising was enabled could
+            // complete on a framework callback thread and Untrack an observer the
+            // constructor had not yet added — a no-op — after which the still-
+            // running constructor registered it. A FINISHED observer then sat in
+            // LiveObservers until shutdown. Ownership must precede enable, and the
+            // subscription must precede ownership so no event is missed.
+            int obsAt = connSrc.IndexOf("internal ProcessExitObserver(Process proc, Action onExit)", StringComparison.Ordinal);
+            int obsEnd = obsAt >= 0 ? connSrc.IndexOf("void OnProcExited", obsAt, StringComparison.Ordinal) : -1;
+            string ctorBody = obsAt >= 0 && obsEnd > obsAt ? connSrc.Substring(obsAt, obsEnd - obsAt) : "";
+            int subAt = ctorBody.IndexOf("Proc.Exited += OnProcExited", StringComparison.Ordinal);
+            int ownAt = ctorBody.IndexOf("Track(this)", StringComparison.Ordinal);
+            int raiseAt = ctorBody.IndexOf("Proc.EnableRaisingEvents", StringComparison.Ordinal);
+            Check("the observer constructor and its three ordering steps are discoverable in source",
+                ctorBody.Length > 0 && subAt >= 0 && ownAt >= 0 && raiseAt >= 0, "");
+            Check("...the observer is OWNED by the registry BEFORE exit raising is enabled",
+                ownAt >= 0 && raiseAt > ownAt, "track@" + ownAt + " enable@" + raiseAt);
+            Check("...and the subscription precedes ownership, so no exit can be missed",
+                subAt >= 0 && ownAt > subAt, "subscribe@" + subAt + " track@" + ownAt);
+
             // C: observation setup failure must not fail the launch. The seam
             // is driven through StartInteractiveImpl with a child that exists
             // and an observer constructor that throws.
@@ -453,6 +485,33 @@ public static class ConnectionsOnboardingTest
             ConnectionProcessLauncher.StartInteractiveImpl = savedImpl;
             Check("an observation-setup failure did NOT convert a successful start into a launch failure",
                 errC == null && launchC != null, errC ?? "ok");
+
+            // W2-004 soak: many instant exits through the REAL production path.
+            // Whatever the interleaving, no finished observer may be left in the
+            // application registry, and the registry size must return to its
+            // pre-soak value rather than creeping upward to shutdown.
+            int soakBaseline = ConnectionProcessLauncher.LiveObserverCount;
+            int soakFired = 0;
+            int soakRetained = 0;
+            for (int i = 0; i < 25; i++)
+            {
+                string errS;
+                var l = ConnectionProcessLauncher.StartInteractive(instant, "", () => Interlocked.Increment(ref soakFired), out errS);
+                if (l == null || l.Observer == null)
+                { Check("soak launch " + i + " launched with observation", false, errS ?? "no observer"); break; }
+                int spins = 0;
+                while (!l.Observer.CallbackFired && spins++ < 400) Thread.Sleep(5);
+                spins = 0;
+                while (ConnectionProcessLauncher.Tracks(l.Observer) && spins++ < 400) Thread.Sleep(5);
+                if (ConnectionProcessLauncher.Tracks(l.Observer)) soakRetained++;
+            }
+            Check("25 rapid child exits all delivered their exit callback exactly once each",
+                soakFired == 25, "fired=" + soakFired);
+            Check("...and NOT ONE finished observer stayed in the application registry",
+                soakRetained == 0, "retained=" + soakRetained);
+            Check("...the registry returned to its pre-soak size",
+                ConnectionProcessLauncher.LiveObserverCount == soakBaseline,
+                "baseline=" + soakBaseline + " now=" + ConnectionProcessLauncher.LiveObserverCount);
         }
         finally
         {

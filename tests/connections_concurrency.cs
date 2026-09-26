@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
 using System.Threading;
 using Limisaw;
 
@@ -156,12 +158,14 @@ public static class ConnectionsConcurrencyTest
         ConnectionWatcher.Start(new ConnectionWatcher.Operation
         { VendorId = "codex", Generation = 7, Verify = () => new VendorConnection { VendorId = "codex", State = ConnectionState.Connected } });
         Check("watcher registers the operation", ConnectionWatcher.Pending("codex", 7), "");
+        Check("first operation activates its scheduler", WatcherTimer() != null, "timer=" + (WatcherTimer() != null));
         // A newer operation for the same vendor supersedes the older watcher.
         ConnectionWatcher.Start(new ConnectionWatcher.Operation
         { VendorId = "codex", Generation = 8, Verify = () => new VendorConnection { VendorId = "codex", State = ConnectionState.Connected } });
         Check("newer operation supersedes the older watcher", !ConnectionWatcher.Pending("codex", 7) && ConnectionWatcher.Pending("codex", 8), "");
         ConnectionWatcher.CancelGeneration("codex", 8);
         Check("cancel removes the pending watcher", !ConnectionWatcher.Pending("codex", 8) && ConnectionWatcher.PendingCount == 0, ConnectionWatcher.PendingCount.ToString());
+        Check("final cancellation disposes the idle scheduler", WatcherTimer() == null, "timer=" + (WatcherTimer() != null));
 
         Console.WriteLine("== bounded cadence is finite and low frequency ==");
         Check("cadence starts immediate", ConnectionWatcher.DelayFor(0) == 0, ConnectionWatcher.DelayFor(0).ToString());
@@ -198,9 +202,12 @@ public static class ConnectionsConcurrencyTest
             ConnectionWatcher.LastExpired != null && ConnectionWatcher.LastExpired.State == ConnectionState.Degraded
             && ConnectionWatcher.LastExpired.RecommendedAction == ConnectionAction.CheckAgain,
             ConnectionWatcher.LastExpired == null ? "null" : ConnectionWatcher.LastExpired.State.ToString());
+        Check("natural expiry of the final operation disposes the scheduler", WatcherTimer() == null,
+            "timer=" + (WatcherTimer() != null));
         ConnectionWatcher.Shutdown();
         ConnectionWatcher.Now = () => Stamp.Now;
         ConnectionWatcher.LastExpired = null;
+        WatcherTimerLifecycle();
 
         Console.WriteLine();
         Console.WriteLine("== CORE-002 (audit/6): terminal vs non-terminal publication ==");
@@ -343,5 +350,88 @@ public static class ConnectionsConcurrencyTest
         Console.WriteLine(checks + " checks");
         Console.WriteLine(fails == 0 ? "PASS (0 failures)" : "FAILED (" + fails + " failures)");
         return fails == 0 ? 0 : 1;
+    }
+
+    static object WatcherTimer()
+    {
+        return typeof(ConnectionWatcher).GetField("Timer", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
+    }
+
+    static void WatcherTimerLifecycle()
+    {
+        Console.WriteLine("== watcher timer lifetime across idle cycles ==");
+        int oldPeriod = ConnectionWatcher.TickPeriodMs;
+        try
+        {
+            ConnectionWatcher.Shutdown();
+            ConnectionWatcher.TickPeriodMs = 25;
+            ConnectionWatcher.Now = () => Stamp.Now;
+            ConnectionWatcher.OnAttempt = op => { };
+            ConnectionWatcher.OnExpire = op => { };
+            ConnectionWatcher.OnRemoved = null;
+
+            object previous = null;
+            for (int i = 0; i < 4; i++)
+            {
+                ConnectionWatcher.Start(new ConnectionWatcher.Operation
+                { VendorId = "timer" + i, Generation = i + 1 });
+                object current = WatcherTimer();
+                Check("idle cycle " + i + " creates one timer for its first operation", current != null,
+                    "timer=" + (current != null));
+                if (previous != null)
+                    Check("idle cycle " + i + " recreates a fresh timer instance", !Object.ReferenceEquals(previous, current), "same=" + Object.ReferenceEquals(previous, current));
+                ConnectionWatcher.CancelGeneration("timer" + i, i + 1);
+                Check("idle cycle " + i + " disposes the timer with the final operation", WatcherTimer() == null,
+                    "timer=" + (WatcherTimer() != null));
+                Thread.Sleep(ConnectionWatcher.TickPeriodMs * 2 + 15);
+                Check("idle cycle " + i + " stays timer-free after empty ticks would have run", WatcherTimer() == null,
+                    "timer=" + (WatcherTimer() != null));
+                previous = current;
+            }
+
+            double fakeNow = 500000.0;
+            ConnectionWatcher.Now = () => fakeNow;
+            var expired = new ManualResetEvent(false);
+            ConnectionWatcher.OnExpire = op => expired.Set();
+            ConnectionWatcher.Start(new ConnectionWatcher.Operation
+            { VendorId = "natural", Generation = 50 });
+            object naturalTimer = WatcherTimer();
+            fakeNow += ConnectionWatcher.WindowS + 1;
+            bool didExpire = expired.WaitOne(3000);
+            Check("natural expiry removes the final operation and timer", didExpire
+                && ConnectionWatcher.PendingCount == 0 && WatcherTimer() == null,
+                "expired=" + didExpire + " pending=" + ConnectionWatcher.PendingCount + " timer=" + (WatcherTimer() != null));
+
+            ConnectionWatcher.Now = () => Stamp.Now;
+            ConnectionWatcher.OnExpire = op => { };
+            ConnectionWatcher.Start(new ConnectionWatcher.Operation
+            { VendorId = "after-idle", Generation = 51 });
+            object restarted = WatcherTimer();
+            Check("a new operation after natural idle recreates scheduling", restarted != null
+                && !Object.ReferenceEquals(naturalTimer, restarted), "timer=" + (restarted != null));
+            ConnectionWatcher.CancelGeneration("after-idle", 51);
+            ConnectionWatcher.Shutdown();
+            ConnectionWatcher.Shutdown();
+            Check("Shutdown remains idempotent and timer-free", WatcherTimer() == null,
+                "timer=" + (WatcherTimer() != null));
+
+            string source = File.ReadAllText(Path.Combine(Directory.GetCurrentDirectory(), "Connections.cs"));
+            int tick = source.IndexOf("static void Tick(object _)", StringComparison.Ordinal);
+            int empty = tick < 0 ? -1 : source.IndexOf("if (Ops.Count == 0)", tick, StringComparison.Ordinal);
+            int allocation = tick < 0 ? -1 : source.IndexOf("new List<Operation>()", tick, StringComparison.Ordinal);
+            Check("empty-state exit precedes avoidable due/expired list allocations",
+                tick >= 0 && empty > tick && allocation > empty,
+                "tick=" + tick + " empty=" + empty + " allocation=" + allocation);
+            expired.Dispose();
+        }
+        finally
+        {
+            ConnectionWatcher.Shutdown();
+            ConnectionWatcher.TickPeriodMs = oldPeriod;
+            ConnectionWatcher.Now = () => Stamp.Now;
+            ConnectionWatcher.OnAttempt = null;
+            ConnectionWatcher.OnExpire = null;
+            ConnectionWatcher.OnRemoved = null;
+        }
     }
 }

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using Limisaw;
 
 // FreeBuff provider + FreeBucks: the optional vendor's whole contract.
@@ -34,6 +35,15 @@ public static class FreebuffTest
         checks++;
         if (ok) Console.WriteLine("PASS  " + name + (detail.Length > 0 ? "  -> " + detail : ""));
         else { fails++; Console.WriteLine("FAIL  " + name + "  -> " + detail); }
+    }
+
+    static bool ResetLauncherCache()
+    {
+        MethodInfo reset = typeof(FreebuffDiscovery).GetMethod("ResetDesktopTargetCacheForTests",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        if (reset == null) return false;
+        reset.Invoke(null, null);
+        return true;
     }
 
     static string Profile;
@@ -148,9 +158,63 @@ public static class FreebuffTest
             FreebuffDiscovery.StartMenuDirs = () => new[] { menuDir };
             FreebuffDiscovery.FileExists = _ => true;
             FreebuffDiscovery.ResolveLnk = link => @"C:\tools\freebuff.exe";
+            ResetLauncherCache();
             string desktop = FreebuffDiscovery.DesktopLauncherTarget();
             Check("1e. a Start Menu .lnk resolving to a real target => detected",
                 desktop == @"C:\tools\freebuff.exe", desktop ?? "null");
+
+            // Desktop launcher resolution checks App Paths before the Start
+            // Menu and retains only a positive target. Reuse must validate that
+            // target; disappearance forces a fresh search, and a negative result
+            // is never cached.
+            ResetLauncherCache();
+            string appTarget = @"C:\apps\freebuff.exe";
+            string nextAppTarget = @"C:\apps\freebuff-new.exe";
+            bool appTargetExists = true;
+            int appPathReads = 0, menuWalks = 0, targetChecks = 0;
+            FreebuffDiscovery.AppPathsTarget = () =>
+            {
+                appPathReads++;
+                if (appPathReads == 1) return appTargetExists ? appTarget : null;
+                if (appPathReads == 2) return null;
+                return nextAppTarget;
+            };
+            FreebuffDiscovery.StartMenuDirs = () => { menuWalks++; return new string[0]; };
+            FreebuffDiscovery.FileExists = path =>
+            {
+                targetChecks++;
+                return appTargetExists && path == appTarget
+                    || path == nextAppTarget && appPathReads >= 3;
+            };
+            string appFirst = FreebuffDiscovery.DesktopLauncherTarget();
+            string appCached = FreebuffDiscovery.DesktopLauncherTarget();
+            Check("1f. App Paths keeps priority and a positive target is reused",
+                appFirst == appTarget && appCached == appTarget
+                && appPathReads == 1 && menuWalks == 0 && targetChecks == 2,
+                "AppPaths reads=" + appPathReads + " menu walks=" + menuWalks
+                + " target checks=" + targetChecks);
+            appTargetExists = false;
+            string disappeared = FreebuffDiscovery.DesktopLauncherTarget();
+            Check("1g. a vanished cached launcher is invalidated",
+                disappeared == null && appPathReads == 2 && menuWalks == 1,
+                disappeared ?? "null");
+            string rediscovered = FreebuffDiscovery.DesktopLauncherTarget();
+            Check("1h. a negative discovery is not cached and a later positive is found",
+                rediscovered == nextAppTarget && appPathReads == 3,
+                rediscovered ?? "null");
+
+            string sourcePath = Environment.GetEnvironmentVariable("LIMISAW_TEST_SOURCE_FILE");
+            if (string.IsNullOrEmpty(sourcePath))
+                sourcePath = Path.Combine(Directory.GetCurrentDirectory(), "ProbeFreebuff.cs");
+            string freebuffSource = File.ReadAllText(sourcePath);
+            int discoveryStart = freebuffSource.IndexOf("internal static class FreebuffDiscovery", StringComparison.Ordinal);
+            string discoveryBody = discoveryStart < 0 ? "" : freebuffSource.Substring(discoveryStart);
+            Check("1i. Start Menu links use lazy enumeration",
+                discoveryBody.IndexOf("Directory.EnumerateFiles", StringComparison.Ordinal) >= 0
+                && discoveryBody.IndexOf("Directory.GetFiles", StringComparison.Ordinal) < 0,
+                "lazy source guard");
+
+            ResetLauncherCache();
             FreebuffDiscovery.AppPathsTarget = savedAppPaths;
             FreebuffDiscovery.StartMenuDirs = savedStartDirs;
             FreebuffDiscovery.ResolveLnk = savedResolveLnk;

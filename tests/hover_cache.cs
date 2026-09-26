@@ -127,6 +127,7 @@ public static class HoverCacheTest
                 if (hover == null) throw new InvalidOperationException("TrayHover missing");
 
                 // ── the 1000-MouseMove control ──────────────────────────────
+                if (DateTime.UtcNow.Second >= 57) System.Threading.Thread.Sleep(3500);
                 Point at = new Point(100, 100);
                 hover.Invoke(form, new object[] { popup, at });   // prime the cache
                 int builds0 = GetInt("HoverContentBuilds"), moves0 = GetInt("HoverMoves"),
