@@ -11,7 +11,7 @@
 ![Platform: Windows 10/11 x64](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078d4)
 ![Runtime: none](https://img.shields.io/badge/runtime-none-brightgreen)
 
-**English** · [Eesti](README.ee.md) · [Eesti (lihtne)](README.ded.md) · [日本語](README.ja.md)
+**English** · [Eesti](README.ee.md) · [日本語](README.ja.md)
 
 LIMISAW is a Windows tray monitor for how much quota you have left across
 **Codex, Claude Code, Antigravity and Zcode** — every account each of them
