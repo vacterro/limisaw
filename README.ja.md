@@ -2,7 +2,7 @@
 
 **ファイル1つ。ランタイム不要。すべてのAIエージェント制限をトレイに。**
 
-[English](README.md) · [Eesti](README.ee.md) · [Eesti (lihtne)](README.ded.md) · **日本語**
+[English](README.md) · [Eesti](README.ee.md) · **日本語**
 
 LIMISAWは、**Codex、Claude Code、Antigravity、Zcode**のクォータ残量を表示するWindowsトレイモニターです — 各ベンダーが公開しているすべてのアカウント単位で。各ベンダーに、ベンダー自身がすでに知っている数値を、そのベンダー独自の読み取り専用呼び出しで尋ねるため、**クォータを読むためにクォータは一切消費されません**。`auth.json` をパースせず、プロンプトを送信せず、自発的に何かをインストールすることもありません。
 
