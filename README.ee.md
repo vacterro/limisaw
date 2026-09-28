@@ -2,7 +2,7 @@
 
 **Üks fail. No runtime. Kõik tehisintellekti agendi limiidid süstrayis.**
 
-[English](README.md) · **Eesti** · [Eesti (lihtne)](README.ded.md) · [日本語](README.ja.md)
+[English](README.md) · **Eesti** · [日本語](README.ja.md)
 
 LIMISAW on Windowsi süstray monitaor, mis näitab, kui palju kvooti sul on jäänud teenustes **Codex, Claude Code, Antigravity ja Zcode** — iga konto, mille need paljastavad. See küsib igalt hankijalt numbri, mida hankija juba teab, kasutades selle hankija enda kirjutuskaitstud väljakutset, nii et **kvoodi lugemine ei kuluta sellest midagi**. See ei pars'i `auth.json`, ei saada prompte ega installi midagi omal algatusel.
 
